@@ -12,7 +12,7 @@ Pantalla actualizada ← respuesta JSON por stdout ← validación, estructuras 
 
 - **C++:** listas dobles, multilistas, pila, cola, CRUD, integridad, estadísticas, importación CSV, deshacer, carga y guardado.
 - **Python Tkinter:** ventanas, formularios, filtros, gráficos, mensajes y extracción básica de perfiles HTML/PDF. En ese caso Python envía el registro revisado a C++ para validarlo e incorporarlo.
-- **Datos:** ambos modos comparten el [esquema CSV](esquema_datos.md). La consola `pea_cpp` sigue funcionando sola. `python3 src/python/Taller2_REMR.py --python-backend` permite ejecutar el núcleo Python independiente si se necesita demostrar la segunda implementación.
+- **Datos:** ambos modos comparten el [esquema CSV versión 2](esquema_datos.md) y abren carpetas anteriores de versión 1. La consola `pea_cpp` sigue funcionando sola. `python3 src/python/Taller2_REMR.py --python-backend` permite ejecutar el núcleo Python independiente si se necesita demostrar la segunda implementación.
 
 ## Protocolo local
 
@@ -46,6 +46,6 @@ El estado se adjunta a todas las respuestas: cambios sin guardar, longitud de pi
 | `undo`, `clear_history` | Usar la pila de cambios reversibles C++; acepta también instantáneas anteriores. |
 | `preview_csv`, `import_csv` | Revisar y aplicar una importación CSV. |
 
-El adaptador Python conserva el proceso abierto durante toda la sesión para que cola, pila y cambios no guardados sigan en memoria. Si la ventana se cierra normalmente, envía `shutdown`. El ejecutable se compila en cada computadora; `build/` está excluido de Git.
+El adaptador Python conserva el proceso abierto durante toda la sesión para que cola, pila y cambios no guardados sigan en memoria. Si la ventana se cierra normalmente, envía `shutdown`. En Windows de 64 bits puede usar el ejecutable incluido después de comprobar las huellas de fuentes y del binario; en otros sistemas intenta compilarlo localmente. `build/` está excluido de Git.
 
 La carga y la importación CSV del backend leen registros uno a uno. La importación hace una pasada de validación antes de aplicar cambios, de modo que un CSV malformado no deja importada una primera parte. Las listas y multilistas siguen guardando los datos; los índices auxiliares aceleran la búsqueda por ID y por códigos externos.

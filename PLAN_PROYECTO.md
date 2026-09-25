@@ -1,6 +1,6 @@
 # PEA-i UPC — Plan maestro de desarrollo y verificación
 
-> **Estado:** documento de trabajo, versión 0.4 — 24 de septiembre de 2026; versiones Python Tkinter y C++ consola implementadas, con conexión por defecto entre la ventana y el backend C++. El avance verificado está en `PROGRESO.md`.<br>
+> **Estado:** plan de trabajo de septiembre de 2026; la implementación y el esquema vigentes se describen en `README.md` y `docs/esquema_datos.md`. El registro histórico está en `PROGRESO.md`.<br>
 > **Fuente principal:** `ENUNCIADO_TALLER_2.md`, transcripción del PDF «Taller 2», Estructura de Datos, Universidad Popular del Cesar, entregado el 24/09/2026.<br>
 > **Fecha de entrega que figura en el PDF:** lunes 19 de octubre de 2026, antes de las 11:59 a. m.<br>
 > **Alcance de este plan:** código de las dos aplicaciones, datos, pruebas, documentación técnica y preparación de un repositorio descargable y ejecutable. La sustentación y el video quedan a cargo de Rafael.
@@ -80,7 +80,7 @@ Las claves internas son identificadores estables. El código externo de un grupo
 
 | Entidad | Campos iniciales propuestos | Relaciones |
 |---|---|---|
-| Grupo | id, código GrupLAC, nombre, sigla, fecha de creación, unidad académica, responsable, categoría Minciencias, estado, descripción, objetivos, misión, visión, líneas, URL y fuente | N investigadores; N productos; N planes |
+| Grupo | id, código GrupLAC, nombre, fecha de creación, unidad académica, responsable, categoría Minciencias, estado, descripción, objetivos, misión, visión, líneas, URL y fuente | N investigadores; N productos; N planes |
 | Investigador | id, nombre, identificador CvLAC si existe, afiliación, categoría si consta, contacto público opcional, perfil/URL, estado, fuente | N grupos con rol y fechas; N productos con rol de autor |
 | Producto | id, título, año/fecha, familia, tipología, categoría, estado de validación, observación, DOI/identificador externo, URL, estado activo, fuente | N autores; 1 o más grupos cuando lo justifique la fuente |
 | Membresía | id del grupo, id del investigador, rol, fecha de inicio y fin, activo | Relación explícita entre grupo e investigador |

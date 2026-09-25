@@ -65,7 +65,7 @@ def architecture_image(path: Path) -> None:
     arrow(draw, (355, 135), (468, 135))
     arrow(draw, (805, 135), (918, 135))
     arrow(draw, (1255, 135), (1343, 135))
-    box(draw, (25, 315, 550, 475), ["Fuentes", "URL / PDF / CSV"])
+    box(draw, (25, 315, 550, 475), ["Fuentes", "URL / PDF / CSV / Office"])
     box(draw, (690, 315, 1215, 475), ["Importador Python", "vista previa y validación"])
     arrow(draw, (555, 395), (683, 395))
     arrow(draw, (950, 308), (950, 225))
@@ -204,7 +204,7 @@ def heading(doc: Document, text: str, level: int = 1) -> None:
 def figure(doc: Document, path: Path, caption: str) -> None:
     image = doc.add_paragraph()
     image.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    image.add_run().add_picture(str(path), width=Cm(16.4))
+    image.add_run().add_picture(str(path), width=Cm(14.5))
     label = doc.add_paragraph(caption)
     label.alignment = WD_ALIGN_PARAGRAPH.CENTER
     label.style = "Caption"
@@ -220,12 +220,12 @@ def setup(doc: Document) -> None:
     section.right_margin = Cm(2.1)
     normal = doc.styles["Normal"]
     normal.font.name = "Liberation Sans"
-    normal.font.size = Pt(9.5)
+    normal.font.size = Pt(9.2)
     normal.font.color.rgb = RGBColor(25, 25, 25)
-    normal.paragraph_format.space_after = Pt(6)
+    normal.paragraph_format.space_after = Pt(5)
     normal.paragraph_format.line_spacing = 1.12
     for name, size, above, below in (
-        ("Title", 20, 0, 13), ("Heading 1", 13, 15, 7),
+        ("Title", 20, 0, 13), ("Heading 1", 13, 12, 6),
         ("Heading 2", 10.7, 11, 5),
     ):
         style = doc.styles[name]
@@ -283,8 +283,8 @@ def build() -> None:
                    "contrario, ejecuta el motor Python.")
     paragraph(doc, "Las salidas comprenden fichas y relaciones consultables, revisión pendiente, historial de "
                    "deshacer, distribuciones descriptivas y diez archivos CSV por carpeta. La adquisición "
-                   "externa usa fichas públicas GrupLAC o CvLAC, CSV y PDF con texto extraíble. La muestra "
-                   "incluida sirve para representar una fuente concreta y no constituye un censo institucional.")
+                   "externa usa fichas públicas GrupLAC o CvLAC, CSV, Excel, Word y PDF con texto extraíble. "
+                   "El conjunto incluido reúne fichas públicas de 66 grupos UPC; no es un censo institucional.")
 
     heading(doc, "2 Arquitectura y casos de uso")
     paragraph(doc, "La interfaz Tkinter envía una solicitud JSON por línea a la entrada estándar de "
@@ -358,8 +358,10 @@ def build() -> None:
     heading(doc, "6 Persistencia e interoperabilidad")
     paragraph(doc, "Cada carpeta de datos contiene manifest.csv, cuatro archivos de entidades, tres de relaciones, "
                    "cola_validacion.csv e historial.csv. El formato común es CSV UTF-8 con encabezados, "
-                   "comillas y saltos de línea conforme al formato CSV. manifest.csv declara la versión 1. "
-                   "Ambos motores validan integridad referencial al cargar. Se preparan archivos temporales "
+                   "comillas y saltos de línea conforme al formato CSV. manifest.csv declara la versión 2. "
+                   "Ambos motores leen la versión 1 y la migran al guardar. La versión 2 neutraliza los "
+                   "valores que una hoja de cálculo interpretaría como fórmulas y recupera su valor original "
+                   "al cargar. Se valida la integridad referencial. Se preparan archivos temporales "
                    "y se conserva .backup del guardado previo para recuperación.")
     paragraph(doc, "Las dos aplicaciones pueden abrir por turnos la misma carpeta. No existe bloqueo de "
                    "escritura multiusuario; abrir simultáneamente una carpeta editable puede producir "
@@ -368,14 +370,28 @@ def build() -> None:
 
     heading(doc, "7 Adquisición e importación")
     paragraph(doc, "Ambos programas importan CSV del esquema PEA-i con vista previa y conteo de filas "
-                   "aceptables o rechazadas. Python además consulta URL públicas HTTP/HTTPS de HTML, texto, "
+                   "aceptables o rechazadas. Python también admite Excel XLSX y Word DOCX mediante "
+                   "dependencias opcionales, y consulta URL públicas HTTP/HTTPS de HTML, texto, "
                    "CSV o PDF de texto y muestra su contenido antes de crear registros. La extracción "
                    "estructurada se limita a fichas GrupLAC/CvLAC y metadatos explícitos de artículos. "
                    "Las páginas de estructura desconocida se limitan a vista previa y captura supervisada.")
     paragraph(doc, "La importación de PDF de texto requiere pdftotext de Poppler. Los escaneos sin texto "
-                   "seleccionable requieren OCR externo. El descargador limita la respuesta a 8 MB, "
-                   "rechaza destinos privados y no convierte contenido de JavaScript o páginas con inicio "
-                   "de sesión en registros inventados. C++ dispone de importación CSV autónoma.")
+                   "seleccionable requieren OCR externo. C++ dispone de importación CSV autónoma.")
+
+    heading(doc, "Controles de seguridad de las fuentes", 2)
+    paragraph(doc, "La descarga limita la respuesta a 8 MB, permite solo HTTP y HTTPS en los puertos 80 y "
+                   "443, rechaza destinos locales o privados y verifica cada redirección. La conexión usa "
+                   "una dirección pública previamente validada, sin proxy heredado del entorno. El tiempo "
+                   "de espera por operación es 15 segundos; no constituye un límite total de duración.")
+    paragraph(doc, "Los archivos locales PDF, XLSX y DOCX tienen un límite de 32 MB. Los documentos Office "
+                   "se inspeccionan antes de extraerlos, con un máximo de 10.000 entradas y 128 MB "
+                   "de tamaño declarado sin comprimir. El conversor PDF tiene 25 segundos para extraer "
+                   "hasta cinco millones de caracteres y límites adicionales de CPU y memoria en POSIX. "
+                   "Cada CSV admite hasta 500.000 filas y 100.000 caracteres por campo.")
+    paragraph(doc, "El ejecutable Windows incluido se usa cuando su SHA-256 y la huella de las fuentes "
+                   "coinciden. Esas huellas detectan cambios accidentales, pero no autentican al autor. "
+                   "Los parámetros privados de URL se omiten al guardar la procedencia; se retienen solo "
+                   "identificadores públicos necesarios para las fichas GrupLAC y CvLAC.")
 
     heading(doc, "8 Hipercubo lógico y estadísticas")
     paragraph(doc, "El hipercubo se implementa como consulta multidimensional calculada bajo demanda: "
@@ -392,7 +408,7 @@ def build() -> None:
     paragraph(doc, "No se almacena un cubo OLAP materializado. Cada solicitud selecciona una dimensión "
                    "relacional; la consulta no admite una intersección simultánea de grupo e investigador. "
                    "La consola muestra tablas y cifras; Tkinter muestra "
-                   "barras por año, tipología y categoría, además de una tabla de productos.")
+                   "barras por año, tipología, categoría y validación, además de una tabla de productos.")
 
     heading(doc, "9 Historias de usuario y aceptación")
     add_table(doc,
@@ -418,18 +434,18 @@ def build() -> None:
         ("R04", "Productos", "Registro con fecha, tipología, categoría, validación y DOI."),
         ("R05", "Integrantes y planes", "Membresía grupo-investigador y plan con grupo_id."),
         ("R06", "Entradas y salidas", "Campos del apartado 3; CSV y distribuciones del apartado 8."),
-        ("R07", "Fuentes externas", "CSV en ambos motores; URL pública y PDF de texto en Python."),
+        ("R07", "Fuentes externas", "CSV en ambos motores; URL pública, PDF, XLSX y DOCX en Python."),
         ("R08", "Listas", "Lista doble enlazada por tipo de entidad."),
         ("R09", "Multilistas", "Vínculos indexados y recorribles desde ambos extremos."),
         ("R10", "Pilas", "Deshacer LIFO de hasta 30 acciones, persistido en historial.csv."),
         ("R11", "Colas", "Revisión FIFO persistida en cola_validacion.csv."),
-        ("R12", "CRUD y persistencia", "Operaciones de dominio y esquema CSV versión 1."),
+        ("R12", "CRUD y persistencia", "Operaciones de dominio y esquema CSV versión 2, con migración de la versión 1."),
         ("R13", "Categoría y validación", "Actualización condicionada a observación nueva."),
         ("R14", "Ventanas temporales", "Dos años, cinco años o intervalo personalizado."),
         ("R15", "Vistas estadísticas", "Total, grupo, investigador o producto sin duplicar IDs."),
         ("R16", "Presentación C++", "Menús, tablas y resúmenes numéricos en consola."),
-        ("R17", "Presentación Python", "Barras por año, tipología y categoría; tabla paginada."),
-        ("R18", "Inicio con o sin datos", "Selector de inicio y apertura de carpeta CSV."),
+        ("R17", "Presentación Python", "Barras por año, tipología, categoría y validación; tabla paginada."),
+        ("R18", "Inicio con o sin datos", "Carga inicial de data/real, inicio vacío y apertura de carpeta CSV."),
         ("R19", "Archivos fuente", "Taller2_REMR.cpp y Taller2_REMR.py."),
         ("R20", "Especificación", "Modelo, estructuras, algoritmos, contratos y diagramas."),
     ]
@@ -437,11 +453,12 @@ def build() -> None:
               [1.25, 4.5, 11.05])
 
     heading(doc, "11 Restricciones del sistema y alcance de los datos")
-    paragraph(doc, "El conjunto data/real es una muestra de la ficha pública del grupo GISICO y del censo "
-                   "de integrantes publicado en GrupLAC. Contiene un grupo, 85 investigadores, 85 "
-                   "membresías, un plan y 202 productos fechados. Los perfiles individuales no se infieren "
-                   "a partir del censo; los campos no publicados permanecen vacíos. La muestra no representa "
-                   "a todos los grupos ni investigadores de la UPC.")
+    paragraph(doc, "El conjunto data/real reúne fichas públicas GrupLAC de 66 grupos UPC. Contiene "
+                   "2.736 investigadores, 3.291 membresías, 66 planes, 6.363 productos únicos, 6.735 "
+                   "vínculos grupo-producto y 9.703 autorías. Hay 274 investigadores con categoría "
+                   "CvLAC capturada. La categoría del grupo no se asigna a sus productos: cuando la "
+                   "fuente no clasifica un producto, su categoría queda vacía. Las fichas públicas pueden "
+                   "cambiar; este conjunto no constituye un censo institucional actualizado.")
     paragraph(doc, "La extracción de URL depende del contenido público entregado por el servidor. Los PDF "
                    "escaneados requieren OCR externo; las páginas que generan sus datos exclusivamente con "
                    "JavaScript o exigen autenticación no suministran registros estructurados por esta vía. "
@@ -455,7 +472,7 @@ def build() -> None:
     heading(doc, "12 Diccionario de persistencia")
     add_table(doc, ["Archivo", "Campos guardados"], [
         ["manifest.csv", "version, guardado"],
-        ["grupos.csv", "id, nombre, sigla, codigo_gruplac, fecha_creacion, unidad, responsable, categoria, descripcion, objetivos, mision, vision, lineas, url, fuente, activo"],
+        ["grupos.csv", "id, nombre, codigo_gruplac, fecha_creacion, unidad, responsable, categoria, descripcion, objetivos, mision, vision, lineas, url, fuente, activo"],
         ["investigadores.csv", "id, nombre, codigo_cvlac, afiliacion, categoria, contacto, url, fuente, activo"],
         ["productos.csv", "id, titulo, anio, fecha, familia, tipologia, categoria, validacion, observacion, doi, url, fuente, activo"],
         ["planes.csv", "id, grupo_id, nombre, inicio, fin, objetivo, indicador, meta, actividad, activo"],
@@ -505,7 +522,7 @@ def build() -> None:
         ["Consultar estadísticas", "Vista válida; ID seleccionado cuando corresponde; rango inicial no mayor que el final.",
          "Total único y distribuciones calculadas tras filtrar; paginar no modifica el total."],
         ["Guardar carpeta", "Datos con integridad referencial y ruta de destino escribible.",
-         "Se escriben diez CSV del esquema 1 y se conserva el guardado anterior en .backup."],
+         "Se escriben diez CSV del esquema 2 y se conserva el guardado anterior en .backup."],
     ], [3.15, 6.8, 6.85])
 
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)

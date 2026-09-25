@@ -2,10 +2,13 @@
 
 import csv
 from email.message import Message
+import hashlib
 import importlib.util
+import os
 from pathlib import Path
 import shutil
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -52,6 +55,8 @@ class StartupTest(unittest.TestCase):
             binary.write_bytes(b"MZ")
             binary.with_suffix(".source-sha256").write_bytes(
                 (root / "bin/windows/pea_cpp.source-sha256").read_bytes())
+            (checkout / "bin/windows/pea_cpp.exe.sha256").write_bytes(
+                (hashlib.sha256(b"MZ").hexdigest() + "\n").encode("ascii"))
             self.assertEqual(pea.bundled_windows_cpp(checkout), binary)
 
     def test_python_fallback_and_explicit_cpp_error(self):
@@ -206,15 +211,13 @@ class DomainTest(unittest.TestCase):
 
     def test_scienti_download_uses_page_charset(self):
         url = "https://scienti.minciencias.gov.co/cvlac/visualizador/generarCurriculoCv.do?cod_rh=0042"
-        html = '<meta charset="iso-8859-1"><p>Nombre</p><p>Juana Álvarez</p>'.encode("iso-8859-1")
-
-        class Headers:
-            @staticmethod
-            def get_content_charset():
-                return None
+        html = ('<meta charset="iso-8859-1"><h1>Hoja de vida</h1><p>Categoría</p>'
+                '<p>Investigador Junior (IJ) con vigencia</p><p>Nombre</p><p>Juana Álvarez</p>').encode("iso-8859-1")
 
         class Response:
-            headers = Headers()
+            def __init__(self):
+                self.headers = Message()
+                self.headers["Content-Type"] = "text/html"
 
             def __enter__(self):
                 return self
@@ -228,9 +231,19 @@ class DomainTest(unittest.TestCase):
             def read(self, _limit):
                 return html
 
-        with patch.object(pea, "urlopen", return_value=Response()):
-            kind, person = pea.download_scienti(url)
-        self.assertEqual((kind, person["nombre"]), ("investigadores", "Juana Álvarez"))
+        class Opener:
+            def __init__(self, response):
+                self.response = response
+
+            def open(self, _request, timeout):
+                return self.response
+
+        public_address = [(2, 1, 6, "", ("93.184.215.14", 443))]
+        with patch.object(pea.socket, "getaddrinfo", return_value=public_address):
+            with patch.object(pea, "build_opener", return_value=Opener(Response())):
+                preview = pea.fetch_web_page(url)
+        self.assertEqual(preview.suggested_kind, "investigadores")
+        self.assertEqual(preview.suggested_row["nombre"], "Juana Álvarez")
 
     def test_other_web_pages_are_previewed_without_invented_records(self):
         url = "https://example.org/about"
@@ -391,19 +404,20 @@ class DomainTest(unittest.TestCase):
                 if isinstance(repo, pea.CppRepository):
                     repo.close()
 
-    def test_real_sample_loads_with_expected_relations(self):
+    def test_real_dataset_loads_with_expected_relations(self):
         real = pea.load_repository(SOURCE.parents[2] / "data" / "real")
-        self.assertEqual(real.statistics()["total"], 202)
-        self.assertEqual(real.statistics(view="Grupo", selected_id="G-00000000002099")["total"], 202)
+        self.assertEqual(real.statistics()["total"], 6363)
+        self.assertEqual(real.statistics(view="Grupo", selected_id="G-00000000002099")["total"], 197)
         self.assertEqual(real.statistics(view="Investigador", selected_id="I-0000494917")["total"], 15)
-        self.assertEqual(len(real.rows("investigadores")), 85)
-        self.assertEqual(len(real.rows("membresias")), 85)
-        self.assertEqual(sum(row["activo"] == "1" for row in real.rows("membresias")), 67)
-        self.assertEqual(len(real.rows("planes")), 1)
-        self.assertEqual(len(real.rows("autorias")), 319)
-        self.assertEqual(len(real.rows("grupos_productos")), 202)
+        self.assertEqual(len(real.rows("grupos")), 66)
+        self.assertEqual(len(real.rows("investigadores")), 2736)
+        self.assertEqual(len(real.rows("membresias")), 3291)
+        self.assertEqual(len(real.rows("planes")), 66)
+        self.assertEqual(len(real.rows("autorias")), 9703)
+        self.assertEqual(len(real.rows("grupos_productos")), 6735)
+        self.assertTrue(all(not row["categoria"] for row in real.rows("productos")))
+        self.assertEqual(sum(bool(row["categoria"]) for row in real.rows("investigadores")), 274)
         self.assertEqual(real.get("investigadores", "I-0000494917")["categoria"], "Investigador Asociado (I)")
-        self.assertEqual(real.rows("membresias")[0]["inicio"], "")
 
     @unittest.skipUnless(shutil.which("pdftotext"), "Poppler no instalado")
     def test_text_pdf_import(self):
@@ -440,6 +454,246 @@ class DomainTest(unittest.TestCase):
         self.assertEqual(demo.statistics(start=2022, end=2026)["total"], 3)
         self.assertEqual(demo.statistics(view="Grupo", selected_id="G-DEMO-1")["total"], 3)
         self.assertEqual(demo.queue.peek()["producto_id"], "P-DEMO-2")
+
+
+class SecurityTest(unittest.TestCase):
+    def test_public_url_rejects_private_credentials_and_scheme(self):
+        for bad in ("http://127.0.0.1/", "http://10.0.0.1/", "http://localhost/x",
+                    "http://[::1]/", "ftp://example.org/x",
+                    "http://user:pass@example.org/x"):
+            with self.assertRaises(pea.DataError):
+                pea._validate_public_url(bad)
+
+    def test_public_url_rejects_nonstandard_port(self):
+        with self.assertRaises(pea.DataError):
+            pea._validate_public_url("https://example.org:8080/x")
+
+    def test_public_url_rejects_private_resolution(self):
+        mixed = [(2, 1, 6, "", ("93.184.215.14", 443)),
+                 (2, 1, 6, "", ("127.0.0.1", 443))]
+        with patch.object(pea.socket, "getaddrinfo", return_value=mixed):
+            with self.assertRaises(pea.DataError):
+                pea._validate_public_url("https://example.org/x")
+
+    def test_resolve_public_addrs_dedupes(self):
+        addresses = [(2, 1, 6, "", ("93.184.215.14", 443)),
+                     (2, 1, 6, "", ("93.184.215.14", 443))]
+        with patch.object(pea.socket, "getaddrinfo", return_value=addresses):
+            self.assertEqual(pea._resolve_public_addrs("example.org", 443), ["93.184.215.14"])
+
+    def test_public_opener_disables_proxy_and_pins(self):
+        opener = pea._build_public_opener()
+        self.assertTrue(any(isinstance(h, pea._PinnedHTTPHandler) for h in opener.handlers))
+        self.assertTrue(any(isinstance(h, pea._PinnedHTTPSHandler) for h in opener.handlers))
+        for handler in opener.handlers:
+            self.assertFalse(getattr(handler, "proxies", {}))
+
+    def test_redact_url_drops_sensitive_params(self):
+        url = ("https://scienti.minciencias.gov.co/gruplac/jsp/visualiza/visualizagr.jsp"
+               "?nro=0001&token=SECRET&auth=abc#frag")
+        self.assertEqual(pea._redact_url(url),
+                         "https://scienti.minciencias.gov.co/gruplac/jsp/visualiza/visualizagr.jsp?nro=0001")
+        self.assertEqual(pea._redact_url("https://example.org/a?token=x"), "https://example.org/a")
+
+    def test_csv_neutralizes_formula_cells(self):
+        self.assertEqual(pea._neutralize_cell("=SUM(A1)"), "'=SUM(A1)")
+        self.assertEqual(pea._neutralize_cell("+cmd"), "'+cmd")
+        self.assertEqual(pea._neutralize_cell("-2+3"), "'-2+3")
+        self.assertEqual(pea._neutralize_cell("@cmd"), "'@cmd")
+        self.assertEqual(pea._neutralize_cell("normal"), "normal")
+        self.assertEqual(pea._neutralize_cell(""), "")
+
+    def test_spreadsheet_export_neutralizes(self):
+        repo = sample()
+        repo.create("grupos", {"id": "G3", "nombre": '=HYPERLINK("http://x")'})
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)
+            pea.export_repository_spreadsheet(repo, path)
+            text = (path / "grupos.csv").read_text(encoding="utf-8")
+            self.assertIn("'=HYPERLINK", text)
+
+    def test_saved_csv_neutralizes_and_roundtrips_formula_text(self):
+        repo = pea.Repository()
+        repo.create("grupos", {"id": "G1", "nombre": "=1+1"}, remember=False)
+        repo.create("productos", {"id": "P1", "titulo": "'=texto"}, remember=False)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)
+            pea.save_repository(repo, path)
+            with (path / "grupos.csv").open(encoding="utf-8", newline="") as stream:
+                self.assertEqual(next(csv.DictReader(stream))["nombre"], "'=1+1")
+            with (path / "productos.csv").open(encoding="utf-8", newline="") as stream:
+                self.assertEqual(next(csv.DictReader(stream))["titulo"], "''=texto")
+            loaded = pea.load_repository(path)
+            self.assertEqual(loaded.get("grupos", "G1")["nombre"], "=1+1")
+            self.assertEqual(loaded.get("productos", "P1")["titulo"], "'=texto")
+
+    def test_legacy_v1_variants_load(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)
+            pea.save_repository(sample(), path)
+            with (path / "manifest.csv").open("w", encoding="utf-8", newline="") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(("version", "guardado"))
+                writer.writerow(("1", "2026-09-24T00:00:00"))
+            groups = pea._csv_read(path / "grupos.csv", pea.ENTITY_FIELDS["grupos"], encoded=True)
+            with (path / "grupos.csv").open("w", encoding="utf-8", newline="") as stream:
+                fields = ("id", "nombre", "sigla", *pea.ENTITY_FIELDS["grupos"][2:])
+                writer = csv.DictWriter(stream, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(groups)
+            self.assertEqual(pea.load_repository(path).get("grupos", "G1")["nombre"], "Grupo uno")
+            products = pea._csv_read(path / "productos.csv", pea.ENTITY_FIELDS["productos"], encoded=True)
+            with (path / "productos.csv").open("w", encoding="utf-8", newline="") as stream:
+                fields = tuple(field for field in pea.ENTITY_FIELDS["productos"] if field != "validacion")
+                writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(products)
+            (path / "cola_validacion.csv").unlink()
+            loaded = pea.load_repository(path)
+            self.assertEqual(loaded.get("productos", "P1")["validacion"], "pendiente")
+            self.assertEqual(loaded.queue_size(), 0)
+
+    def test_extract_pdf_text_caps_output(self):
+        class Stream:
+            def __init__(self, data):
+                self._data = data
+
+            def read(self, size):
+                chunk = self._data[:size]
+                self._data = self._data[size:]
+                return chunk
+
+            def close(self):
+                pass
+
+        class Process:
+            def __init__(self, stdout):
+                self.stdout = Stream(stdout)
+                self.stderr = Stream("")
+                self.returncode = 0
+
+            def kill(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "x.pdf"
+            path.write_bytes(b"%PDF-1.4")
+            with patch.object(pea.shutil, "which", return_value="/usr/bin/pdftotext"):
+                with patch.object(pea.subprocess, "Popen",
+                                  return_value=Process("x" * (pea.MAX_PDF_TEXT + 1))):
+                    with self.assertRaises(pea.DataError):
+                        pea.extract_pdf_text(path)
+
+    @unittest.skipIf(os.name == "nt", "El ejecutable falso usa un shebang POSIX")
+    def test_pdf_wall_timeout_stops_stalled_converter(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            converter = folder / "pdftotext"
+            converter.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(3)\n", encoding="utf-8")
+            converter.chmod(0o755)
+            pdf = folder / "documento.pdf"
+            pdf.write_bytes(b"%PDF-1.4")
+            with patch.dict(os.environ, {"PATH": str(folder) + os.pathsep + os.environ["PATH"]}):
+                with patch.object(pea, "PDF_TIMEOUT", 1):
+                    started = time.monotonic()
+                    with self.assertRaisesRegex(pea.DataError, "tiempo"):
+                        pea.extract_pdf_text(pdf)
+                    self.assertLess(time.monotonic() - started, 2.5)
+
+    def test_field_length_limit(self):
+        repo = pea.Repository()
+        with self.assertRaises(pea.DataError):
+            repo.create("grupos", {"id": "G1", "nombre": "x" * (pea.MAX_FIELD_LEN + 1)})
+
+    def test_csv_row_limit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "productos.csv"
+            with path.open("w", encoding="utf-8", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=pea.ENTITY_FIELDS["productos"])
+                writer.writeheader()
+                for index in range(10):
+                    writer.writerow({"id": f"P{index}", "titulo": "T"})
+            with patch.object(pea, "MAX_CSV_ROWS", 5):
+                with self.assertRaises(pea.DataError):
+                    pea._csv_read(path, pea.ENTITY_FIELDS["productos"])
+
+    def test_deeply_nested_jsonld_does_not_crash(self):
+        nested = '{"@type":"ScholarlyArticle","@graph":' + '{"@graph":' * 5000 + '{}' + '}' * 5000 + '}'
+        html = f'<script type="application/ld+json">{nested}</script>'
+        preview = pea.parse_web_page(html, "https://example.org/x")
+        self.assertIsNone(preview.suggested_kind)
+
+
+def _minimal_docx(text: str) -> bytes:
+    content_types = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                     '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                     '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                     '<Default Extension="xml" ContentType="application/xml"/>'
+                     '<Override PartName="/word/document.xml" '
+                     'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+                     '</Types>')
+    rels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+            'Target="word/document.xml"/></Relationships>')
+    document = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                '<w:body><w:p><w:r><w:t>' + text + '</w:t></w:r></w:p></w:body></w:document>')
+    import io
+    import zipfile
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", rels)
+        archive.writestr("word/document.xml", document)
+    return buffer.getvalue()
+
+
+class ImportFormatsTest(unittest.TestCase):
+    def test_xlsx_to_csv_roundtrip(self):
+        try:
+            import openpyxl
+        except ImportError:
+            self.skipTest("openpyxl no instalado")
+        workbook = openpyxl.Workbook()
+        workbook.active.append(["id", "nombre"])
+        workbook.active.append(["1", "Ana"])
+        workbook.active.append(["2", "Beto"])
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "datos.xlsx"
+            target = Path(temp) / "datos.csv"
+            workbook.save(source)
+            pea._xlsx_to_csv(source, target)
+            rows = pea._csv_read(target, ("id", "nombre"))
+            self.assertEqual([row["nombre"] for row in rows], ["Ana", "Beto"])
+
+    def test_xlsx_to_csv_requires_headers(self):
+        try:
+            import openpyxl
+        except ImportError:
+            self.skipTest("openpyxl no instalado")
+        workbook = openpyxl.Workbook()
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "vacio.xlsx"
+            target = Path(temp) / "vacio.csv"
+            workbook.save(source)
+            with self.assertRaises(pea.DataError):
+                pea._xlsx_to_csv(source, target)
+
+    def test_docx_extract_text(self):
+        try:
+            import mammoth
+        except ImportError:
+            self.skipTest("mammoth no instalado")
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "documento.docx"
+            path.write_bytes(_minimal_docx("Hola mundo"))
+            html = pea.extract_docx_html(path)
+            self.assertIn("Hola mundo", html)
 
 
 if __name__ == "__main__":

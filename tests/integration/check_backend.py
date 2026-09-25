@@ -108,9 +108,49 @@ def main() -> None:
                 assert reopened.get("productos", "P-B")["categoria"] == ""
             finally:
                 reopened.close()
+            backend.create("productos", {"id": "P-FORMULA", "titulo": "=1+1"})
+            backend.save(path)
+            with (path / "productos.csv").open(encoding="utf-8", newline="") as stream:
+                saved_rows = list(csv.DictReader(stream))
+            assert next(row for row in saved_rows if row["id"] == "P-FORMULA")["titulo"] == "'=1+1"
+            python_repo = pea.load_repository(path)
+            assert python_repo.get("productos", "P-FORMULA")["titulo"] == "=1+1"
+            pea.save_repository(python_repo, path)
+            backend.load(path)
+            assert backend.get("productos", "P-FORMULA")["titulo"] == "=1+1"
     finally:
         backend.close()
     assert backend.process.poll() is not None
+    with tempfile.TemporaryDirectory(prefix="pea-legacy-") as folder:
+        path = Path(folder)
+        old = pea.Repository()
+        old.create("grupos", {"id": "G-OLD", "nombre": "Grupo anterior"}, remember=False)
+        old.create("productos", {"id": "P-OLD", "titulo": "Producto anterior"}, remember=False)
+        pea.save_repository(old, path)
+        with (path / "manifest.csv").open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(("version", "guardado"))
+            writer.writerow(("1", "2026-09-24T00:00:00"))
+        groups = pea._csv_read(path / "grupos.csv", pea.ENTITY_FIELDS["grupos"], encoded=True)
+        with (path / "grupos.csv").open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=("id", "nombre", "sigla", *pea.ENTITY_FIELDS["grupos"][2:]))
+            writer.writeheader()
+            writer.writerows(groups)
+        products = pea._csv_read(path / "productos.csv", pea.ENTITY_FIELDS["productos"], encoded=True)
+        with (path / "productos.csv").open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=tuple(
+                field for field in pea.ENTITY_FIELDS["productos"] if field != "validacion"), extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(products)
+        (path / "cola_validacion.csv").unlink()
+        legacy = pea.CppRepository(binary)
+        try:
+            legacy.load(path)
+            assert legacy.get("productos", "P-OLD")["validacion"] == "pendiente"
+            legacy.save(path)
+            assert pea.load_repository(path).get("grupos", "G-OLD")["nombre"] == "Grupo anterior"
+        finally:
+            legacy.close()
     print("Backend C++ conectado: CRUD, estadísticas, cola, deshacer y CSV.")
 
 

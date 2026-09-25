@@ -47,8 +47,10 @@ const std::array<std::string, 7> ALL_KINDS = {
     "grupos", "investigadores", "productos", "planes",
     "membresias", "autorias", "grupos_productos"
 };
+constexpr std::size_t MAX_FIELD_LENGTH = 100000;
+constexpr std::size_t MAX_CSV_ROWS = 500000;
 const std::map<std::string, std::vector<std::string>> FIELDS = {
-    {"grupos", {"id", "nombre", "sigla", "codigo_gruplac", "fecha_creacion", "unidad", "responsable",
+    {"grupos", {"id", "nombre", "codigo_gruplac", "fecha_creacion", "unidad", "responsable",
                 "categoria", "descripcion", "objetivos", "mision", "vision", "lineas", "url", "fuente", "activo"}},
     {"investigadores", {"id", "nombre", "codigo_cvlac", "afiliacion", "categoria", "contacto", "url", "fuente", "activo"}},
     {"productos", {"id", "titulo", "anio", "fecha", "familia", "tipologia", "categoria",
@@ -68,7 +70,7 @@ const std::map<std::string, std::vector<std::string>> REQUIRED = {
     {"productos", {"id", "titulo"}}, {"planes", {"id", "grupo_id", "nombre"}}
 };
 const std::map<std::string, std::string> LABELS = {
-    {"id", "ID"}, {"nombre", "Nombre"}, {"sigla", "Sigla"},
+    {"id", "ID"}, {"nombre", "Nombre"},
     {"codigo_gruplac", "Codigo GrupLAC"}, {"fecha_creacion", "Fecha creacion"},
     {"unidad", "Unidad academica"}, {"responsable", "Responsable"},
     {"categoria", "Categoria"}, {"descripcion", "Descripcion"}, {"objetivos", "Objetivos"},
@@ -255,6 +257,9 @@ Row cleanRow(const std::string& kind, const Row& input) {
     if ((kind == "planes" || kind == "membresias") && !row["inicio"].empty() &&
         !row["fin"].empty() && row["inicio"] > row["fin"])
         throw DataError("La fecha final precede la inicial");
+    for (const auto& [name, value] : row)
+        if (value.size() > MAX_FIELD_LENGTH)
+            throw DataError(label(name) + " supera el tamano permitido");
     return row;
 }
 
@@ -685,9 +690,16 @@ public:
     }
 };
 
+std::string storageCell(const std::string& value) {
+    if (!value.empty() && std::string("=+-@\t\r'").find(value.front()) != std::string::npos)
+        return "'" + value;
+    return value;
+}
+
 // Lee registros uno a uno; admite BOM, comillas, CRLF y saltos de linea dentro de celdas.
 std::size_t readCsvEach(const fs::path& path, const std::vector<std::string>& requiredFields,
-                        const std::function<void(Row, std::size_t)>& visit) {
+                        const std::function<void(Row, std::size_t)>& visit,
+                        bool encoded = false) {
     std::ifstream input(path, std::ios::binary);
     if (!input) throw DataError("No se pudo abrir " + path.string());
     char bom[3]{};
@@ -717,10 +729,16 @@ std::size_t readCsvEach(const fs::path& path, const std::vector<std::string>& re
                 throw DataError("Encabezados incorrectos en " + path.filename().string());
             hasHeader = true;
         } else {
+            if (number - 1 > MAX_CSV_ROWS)
+                throw DataError(path.filename().string() + ": demasiadas filas");
             if (record.size() != header.size())
                 throw DataError(path.filename().string() + ", fila " + std::to_string(number) + " malformada");
             Row row;
-            for (std::size_t i = 0; i < header.size(); ++i) row[header[i]] = std::move(record[i]);
+            for (std::size_t i = 0; i < header.size(); ++i) {
+                std::string value = std::move(record[i]);
+                if (encoded && !value.empty() && value.front() == '\'') value.erase(0, 1);
+                row[header[i]] = std::move(value);
+            }
             visit(std::move(row), number);
         }
         record.clear();
@@ -783,7 +801,8 @@ void writeCsv(const fs::path& path, const std::vector<std::string>& header, cons
     if (!output) throw DataError("No se pudo completar " + path.string());
 }
 void writeCsvEach(const fs::path& path, const std::vector<std::string>& header,
-                  const std::function<void(const std::function<void(const Row&)>&)>& produce) {
+                  const std::function<void(const std::function<void(const Row&)>&)>& produce,
+                  bool encoded = false) {
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     if (!output) throw DataError("No se pudo escribir " + path.string());
     for (std::size_t i = 0; i < header.size(); ++i)
@@ -791,7 +810,7 @@ void writeCsvEach(const fs::path& path, const std::vector<std::string>& header,
     output << '\n';
     produce([&](const Row& row) {
         for (std::size_t i = 0; i < header.size(); ++i)
-            output << (i ? "," : "") << csvCell(field(row, header[i]));
+            output << (i ? "," : "") << csvCell(encoded ? storageCell(field(row, header[i])) : field(row, header[i]));
         output << '\n';
     });
     output.flush();
@@ -1019,6 +1038,7 @@ class Repository {
                 Row row = change;
                 row.erase("__op");
                 row.erase("__kind");
+                if (kind == "grupos") row.erase("sigla");
                 cleanRow(kind, row);
             } else if (FIELDS.count(kind) && op == "delete") {
                 if (entityIndex(kind) >= 0 ? field(change, "id").empty() :
@@ -1058,6 +1078,8 @@ class Repository {
                 Row row = change;
                 row.erase("__op");
                 row.erase("__kind");
+                if (kind == "grupos") row.erase("sigla");
+                row = cleanRow(kind, row);
                 if (op == "create") create(kind, row, false);
                 else {
                     Row* current = get(kind, key, second);
@@ -1319,20 +1341,23 @@ public:
     }
     void restore(const std::string& state) {
         auto parsed = SnapshotParser(state).parse();
-        if (parsed.size() != ALL_KINDS.size() + 1 || !parsed.count("cola_validacion"))
+        if ((parsed.size() != ALL_KINDS.size() + 1 || !parsed.count("cola_validacion")) &&
+            parsed.size() != ALL_KINDS.size())
             throw DataError("Historial incompleto");
         Repository fresh;
         for (const auto& kind : ENTITY_KINDS) {
             if (!parsed.count(kind)) throw DataError("Historial sin " + kind);
-            for (const Row& row : parsed.at(kind)) fresh.create(kind, row, false);
+            for (Row row : parsed.at(kind)) {
+                if (kind == "grupos") row.erase("sigla");
+                fresh.create(kind, row, false);
+            }
         }
         for (const auto& kind : RELATION_KINDS) {
             if (!parsed.count(kind)) throw DataError("Historial sin " + kind);
             for (const Row& row : parsed.at(kind)) fresh.create(kind, row, false);
         }
-        for (const Row& job : parsed.at("cola_validacion")) {
-            fresh.loadJob(job);
-        }
+        if (parsed.count("cola_validacion"))
+            for (const Row& job : parsed.at("cola_validacion")) fresh.loadJob(job);
         entities_ = std::move(fresh.entities_);
         relations_ = std::move(fresh.relations_);
         externalIndex_ = std::move(fresh.externalIndex_);
@@ -1474,6 +1499,18 @@ std::vector<std::string> dataFiles() {
     result.push_back("historial.csv");
     return result;
 }
+bool headerMatches(const fs::path& path, const std::vector<std::string>& fields) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) throw DataError("No se pudo abrir " + path.string());
+    std::string first;
+    std::getline(input, first);
+    if (startsWith(first, "\xef\xbb\xbf")) first.erase(0, 3);
+    if (!first.empty() && first.back() == '\r') first.pop_back();
+    std::string expected;
+    for (std::size_t i = 0; i < fields.size(); ++i)
+        expected += (i ? "," : "") + fields[i];
+    return first == expected;
+}
 Repository loadRepository(const fs::path& directory) {
     std::string version;
     std::size_t manifestRows = 0;
@@ -1482,17 +1519,33 @@ Repository loadRepository(const fs::path& directory) {
         if (++manifestRows > 1) throw DataError("Manifest con mas de una fila");
         version = field(row, "version");
     });
-    if (manifestRows != 1 || version != "1")
+    if (manifestRows != 1 || (version != "1" && version != "2"))
         throw DataError("Version de datos incompatible");
+    const bool legacy = version == "1";
     Repository repo;
     for (const auto& kind : ENTITY_KINDS) {
-        readCsvEach(directory / (kind + ".csv"), FIELDS.at(kind),
+        auto columns = FIELDS.at(kind);
+        const fs::path path = directory / (kind + ".csv");
+        if (legacy && kind == "grupos") {
+            auto oldColumns = columns;
+            oldColumns.insert(oldColumns.begin() + 2, "sigla");
+            if (headerMatches(path, oldColumns)) columns = std::move(oldColumns);
+        }
+        if (legacy && kind == "productos") {
+            auto oldColumns = columns;
+            oldColumns.erase(std::remove(oldColumns.begin(), oldColumns.end(), "validacion"), oldColumns.end());
+            if (headerMatches(path, oldColumns)) columns = std::move(oldColumns);
+        }
+        readCsvEach(path, columns,
                     [&](Row row, std::size_t number) {
-            try { repo.create(kind, row, false); }
+            try {
+                if (legacy && kind == "grupos") row.erase("sigla");
+                repo.create(kind, row, false);
+            }
             catch (const DataError& error) {
                 throw DataError(kind + ".csv, fila " + std::to_string(number) + ": " + error.what());
             }
-        });
+        }, !legacy);
     }
     for (const auto& kind : RELATION_KINDS) {
         readCsvEach(directory / (kind + ".csv"), FIELDS.at(kind),
@@ -1501,21 +1554,22 @@ Repository loadRepository(const fs::path& directory) {
             catch (const DataError& error) {
                 throw DataError(kind + ".csv, fila " + std::to_string(number) + ": " + error.what());
             }
-        });
+        }, !legacy);
     }
-    readCsvEach(directory / "cola_validacion.csv", QUEUE_FIELDS,
+    const fs::path queuePath = directory / "cola_validacion.csv";
+    if (!legacy || fs::exists(queuePath)) readCsvEach(queuePath, QUEUE_FIELDS,
                 [&](Row job, std::size_t number) {
         try { repo.loadJob(job); }
         catch (const DataError& error) {
             throw DataError("cola_validacion.csv, fila " + std::to_string(number) + ": " + error.what());
         }
-    });
+    }, !legacy);
     Rows history;
     readCsvEach(directory / "historial.csv", HISTORY_FIELDS,
                 [&](Row row, std::size_t) {
         if (history.size() >= 30) throw DataError("Historial supera 30 acciones");
         history.push_back(std::move(row));
-    });
+    }, !legacy);
     repo.loadHistory(history);
     repo.markSaved();
     return repo;
@@ -1535,19 +1589,19 @@ void saveRepository(Repository& repo, const fs::path& directory) {
     const auto tick = std::chrono::high_resolution_clock::now().time_since_epoch().count();
     StagingFolder stage(directory / (".pea-stage-" + std::to_string(tick)));
     writeCsv(stage.path / "manifest.csv", MANIFEST_FIELDS,
-             {{{"version", "1"}, {"guardado", nowIso()}}});
+             {{{"version", "2"}, {"guardado", nowIso()}}});
     for (const auto& kind : ALL_KINDS)
         writeCsvEach(stage.path / (kind + ".csv"), FIELDS.at(kind),
-                     [&](const auto& visit) { repo.forEachRow(kind, visit); });
+                     [&](const auto& visit) { repo.forEachRow(kind, visit); }, true);
     writeCsvEach(stage.path / "cola_validacion.csv", QUEUE_FIELDS,
-                 [&](const auto& visit) { repo.forEachQueue(visit); });
+                 [&](const auto& visit) { repo.forEachQueue(visit); }, true);
     std::size_t order = 0;
     writeCsvEach(stage.path / "historial.csv", HISTORY_FIELDS,
                  [&](const auto& visit) {
         repo.forEachHistory([&](const std::string& state) {
             visit({{"orden", std::to_string(order++)}, {"snapshot", state}});
         });
-    });
+    }, true);
     const fs::path backup = directory / ".backup";
     fs::create_directories(backup);
     const auto files = dataFiles();

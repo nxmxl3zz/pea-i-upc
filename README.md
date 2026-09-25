@@ -1,203 +1,104 @@
-# PEA-i UPC — gestor de investigación
+# PEA-i UPC
 
-Dos programas para gestionar grupos de investigación, investigadores, productos, planes y sus relaciones. **C++** ofrece menús de consola y también actúa como backend de la **interfaz Python Tkinter**. Al abrir la ventana, Python inicia C++ automáticamente cuando está disponible: C++ gestiona los datos, validaciones, estadísticas, cola, historial y CSV; Tkinter muestra formularios y gráficos. Si C++ no puede arrancar, la ventana abre con el motor Python independiente.
-
-> **Estado actual:** las dos versiones están implementadas y usan los nombres de entrega `Taller2_REMR.py` y `Taller2_REMR.cpp`. La aplicación abre en Windows; la revisión completa de sus flujos en ese sistema sigue pendiente. La [especificación técnica en Word](docs/especificacion_tecnica.docx) es el único documento de entrega.
+Programa Estadístico de Análisis de Investigación para la Universidad Popular del Cesar. El proyecto contiene dos soluciones: una consola C++17 y una aplicación Python con Tkinter. La ventana inicia el motor C++ como proceso local cuando está disponible y usa el motor Python autónomo si no puede iniciarlo. La comunicación entre ambos usa JSON por `stdin`/`stdout`; no requiere abrir dos ventanas ni un servidor.
 
 ## Organización del repositorio
 
 ```text
-pea-i-upc/
-├── Iniciar PEA-i.pyw              Inicio con doble clic en Windows
-├── src/
-│   ├── cpp/Taller2_REMR.cpp       Consola y motor de datos C++
-│   └── python/Taller2_REMR.py     Interfaz Tkinter y motor Python autónomo
-├── bin/windows/                   Ejecutable C++ de 64 bits y huella de fuentes
-├── data/
-│   ├── demo/                      Muestra ficticia en CSV
-│   └── real/                      Muestra pública y procedencia de sus datos
-├── docs/
-│   ├── especificacion_tecnica.docx  Especificación técnica de entrega
-│   ├── esquema_datos.md           Campos CSV y reglas de integridad
-│   └── protocolo_backend.md       Comunicación local entre Python y C++
-├── scripts/                       Generación de muestras, Word y binario Windows
-├── tests/                         Pruebas Python, integración y carga
-├── CMakeLists.txt                  Compilación del motor C++
-├── ENUNCIADO_TALLER_2.md          Requisitos del profesor
-├── PLAN_PROYECTO.md               Alcance y criterios de aceptación
-├── PROGRESO.md                    Avance y verificaciones del desarrollo
-└── README.md                      Esta guía
+Iniciar PEA-i.pyw                 Lanzador de doble clic en Windows
+src/cpp/Taller2_REMR.cpp         Consola y backend C++
+src/python/Taller2_REMR.py       Interfaz Tkinter y motor Python autónomo
+bin/windows/                    Ejecutable C++ de 64 bits y huellas de integridad
+data/demo/                       Datos ficticios para demostración
+data/real/                       Captura pública de grupos UPC y procedencia
+docs/especificacion_tecnica.docx Especificación técnica de entrega
+docs/esquema_datos.md            Contrato de persistencia CSV
+docs/protocolo_backend.md        Protocolo entre Tkinter y C++
+scripts/                       Regeneración de datos, documento y binario
+tests/                         Pruebas del dominio, integración y carga
+CMakeLists.txt                  Compilación C++
+ENUNCIADO_TALLER_2.md           Requisitos del taller
 ```
 
-`build/` contiene compilaciones locales y no se sube al repositorio. `data/local/` queda reservado para datos de trabajo y también está excluido de Git. El Word de `docs/` puede abrirse y editarse en LibreOffice; `scripts/build_technical_spec.py` lo regenera desde código y sobrescribe los cambios manuales.
+`build/`, `data/local/`, `.claude/` y los archivos temporales no forman parte de la entrega. El documento de cambios de trabajo `docs/cambios_sesion.md` tampoco se publica.
 
-## Descargar y ejecutar
+## Instalación y ejecución
 
-En GitHub, abra **Code → Download ZIP** y descomprima el proyecto. Si prefiere Git, copie la URL HTTPS del botón **Code** y ejecute `git clone URL_COPIADA`; después entre en la carpeta creada. Abra una terminal **dentro de la carpeta descomprimida o clonada**, donde está este `README.md`. GitHub muestra el código, pero la ventana Tkinter se ejecuta en su computadora.
+Descargue el ZIP del repositorio en GitHub y **extraiga la carpeta completa**, o use `git clone`. Se necesita Python 3.10 o posterior con Tkinter y una sesión de escritorio. Las funciones básicas no requieren paquetes de `pip`.
 
-Para abrir la ventana necesita **Python 3.10 o posterior con Tkinter** y una sesión de escritorio. No hay paquetes de `pip` obligatorios. En Windows de 64 bits, el repositorio incluye el ejecutable C++ necesario para la conexión; **el usuario no necesita instalar CMake, NMake ni `g++`**. En otros sistemas, Python intenta compilar C++ con CMake y un compilador C++17 disponibles. Si no puede, la ventana funciona con el motor Python. La consola C++ y el modo Python independiente funcionan por separado.
+### Windows de 64 bits
+
+Haga doble clic en **`Iniciar PEA-i.pyw`**. El repositorio incluye `bin/windows/pea_cpp.exe`, por lo que el uso normal no requiere CMake, NMake, Dev-C++ ni `g++`. Si la asociación de `.pyw` no funciona, abra PowerShell en la raíz del proyecto y ejecute:
+
+```powershell
+py -3 src/python/Taller2_REMR.py
+```
+
+El motor activo aparece en **Ayuda → Acerca de PEA-i**. Para ejecutar solo la consola C++ use `bin\windows\pea_cpp.exe`. Para forzar el motor Python use `py -3 src/python/Taller2_REMR.py --python-backend`.
 
 ### Linux
-
-Compruebe que Python y Tkinter están disponibles:
-
-```bash
-python3 --version
-python3 -m tkinter
-```
-
-El segundo comando abre una pequeña ventana de prueba; ciérrela y ejecute:
 
 ```bash
 python3 src/python/Taller2_REMR.py
 ```
 
-La ventana inicia y cierra su propio proceso de backend; no necesita abrir la consola C++ aparte. Para comprobar qué motor está usando, abra **Ayuda → Acerca de PEA-i**.
-
-### Windows — doble clic
-
-Extraiga el ZIP completo o clone el repositorio. Haga doble clic en **`Iniciar PEA-i.pyw`** en la carpeta principal. También puede abrir directamente **`src/python/Taller2_REMR.py`**. En Windows de 64 bits la interfaz usa el backend C++ incluido, sin abrir Dev-C++ ni instalar CMake. El archivo `.pyw` evita que aparezca una ventana de consola. Para comprobar el motor activo, abra **Ayuda → Acerca de PEA-i**.
-
-Si Windows abre el archivo como texto, instale Python 3.10 o posterior con Tkinter y asocie los archivos `.pyw` con Python; también puede iniciarlo desde PowerShell:
-
-```powershell
-py -3 --version
-py -3 -m tkinter
-py -3 src/python/Taller2_REMR.py
-```
-
-Si `py` no está disponible, pruebe los mismos comandos con `python`. Cierre la ventana de prueba de Tkinter antes de iniciar PEA-i.
-
-Si desea usar un ejecutable C++ propio, indique su ruta con `--cpp-binary`; en ese caso, un error de ese ejecutable se muestra en lugar de cambiar al motor Python.
-
-Si descargó un ZIP, **extraiga todos los archivos** antes de ejecutar el programa: la opción de demostración busca `data/demo` dentro del proyecto.
-
-### C++ — Linux
-
-Desde la raíz del proyecto:
+Si CMake y un compilador C++17 están instalados, la ventana compila y ejecuta el backend C++ cuando hace falta. Si no están disponibles, inicia el motor Python. Para compilar y abrir la consola por separado:
 
 ```bash
 cmake -S . -B build
-cmake --build build --config Release
+cmake --build build
 ./build/pea_cpp
 ```
 
-### C++ — Windows (PowerShell)
+Para indicar un ejecutable C++ propio use `--cpp-binary RUTA`. Para abrir una carpeta guardada al iniciar use `--data-dir RUTA`. La consola admite `--demo` y `--data-dir RUTA`.
 
-Esta compilación manual es opcional para el usuario de la interfaz. Para compilar con Dev-C++, configure el `PATH` de Windows para que encuentre `g++.exe` y `mingw32-make.exe`, instale CMake y ejecute:
+## Uso de la ventana
 
-```powershell
-cmake -S . -B build-mingw -G "MinGW Makefiles"
-cmake --build build-mingw
-.\build-mingw\pea_cpp.exe
-```
+Al iniciar se abre automáticamente `data/real`, salvo que se indique `--data-dir`. El menú **Archivo** permite iniciar vacío, abrir otra carpeta, cargar la demostración y guardar una copia. `data/demo` y `data/real` se tratan como muestras de solo lectura desde la ventana: use **Guardar como** para conservar cambios en otra carpeta.
 
-Si ya existe una carpeta de compilación configurada con NMake, use la carpeta nueva `build-mingw` del ejemplo para evitar conflictos de generador. Los comandos de Windows todavía no se han probado en un equipo Windows.
+La navegación lateral contiene Dashboard, Gráficos, Grupos, Investigadores, Productos, Planes, Relaciones y Cola de revisión. El botón ☰ contrae o despliega el menú. Las tablas muestran 100 filas por página y la búsqueda abarca el conjunto completo. En las pestañas de entidades, haga doble clic en una fila o pulse **Información** para abrir sus campos y productos relacionados.
 
-Para actualizar el ejecutable Windows incluido después de modificar C++, ejecute `python scripts/build_windows_backend.py` con un compilador MinGW de 64 bits. El script vuelve a generar `bin/windows/pea_cpp.exe` y su huella de fuentes. Los usuarios de la interfaz no necesitan ejecutar este paso.
+El dashboard muestra productos únicos por vista (Todos, Grupo, Investigador o Producto), con filtros de año, categoría y validación. Los filtros de selección se aplican al cambiarlos. Los gráficos agrupan por año, tipología, categoría y validación. Un dato vacío no se inventa: el producto sigue en el total y figura como «Sin dato» en la distribución correspondiente. La categoría del **grupo** no se copia a la categoría del **producto**.
 
-### Dos modos de la ventana
+Puede crear, editar, desactivar y eliminar entidades y relaciones. El cambio de categoría o validación de un producto exige una observación nueva. La **Cola de revisión** procesa productos por orden de llegada; **Editar → Deshacer** revierte acciones. Los datos, la cola y el historial se conservan al guardar.
 
-`python3 src/python/Taller2_REMR.py` prefiere C++ como backend y usa Python si C++ no está disponible. Para forzar la implementación Python independiente, use `python3 src/python/Taller2_REMR.py --python-backend`. La consola C++ se ejecuta con `./build/pea_cpp` en Linux o con `bin\windows\pea_cpp.exe` en Windows. Los tres modos usan el mismo [esquema CSV](docs/esquema_datos.md), pero abra una misma carpeta de datos en una sola instancia a la vez. La [conexión entre Tkinter y C++](docs/protocolo_backend.md) funciona localmente, sin red.
+### Importar información
 
-### Mostrar el cruce en una demostración
+- **CSV:** ambos motores importan los archivos con los encabezados de [esquema_datos.md](docs/esquema_datos.md). La vista previa indica filas aceptables y rechazadas.
+- **Excel `.xlsx`:** la interfaz Python convierte la primera hoja a CSV antes de la vista previa. Requiere `openpyxl` (`pip install openpyxl`).
+- **URL pública:** la interfaz Python muestra HTML, texto, CSV o PDF de texto antes de crear registros. Reconoce fichas GrupLAC/CvLAC y metadatos explícitos de artículos; otros sitios pueden mostrarse sin proponer campos. No ejecuta JavaScript de la página ni inicia sesión en sitios externos.
+- **PDF local:** la interfaz Python requiere `pdftotext` de Poppler y texto seleccionable. Un PDF escaneado necesita OCR externo.
+- **Word `.docx`:** la interfaz Python extrae texto para vista previa mediante `mammoth` (`pip install mammoth`).
 
-1. Abra `python3 src/python/Taller2_REMR.py`. En **Ayuda → Acerca de PEA-i** puede ver el motor de datos activo; por defecto se inicia un proceso C++ en segundo plano.
-2. Cargue la demostración y guarde una copia en otra carpeta, por ejemplo `data/local`. Cree o edite un registro en la ventana y guarde.
-3. Cierre la ventana y ejecute `./build/pea_cpp --data-dir data/local`. Consulte el mismo registro desde los menús C++. Para mostrar la segunda implementación autónoma, también puede abrir la copia con `python3 src/python/Taller2_REMR.py --python-backend --data-dir data/local`.
+La consola C++ importa CSV; en el uso integrado, Python consulta las fuentes y envía a C++ los registros aceptados.
 
-## Primer uso y demostración
+## Datos incluidos y persistencia
 
-Al abrir la ventana Python, elija una de estas opciones:
+`data/demo` contiene 2 grupos, 3 investigadores, 4 productos y 2 revisiones ficticias. `data/real` contiene **66 grupos, 2.736 investigadores, 6.363 productos, 66 planes, 3.291 membresías, 6.735 vínculos grupo-producto y 9.703 autorías** de fichas públicas GrupLAC. De los investigadores, 274 tienen una categoría CvLAC capturada; los campos sin fuente suficiente quedan vacíos. La [procedencia y límites de la captura](data/real/README.md) están documentados aparte. No se necesita Internet para consultar los CSV incluidos.
 
-| Opción | Resultado |
-|---|---|
-| **Iniciar vacío** | Crea un espacio sin registros. Puede agregar datos con los formularios de Python o los menús de C++, o importar CSV. |
-| **Abrir carpeta de datos** | Recupera un espacio PEA-i guardado antes; indique la carpeta que contiene `manifest.csv`. |
-| **Cargar datos reales** | Abre [data/real](data/real/README.md), una captura de las fichas públicas GrupLAC/CvLAC del enunciado con 85 integrantes, un plan y 202 productos fechados. |
-| **Cargar demostración** | Abre `data/demo`, con datos **ficticios** para recorrer la aplicación sin Internet. |
+Cada carpeta de trabajo contiene `manifest.csv`, cuatro CSV de entidades, tres de relaciones, `cola_validacion.csv` e `historial.csv`. El esquema actual es la **versión 2**. Las carpetas anteriores de versión 1 se abren en ambos motores y se convierten al guardar; conviene conservar una copia antes de abrirlas. La carpeta `.backup` guarda los archivos del guardado anterior. Abra una carpeta editable en una sola instancia a la vez.
 
-Para ver las fuentes reales, elija **Cargar datos reales** o ejecute `python3 src/python/Taller2_REMR.py --data-dir data/real`. El dashboard muestra 202 productos fechados del grupo GISICO, con gráficos por año y tipología. La pestaña **Investigadores** contiene los 85 integrantes publicados en la ficha; **Relaciones → Integrantes** distingue 67 membresías actuales y 18 finalizadas. Hay 319 autorías vinculadas por coincidencia de nombre con el censo, y un plan estratégico en **Planes**. Solo el perfil CvLAC de Adith Bismarck Pérez Orozco se consultó individualmente para añadir su categoría; los demás conservan los datos publicados en el censo. Seleccione un grupo o investigador y pulse **Consultar fuente** para revisar su página pública y, si corresponde, completar su ficha. Las categorías de producto quedan vacías porque la fuente no declara una categoría comparable con ese campo.
+La versión 2 neutraliza en disco los valores que una hoja de cálculo podría interpretar como fórmulas y los recupera al cargar. **Archivo → Exportar para hoja de cálculo** crea una copia segura para consulta; esa exportación no incluye la cola ni el historial y no sustituye una carpeta de trabajo.
 
-Para comprobar rápidamente los filtros, cargue la demostración. En el **Dashboard** de Python o **Estadísticas** de C++, la vista **Todos** muestra cuatro productos. El rango **2025–2026** muestra dos; **2022–2026** muestra tres. El producto `P-DEMO-1` está vinculado a dos grupos y se cuenta una sola vez en el total institucional. En C++, seleccione la opción **4. Rango** para indicar esos años.
+## Medidas y límites de seguridad
 
-Las carpetas `data/demo` y `data/real` se tratan como muestras de solo lectura en la ventana Python. Para conservar cambios en otra carpeta, por ejemplo `data/local`, use **Archivo → Guardar como...** en Python o **Datos → Guardar como** en C++. Después puede abrirla desde **Archivo → Abrir carpeta de datos...** en Python, desde **Datos → Abrir carpeta** en C++, o iniciar directamente con:
+Las consultas web aceptan HTTP/HTTPS en puertos 80/443, rechazan direcciones locales y privadas, comprueban también cada redirección, desactivan el proxy heredado del entorno y conectan a una IP pública ya validada. La descarga limita la respuesta a 8 MB. La conexión tiene un tiempo de espera por operación de 15 segundos; un servidor que envía datos muy lentamente puede prolongar la consulta, por lo que no debe tratarse como una garantía de duración total.
 
-```bash
-python3 src/python/Taller2_REMR.py --data-dir data/local
-./build/pea_cpp --data-dir data/local
-```
+Los archivos locales PDF, Word y Excel tienen un límite de 32 MB. Word y Excel se inspeccionan como archivos comprimidos antes de procesarlos: máximo 10.000 entradas y 128 MB declarados al descomprimir. La extracción PDF limita el texto a 5 millones de caracteres y aplica 25 segundos de espera total; en sistemas POSIX también impone límites de memoria y CPU al conversor. Las importaciones CSV limitan cada campo a 100.000 caracteres y cada archivo a 500.000 filas.
 
-En Windows, sustituya `python3` por `py -3` y `./build/pea_cpp` por la ruta del ejecutable C++ de la sección anterior. La ruta indicada con `--data-dir` debe contener los CSV previamente guardados; si todavía no existe, se mostrará el selector de inicio. Para abrir directamente la demostración de C++, use `./build/pea_cpp --demo`.
+El binario Windows incluido se usa solo cuando coinciden su SHA-256 y la huella de las fuentes. Esas huellas detectan cambios accidentales o desajustes; al distribuirse junto con el ejecutable, **no autentican al autor**. Descargue el proyecto de una fuente en la que confíe. No se deben pegar tokens o contraseñas en URL de importación; el programa elimina parámetros de consulta al guardar las URL propuestas, salvo los identificadores públicos necesarios de GrupLAC/CvLAC.
 
-En C++, los menús principales son **Grupos**, **Investigadores**, **Productos**, **Planes**, **Relaciones**, **Importar CSV**, **Estadísticas**, **Cola de revisión**, **Deshacer** y **Datos**. Escriba el número de la opción y pulse Enter. Al crear un registro, Enter acepta el valor sugerido; al editar, Enter conserva el valor anterior y `:vaciar` borra un campo. Para guardar, use **11. Guardar** o **Datos → Guardar como**. El asterisco del menú indica cambios sin guardar.
-
-## Funciones disponibles
-
-- **Grupos, Investigadores, Productos y Planes:** crear, buscar, consultar, editar, activar/desactivar y eliminar registros en ambos programas. Los IDs son estables. Para eliminar una entidad con relaciones o planes, primero quite esas dependencias o desactive la entidad.
-- **Relaciones:** gestionar integrantes de grupos, autorías y vínculos entre grupos y productos. Cada relación se puede editar, desactivar o eliminar.
-- **Productos:** registrar año, fecha, familia, tipología, categoría y validación (`pendiente`, `validado`, `rechazado`). Cambiar categoría o validación requiere una observación nueva.
-- **Cola de revisión:** encolar productos y procesarlos en orden de llegada. **Editar → Deshacer** en Python u **9. Deshacer** en C++ recupera el estado anterior; el historial y los trabajos pendientes se guardan con los datos.
-- **Estadísticas:** ver productos por grupo, investigador, producto o en total; filtrar por últimos dos años, últimos cinco años, rango personalizado, categoría y validación. Ambos muestran productos únicos y distribuciones por año, tipología, categoría y validación. Python incluye gráficos y tabla en el dashboard; C++ muestra resúmenes y tabla en consola.
-- **Importación CSV en ambos programas:** seleccione un tipo de registro y un archivo del [esquema PEA-i](docs/esquema_datos.md); revise cuántas filas se aceptarán o rechazarán antes de mezclarlo con los datos. Importe primero entidades y después relaciones que las referencien.
-- **Consulta de URL solo en Python:** **Importar → URL pública...** acepta una página pública HTTP/HTTPS en HTML, texto, CSV o PDF de texto. Muestra título, fuente, metadatos declarados, tablas HTML y texto visible antes de crear nada. Puede revisar y crear un grupo, investigador o producto desde esa vista. En una ficha GrupLAC, **Importar datos detectados** incorpora el grupo, su censo de integrantes, el plan, los productos fechados de las secciones bibliográficas y técnicas reconocidas y las autorías cuyos nombres coinciden con el censo; puede volver a consultar la ficha sin duplicar esos registros. Una ficha CvLAC propone el investigador y permite completar un registro existente. Una página académica con metadatos de artículo puede proponer título, año y DOI. Un CSV descargado puede importarse si usa los encabezados del esquema PEA-i. **Importar → PDF de texto GrupLAC/CvLAC...** también acepta un PDF local con `pdftotext` de Poppler instalado y solicita la URL de origen.
-
-Las tablas de Tkinter muestran 100 registros por página; use **Anterior** y **Siguiente** para recorrerlos. La búsqueda filtra el conjunto completo. En **Grupos**, **Investigadores**, **Productos** y **Planes** puede arrastrar directamente el borde entre la tabla y **Información general** para ajustar sus alturas; ambos paneles conservan un tamaño mínimo. Los campos de ID en filtros y formularios aceptan escribir un ID aunque no aparezca entre las primeras sugerencias.
-
-En la ventana conectada, Python descarga y presenta la URL; solo envía al backend C++ el registro que el usuario revise y guarde. Los registros creados mediante el formulario de esa vista conservan la URL y la fecha de consulta en `fuente`. Los CSV descargados conservan los campos que declara el propio archivo.
-
-Una página cualquiera puede mostrar información legible sin contener datos de investigación estructurados. En ese caso la vista previa no propone campos ni crea registros; si corresponde, el usuario puede escoger el tipo y completar el formulario con lo que la página demuestra. Los gráficos se construyen únicamente con **productos guardados**: si falta año, tipología o categoría, ese gráfico indica «Sin valores registrados»; el producto sigue en el total. No se inventan categorías, autores ni relaciones. La descarga consulta una sola URL y limita la respuesta a 8 MB; páginas que requieren inicio de sesión, ejecutan su contenido solo con JavaScript o sirven PDF escaneado pueden necesitar un CSV o PDF preparado aparte. El CSV de importación necesita los encabezados exactos del [contrato de datos](docs/esquema_datos.md); para recuperar una carpeta completa use la opción de abrir carpeta. Las categorías de la demostración son ejemplos, no clasificaciones oficiales.
-
-## Datos guardados
-
-Cada espacio de trabajo es una carpeta con `manifest.csv` y CSV de grupos, investigadores, productos, planes, relaciones, cola e historial. **Conserve juntos todos esos archivos** al mover los datos a otra computadora. Las fechas usan `AAAA-MM-DD`; los CSV usan UTF-8. Antes de sustituir un guardado existente, el programa conserva la versión anterior en `.backup` dentro de esa carpeta. Evite abrir la misma carpeta en dos instancias al mismo tiempo.
-
-Los datos de [data/demo](data/demo/README.md) son inventados para pruebas y no describen personas o grupos reales de la UPC. [data/real](data/real/README.md) documenta las fuentes y las decisiones de extracción de la muestra pública real.
-
-## Compartir y recibir actualizaciones
-
-Para recibir cambios futuros, es mejor obtener el proyecto con `git clone` una sola vez. Desde esa carpeta, cierre PEA-i y ejecute:
-
-```bash
-git pull --ff-only origin main
-```
-
-Esto actualiza el código y las muestras incluidas en el repositorio. Las carpetas de trabajo guardadas en `data/local/` están ignoradas por Git y no se sobrescriben al actualizar. Si se descargó un ZIP en lugar de clonar, habrá que descargar y extraer un ZIP nuevo para obtener cada versión; Git no puede actualizar automáticamente una carpeta extraída sin historial.
-
-Quien tenga permiso para escribir en el repositorio puede publicar sus propios cambios con `git add`, `git commit` y `git push origin main`. Antes de hacer `git pull`, guarde o confirme los cambios locales de código para evitar conflictos. Quien no tenga permiso puede crear una copia (*fork*) y enviar una solicitud de cambios (*pull request*).
-
-## Ejecutar pruebas
+## Verificación y actualización
 
 Desde la raíz del proyecto:
 
 ```bash
 python3 -m unittest discover -s tests/python -v
 cmake -S . -B build
-cmake --build build --config Release
+cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-En Windows use `py -3` en los comandos Python. CTest ejecuta la autoprueba C++ y, si CMake encuentra Python 3.10 o posterior, tres pruebas de integración, incluida la conexión directa de la interfaz Python al backend. Las pruebas del núcleo Python usan la biblioteca estándar. La prueba de importación PDF se omite automáticamente si `pdftotext` no está instalado. `python3 scripts/build_demo.py` regenera los datos ficticios de muestra. `python3 scripts/build_real_sample.py` regenera `data/real` desde las dos URL del enunciado; necesita Internet y puede generar una captura distinta si las páginas cambian. Ninguno es necesario para usar la aplicación.
+En Windows, sustituya `python3` por `py -3`. Las pruebas de PDF, Excel y Word omiten lo que dependa de herramientas opcionales no instaladas. Para actualizar un clon, cierre PEA-i y ejecute `git pull` desde la carpeta del proyecto; conserve sus datos de trabajo fuera de `data/demo` y `data/real`, por ejemplo en `data/local/`.
 
-### Prueba de carga
-
-El backend C++ usa índices para códigos externos, lee CSV por registros, guarda cambios compactos para deshacer y entrega páginas de hasta 200 filas a la interfaz. Para repetir una prueba sintética sin modificar `data/demo` ni sus propios datos:
-
-```bash
-python3 tests/performance/stress_backend.py build/pea_cpp --products 20000 --people 1000 --links 20000 --memory-mb 768 --check-import
-```
-
-En Linux se probó también `--products 225000 --people 9000 --links 225000 --jobs 225000 --memory-mb 1024 --timeout 120 --check-import`. Con textos sintéticos cortos, cargar y reabrir tardó unos 16–17 s cada vez; guardar tardó cerca de 1,6 s; el mayor pico observado del proceso C++ fue aproximadamente 729 MiB. Treinta ediciones y treinta acciones de deshacer tardaron menos de 0,02 s. La vista previa, importación y deshacer de 225 000 productos tardaron unos 34 s. El límite de memoria se aplica al **proceso C++**, no a Tkinter ni al sistema completo. Los tiempos y la memoria dependen del equipo, la longitud de los campos y la cantidad de relaciones. En Windows el script ejecuta la prueba funcional, pero no aplica el límite de memoria de Linux.
-
-## Si algo no abre
-
-- **No encuentra `src/python/Taller2_REMR.py`:** abra la terminal en la carpeta que contiene este README y repita el comando.
-- **El motor aparece como Python en Ayuda → Acerca de PEA-i:** la ventana está funcionando con el respaldo Python. En Windows de 64 bits, compruebe que descargó o clonó el repositorio completo y que existe `bin/windows/pea_cpp.exe`. En otros sistemas, instale CMake y un compilador C++17 para activar la conexión C++.
-- **Aparece `CMAKE_CXX_COMPILER not set` o un error de NMake al compilar manualmente:** CMake no está encontrando el compilador de Dev-C++. Agregue al `PATH` la carpeta que contiene `g++.exe` y `mingw32-make.exe`, y use `-G "MinGW Makefiles"` con una carpeta de compilación nueva. Para abrir la ventana normalmente en Windows, estos programas no son necesarios.
-- **Falla `python3 -m tkinter` o `py -3 -m tkinter`:** instale una distribución de Python que incluya Tkinter o el paquete Tkinter de su sistema.
-- **Error de pantalla o `display`:** ejecute el programa desde una sesión gráfica local; necesita poder abrir ventanas de escritorio.
-- **No se puede importar PDF:** compruebe que `pdftotext` está instalado y que el PDF tiene texto seleccionable. También puede usar CSV.
-- **Una URL no muestra datos útiles:** compruebe que es pública y que el contenido aparece en el HTML o documento descargado. Si la página carga todo mediante JavaScript o exige cuenta, use un CSV o PDF de texto exportado por el sitio.
-- **No se puede abrir una carpeta guardada:** verifique que contiene `manifest.csv` y todos los CSV del [esquema](docs/esquema_datos.md). Si un guardado se dañó y existe `.backup`, la aplicación ofrece abrir la copia anterior.
-
-La lógica Python y sus pruebas se verificaron en Linux con Python 3.14. C++ se compiló y probó en Linux; las pruebas de integración comprobaron la comunicación Tkinter/C++, el intercambio de CSV y el historial. La ventana conectada abrió y cargó la muestra pública en Linux. El ejecutable Windows incluido pasó su autoprueba y respondió al protocolo JSON bajo Wine; la interfaz también abrió en Windows. Todavía falta recorrer allí todos los formularios, importaciones y ciclos de guardado. El avance real y los límites se registran en [PROGRESO.md](PROGRESO.md); el [enunciado](ENUNCIADO_TALLER_2.md) y el [plan](PLAN_PROYECTO.md) conservan los requisitos del taller.
+`python3 scripts/build_demo.py` regenera la demostración. `python3 scripts/import_upc_dataset.py` vuelve a consultar la lista de grupos públicos; necesita Internet, no reemplaza el conjunto existente si falla alguna importación y puede producir datos diferentes si cambian las fichas. Para consultar solo parte de la lista, use `--limit N --output OTRA_CARPETA`. `python3 scripts/build_real_sample.py` genera por separado una muestra pequeña en `data/sample_scienti/` y no reemplaza el conjunto de 66 grupos.

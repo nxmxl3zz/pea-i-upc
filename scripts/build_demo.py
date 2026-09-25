@@ -13,8 +13,8 @@ SPEC.loader.exec_module(pea)
 repo = pea.Repository()
 source = "Demostración ficticia; no representa registros de la UPC ni de Scienti"
 for row in (
-    {"id": "G-DEMO-1", "nombre": "Grupo demostrativo de sistemas", "sigla": "GDS", "categoria": "Ejemplo A", "unidad": "Ingeniería", "objetivos": "Estudiar sistemas de información", "fuente": source},
-    {"id": "G-DEMO-2", "nombre": "Grupo demostrativo ambiental", "sigla": "GDA", "categoria": "Ejemplo B", "unidad": "Ciencias", "objetivos": "Estudiar el ambiente", "fuente": source},
+    {"id": "G-DEMO-1", "nombre": "Grupo demostrativo de sistemas", "categoria": "Ejemplo A", "unidad": "Ingeniería", "objetivos": "Estudiar sistemas de información", "fuente": source},
+    {"id": "G-DEMO-2", "nombre": "Grupo demostrativo ambiental", "categoria": "Ejemplo B", "unidad": "Ciencias", "objetivos": "Estudiar el ambiente", "fuente": source},
 ):
     repo.create("grupos", row, remember=False)
 for row in (

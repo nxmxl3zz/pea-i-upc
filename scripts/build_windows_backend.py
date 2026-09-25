@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCES = (ROOT / "CMakeLists.txt", ROOT / "src/cpp/Taller2_REMR.cpp")
 OUTPUT = ROOT / "bin/windows/pea_cpp.exe"
 FINGERPRINT = ROOT / "bin/windows/pea_cpp.source-sha256"
+INTEGRITY = ROOT / "bin/windows/pea_cpp.exe.sha256"
 
 
 def source_fingerprint() -> str:
@@ -49,6 +50,7 @@ def main() -> None:
             subprocess.run([strip, str(temporary)], check=True)
         temporary.replace(OUTPUT)
     FINGERPRINT.write_text(source_fingerprint() + "\n", encoding="ascii")
+    INTEGRITY.write_text(hashlib.sha256(OUTPUT.read_bytes()).hexdigest() + "\n", encoding="ascii")
     print(f"Backend Windows listo: {OUTPUT.relative_to(ROOT)}")
 
 

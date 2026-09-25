@@ -31,7 +31,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Crear muestra UPC desde fichas públicas de Scienti")
     parser.add_argument("--group-html", type=Path, help="HTML GrupLAC ya descargado")
     parser.add_argument("--researcher-html", type=Path, help="HTML CvLAC ya descargado")
-    parser.add_argument("--output", type=Path, default=ROOT / "data" / "real", help="Carpeta CSV de salida")
+    parser.add_argument("--output", type=Path, default=ROOT / "data" / "sample_scienti", help="Carpeta CSV de salida")
     args = parser.parse_args()
     group_page = preview(GROUP_URL, args.group_html)
     researcher_page = preview(RESEARCHER_URL, args.researcher_html)
