@@ -1,0 +1,5 @@
+id,titulo,anio,fecha,familia,tipologia,categoria,validacion,observacion,doi,url,fuente,activo
+P-DEMO-1,Análisis de redes de prueba,2026,,Nuevo conocimiento,Artículo,Ejemplo A,validado,Validación de demostración,,,Demostración ficticia; no representa registros de la UPC ni de Scienti,1
+P-DEMO-2,Herramienta educativa de prueba,2025,,Desarrollo tecnológico,Software,Ejemplo B,pendiente,,,,Demostración ficticia; no representa registros de la UPC ni de Scienti,1
+P-DEMO-3,"Libro de muestra, tomo 1",2023,,Nuevo conocimiento,Libro,Ejemplo B,pendiente,,,,Demostración ficticia; no representa registros de la UPC ni de Scienti,1
+P-DEMO-4,Informe histórico de ejemplo,2021,,Apropiación social,Informe,Sin categoría,rechazado,Caso ficticio para filtro,,,Demostración ficticia; no representa registros de la UPC ni de Scienti,1

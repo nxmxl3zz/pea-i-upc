@@ -1,0 +1,12 @@
+# Muestra de datos públicos reales
+
+Esta carpeta contiene una captura consultada el **24 de septiembre de 2026** desde las dos URL públicas incluidas en el enunciado del taller:
+
+- [Grupo GISICO en GrupLAC](https://scienti.minciencias.gov.co/gruplac/jsp/visualiza/visualizagr.jsp?nro=00000000002099)
+- [Adith Bismarck Pérez Orozco en CvLAC](https://scienti.minciencias.gov.co/cvlac/visualizador/generarCurriculoCv.do?cod_rh=0000494917)
+
+La muestra contiene **1 grupo, 85 investigadores del censo GrupLAC, 85 membresías, 1 plan estratégico, 202 productos fechados, 202 vínculos grupo-producto y 319 autorías asociadas a integrantes del censo**. Entre las membresías, 67 figuran como actuales y 18 muestran una fecha de fin. Los productos proceden de las secciones bibliográficas y técnicas con título, tipo y año reconocibles: artículos, libros, capítulos, documentos de trabajo, software y otras clases declaradas en la ficha. Los duplicados con el mismo DOI, o el mismo título, tipo y año cuando falta DOI, se cuentan una vez. Las autorías se vinculan a un integrante solo cuando el nombre publicado coincide con el del censo al ignorar mayúsculas y tildes; otros autores siguen en la página de origen, sin una identidad supuesta.
+
+El perfil CvLAC indicado en el enunciado aporta la categoría de Adith Bismarck Pérez Orozco; los otros perfiles conservan los datos que expone el censo (nombre, enlace y período de vinculación), sin atribuirles categorías o información personal no consultada. Los campos sin precisión suficiente quedan vacíos. En particular, los meses de vinculación quedan en el texto del rol y no se convierten en días ISO inventados; tampoco se asigna categoría de producto. `validacion=pendiente` es el estado interno de revisión de PEA-i, no una afirmación sobre la validación oficial. Esta captura incluye únicamente las secciones de producción que el extractor reconoce y cuyos registros tienen año explícito; la ficha original puede contener otras actividades y productos. Para trabajar sin modificar la muestra, use **Archivo → Cargar datos reales** y después **Guardar como** en otra carpeta.
+
+Para regenerar la carpeta desde las dos URL oficiales, ejecute `python3 scripts/build_real_sample.py` desde la raíz del repositorio. El script también acepta `--group-html` y `--researcher-html` para usar copias HTML descargadas antes. La captura incluida se consultó en la fecha indicada arriba; los datos de las páginas pueden cambiar después.

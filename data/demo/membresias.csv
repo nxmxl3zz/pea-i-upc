@@ -1,0 +1,5 @@
+grupo_id,investigador_id,rol,inicio,fin,activo
+G-DEMO-1,I-DEMO-1,Líder,,,1
+G-DEMO-1,I-DEMO-2,Integrante,,,1
+G-DEMO-2,I-DEMO-2,Líder,,,1
+G-DEMO-2,I-DEMO-3,Integrante,,,1

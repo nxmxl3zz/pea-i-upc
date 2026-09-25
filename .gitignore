@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+build/
+data/local/
+**/.backup/
+*.tmp
+.claude/
+.agents/
+.codex/
