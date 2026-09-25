@@ -22,9 +22,11 @@ def main() -> None:
         raise SystemExit(f"No existe el ejecutable: {binary}")
     with tempfile.TemporaryDirectory(prefix="pea-interop-") as folder:
         path = Path(folder)
+        subprocess.run([sys.executable, str(ROOT / "scripts/build_demo.py"),
+                        "--output", str(path)], check=True, capture_output=True, text=True)
         first = subprocess.run(
-            [str(binary), "--demo"],
-            input=f"8\n3\nvalidado\nVerificado por C++\n0\n11\n{path}\n0\n",
+            [str(binary), "--data-dir", str(path)],
+            input="8\n3\nvalidado\nVerificado por C++\n0\n11\n0\n",
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             cwd=ROOT, timeout=20, check=True,
         )

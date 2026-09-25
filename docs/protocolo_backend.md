@@ -21,7 +21,7 @@ Cada solicitud ocupa una línea JSON en UTF-8. Sus propiedades son cadenas; para
 Ejemplo de comprobación manual desde la raíz del proyecto:
 
 ```bash
-printf '%s\n' '{"action":"ping"}' '{"action":"statistics","view":"Todos"}' | ./build/pea_cpp --api --demo
+printf '%s\n' '{"action":"ping"}' '{"action":"statistics","view":"Todos"}' | ./build/pea_cpp --api --data-dir data/real
 ```
 
 La primera respuesta es:

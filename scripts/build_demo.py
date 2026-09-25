@@ -1,10 +1,14 @@
-"""Recrea el conjunto ficticio de demostración."""
+"""Genera datos ficticios para pruebas locales, fuera del repositorio."""
 
+import argparse
 import importlib.util
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--output", type=Path, default=ROOT / "data" / "demo")
+args = parser.parse_args()
 SOURCE = ROOT / "src" / "python" / "Taller2_REMR.py"
 SPEC = importlib.util.spec_from_file_location("pea", SOURCE)
 pea = importlib.util.module_from_spec(SPEC)
@@ -60,5 +64,5 @@ for row in (
     repo.create("grupos_productos", row, remember=False)
 repo.queue.enqueue({"id": "Q-DEMO-1", "producto_id": "P-DEMO-2", "motivo": "Revisar categoría", "creado": "2026-09-24T09:00:00"})
 repo.queue.enqueue({"id": "Q-DEMO-2", "producto_id": "P-DEMO-3", "motivo": "Verificar fuente", "creado": "2026-09-24T09:05:00"})
-pea.save_repository(repo, ROOT / "data" / "demo")
-print("Demostración creada: 2 grupos, 3 investigadores, 4 productos, 2 revisiones")
+pea.save_repository(repo, args.output)
+print(f"Datos de prueba creados en {args.output}: 2 grupos, 3 investigadores, 4 productos, 2 revisiones")

@@ -1994,16 +1994,6 @@ void queueMenu(Repository& repo) {
         }
     }
 }
-fs::path projectDemo() {
-    fs::path cursor = fs::current_path();
-    for (int i = 0; i < 6; ++i) {
-        fs::path candidate = cursor / "data" / "demo";
-        if (fs::exists(candidate / "manifest.csv")) return candidate;
-        if (!cursor.has_parent_path() || cursor.parent_path() == cursor) break;
-        cursor = cursor.parent_path();
-    }
-    return {};
-}
 bool samePath(const fs::path& a, const fs::path& b) {
     if (a.empty() || b.empty()) return false;
     std::error_code ignored;
@@ -2012,21 +2002,14 @@ bool samePath(const fs::path& a, const fs::path& b) {
 class ConsoleApp {
     Repository repo_;
     fs::path directory_;
-    fs::path demoPath_ = projectDemo();
-    bool demo_ = false;
 
     bool saveTo(const fs::path& path) {
         if (path.empty()) return false;
-        if (samePath(path, demoPath_)) {
-            std::cout << "La demostracion es de solo lectura; elija otra carpeta.\n";
-            return false;
-        }
         if (fs::exists(path / "manifest.csv") && !samePath(path, directory_) &&
             !confirm("La carpeta ya contiene datos PEA-i. Reemplazarlos?")) return false;
         try {
             saveRepository(repo_, path);
             directory_ = path;
-            demo_ = false;
             std::cout << "Guardado en " << path.string() << '\n';
             return true;
         } catch (const std::exception& error) {
@@ -2035,7 +2018,7 @@ class ConsoleApp {
         }
     }
     bool save(bool askPath = false) {
-        if (askPath || directory_.empty() || demo_) {
+        if (askPath || directory_.empty()) {
             const std::string text = ask("Carpeta de destino (vacio = cancelar): ");
             if (text.empty()) return false;
             return saveTo(pathFromUtf8(text));
@@ -2055,11 +2038,8 @@ class ConsoleApp {
         try {
             Repository fresh = loadRepository(path);
             repo_ = std::move(fresh);
-            demo_ = samePath(path, demoPath_);
-            directory_ = demo_ ? fs::path{} : path;
-            std::cout << "Cargado: " << path.string();
-            if (demo_) std::cout << " (demostracion; guarde una copia)";
-            std::cout << '\n';
+            directory_ = path;
+            std::cout << "Cargado: " << path.string() << '\n';
         } catch (const std::exception& error) {
             std::cout << "No se pudo cargar: " << error.what() << '\n';
             const fs::path backup = path / ".backup";
@@ -2068,7 +2048,6 @@ class ConsoleApp {
                     Repository recovered = loadRepository(backup);
                     repo_ = std::move(recovered);
                     directory_.clear();
-                    demo_ = false;
                     std::cout << "Copia abierta; use Guardar como para recuperarla.\n";
                 } catch (const std::exception& backupError) {
                     std::cout << "La copia anterior tampoco se pudo abrir: "
@@ -2081,25 +2060,21 @@ class ConsoleApp {
         while (true) {
             std::cout << "\n=== Datos ===\n"
                       << "Carpeta: " << (directory_.empty() ? "(sin guardar)" : directory_.string()) << '\n'
-                      << "1. Iniciar vacio  2. Abrir carpeta  3. Cargar demostracion\n"
-                      << "4. Guardar  5. Guardar como  0. Volver\n";
-            const int option = askNumber("Opcion: ", 0, 5);
+                      << "1. Iniciar vacio  2. Abrir carpeta\n"
+                      << "3. Guardar  4. Guardar como  0. Volver\n";
+            const int option = askNumber("Opcion: ", 0, 4);
             if (option == 0) return;
             try {
-                if (option == 4) save();
-                else if (option == 5) save(true);
+                if (option == 3) save();
+                else if (option == 4) save(true);
                 else if (mayReplace()) {
                     if (option == 1) {
                         repo_ = Repository();
                         directory_.clear();
-                        demo_ = false;
                         std::cout << "Espacio vacio creado.\n";
                     } else if (option == 2) {
                         const std::string text = ask("Carpeta con manifest.csv: ");
                         if (!text.empty()) load(pathFromUtf8(text));
-                    } else if (option == 3) {
-                        if (demoPath_.empty()) std::cout << "No se encontro data/demo.\n";
-                        else load(demoPath_);
                     }
                 }
             } catch (const std::exception& error) {
@@ -2129,19 +2104,15 @@ class ConsoleApp {
         }
     }
 public:
-    void startup(const std::optional<fs::path>& initial, bool demoFlag) {
-        if (demoFlag && !demoPath_.empty()) { load(demoPath_); return; }
+    void startup(const std::optional<fs::path>& initial) {
         if (initial && fs::exists(*initial / "manifest.csv")) { load(*initial); return; }
         std::cout << "PEA-i UPC - inicio\n"
-                  << "1. Iniciar vacio  2. Abrir carpeta  3. Cargar demostracion  0. Salir\n";
-        const int option = askNumber("Opcion: ", 0, 3);
+                  << "1. Iniciar vacio  2. Abrir carpeta  0. Salir\n";
+        const int option = askNumber("Opcion: ", 0, 2);
         if (option == 0) throw EndInput{};
         if (option == 2) {
             const std::string text = ask("Carpeta con manifest.csv: ");
             if (!text.empty()) load(pathFromUtf8(text));
-        } else if (option == 3) {
-            if (demoPath_.empty()) std::cout << "No se encontro data/demo. Iniciando vacio.\n";
-            else load(demoPath_);
         } else std::cout << "Espacio vacio.\n";
     }
     void run() {
@@ -2286,7 +2257,6 @@ class ApiApp {
         if (action == "save") {
             const fs::path path = pathFromUtf8(field(request, "path"));
             if (path.empty()) throw DataError("Falta carpeta de destino");
-            if (samePath(path, projectDemo())) throw DataError("La demostracion es de solo lectura");
             saveRepository(repo_, path);
             return "null";
         }
@@ -2363,12 +2333,8 @@ class ApiApp {
         throw DataError("Accion de protocolo desconocida: " + action);
     }
 public:
-    void startup(const std::optional<fs::path>& initial, bool demo) {
-        if (demo) {
-            const fs::path path = projectDemo();
-            if (path.empty()) throw DataError("No se encontro data/demo");
-            repo_ = loadRepository(path);
-        } else if (initial) {
+    void startup(const std::optional<fs::path>& initial) {
+        if (initial) {
             repo_ = loadRepository(*initial);
         }
     }
@@ -2394,7 +2360,7 @@ public:
 void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error("Autoprueba: " + message);
 }
-void selfTest(const fs::path& demo) {
+void selfTest() {
     DoublyList list;
     require(list.rows().empty(), "lista vacia");
     list.append({{"id", "A"}});
@@ -2424,8 +2390,29 @@ void selfTest(const fs::path& demo) {
     require(field(*queue.dequeue(), "id") == "A" &&
             field(*queue.dequeue(), "id") == "B", "cola FIFO");
 
-    Repository repo = loadRepository(demo);
-    require(repo.statistics().products.size() == 4, "total demo sin duplicados");
+    Repository repo;
+    repo.create("grupos", {{"id", "G-DEMO-1"}, {"nombre", "Grupo uno"}}, false);
+    repo.create("grupos", {{"id", "G-DEMO-2"}, {"nombre", "Grupo dos"}}, false);
+    repo.create("investigadores", {{"id", "I-DEMO-1"}, {"nombre", "Ana"}}, false);
+    repo.create("investigadores", {{"id", "I-DEMO-2"}, {"nombre", "Bruno"}}, false);
+    repo.create("productos", {{"id", "P-DEMO-1"}, {"titulo", "Producto uno"},
+                             {"anio", "2026"}, {"categoria", "Ejemplo A"}}, false);
+    repo.create("productos", {{"id", "P-DEMO-2"}, {"titulo", "Producto dos"},
+                             {"anio", "2025"}}, false);
+    repo.create("productos", {{"id", "P-DEMO-3"}, {"titulo", "Producto tres"},
+                             {"anio", "2023"}}, false);
+    repo.create("productos", {{"id", "P-DEMO-4"}, {"titulo", "Producto cuatro"},
+                             {"anio", "2021"}}, false);
+    for (const char* id : {"P-DEMO-1", "P-DEMO-2", "P-DEMO-4"})
+        repo.create("grupos_productos", {{"grupo_id", "G-DEMO-1"}, {"producto_id", id}}, false);
+    repo.create("grupos_productos", {{"grupo_id", "G-DEMO-2"},
+                                  {"producto_id", "P-DEMO-3"}}, false);
+    for (const char* id : {"P-DEMO-1", "P-DEMO-2"})
+        repo.create("autorias", {{"producto_id", id}, {"investigador_id", "I-DEMO-2"}}, false);
+    repo.enqueueReview("P-DEMO-2", "Revisar");
+    repo.enqueueReview("P-DEMO-3", "Verificar");
+    repo.clearHistory();
+    require(repo.statistics().products.size() == 4, "total sin duplicados");
     require(repo.statistics("Todos", "", 2025, 2026).products.size() == 2, "ventana de dos anios");
     require(repo.statistics("Todos", "", 2022, 2026).products.size() == 3, "ventana de cinco anios");
     require(repo.statistics("Grupo", "G-DEMO-1").products.size() == 3, "vista por grupo");
@@ -2508,44 +2495,37 @@ int main(int argc, char* argv[]) {
 #endif
     try {
         std::optional<pea::fs::path> directory;
-        bool demo = false;
         bool check = false;
         bool api = false;
-        pea::fs::path testData;
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
             if (arg == "--help" || arg == "-h") {
                 std::cout << "PEA-i UPC C++17\n"
-                          << "Uso: pea_cpp [--data-dir CARPETA] [--demo] [--api]\n"
-                          << "     pea_cpp --self-test [CARPETA_DEMO]\n"
+                          << "Uso: pea_cpp [--data-dir CARPETA] [--api]\n"
+                          << "     pea_cpp --self-test\n"
                           << "El programa gestiona datos CSV con menus de consola o protocolo JSON.\n";
                 return 0;
             }
             if (arg == "--data-dir" && i + 1 < argc) directory = pea::pathFromUtf8(argv[++i]);
-            else if (arg == "--demo") demo = true;
             else if (arg == "--api") api = true;
-            else if (arg == "--self-test") {
-                check = true;
-                if (i + 1 < argc && argv[i + 1][0] != '-') testData = pea::pathFromUtf8(argv[++i]);
-            } else {
+            else if (arg == "--self-test") check = true;
+            else {
                 std::cerr << "Argumento desconocido o incompleto: " << arg << '\n';
                 return 2;
             }
         }
         if (check) {
-            if (testData.empty()) testData = pea::projectDemo();
-            if (testData.empty()) throw pea::DataError("No se encontro data/demo");
-            pea::selfTest(testData);
+            pea::selfTest();
             return 0;
         }
         if (api) {
             pea::ApiApp app;
-            app.startup(directory, demo);
+            app.startup(directory);
             app.run();
             return 0;
         }
         pea::ConsoleApp app;
-        app.startup(directory, demo);
+        app.startup(directory);
         app.run();
         return 0;
     } catch (const pea::EndInput&) {

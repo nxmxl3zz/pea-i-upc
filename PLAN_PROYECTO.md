@@ -21,7 +21,7 @@ Ambos programas compartirán **un contrato de datos documentado**, podrán inici
 ### Resultado que debe recibir quien clone el repositorio
 
 - Instrucciones completas para instalar, compilar y ejecutar en Linux y Windows.
-- Las dos aplicaciones y datos de demostración suficientes para probar cada vista.
+- Las dos aplicaciones y una carpeta de datos públicos suficiente para probar cada vista.
 - Un modo de crear/cargar datos sin depender de que Scienti responda en ese momento.
 - Pruebas automáticas y una secuencia corta de comprobación manual.
 - Especificación técnica detallada y trazabilidad frente al enunciado.
@@ -49,7 +49,7 @@ Los identificadores **R** se usarán en el código, las pruebas y la documentaci
 | R15 | Estadísticas por grupo, investigador y producto | Totales, distribución temporal, distribución por tipo/categoría y estados; definición de denominador y tratamiento de duplicados documentados. |
 | R16 | Presentación C++ | Menú comprensible, tablas legibles y cifras coherentes con los datos. No exige GUI. |
 | R17 | Presentación Python | Dashboard Tkinter con navegación, filtros, histogramas por año y barras por tipología/categoría; datos vacíos tratados con mensajes claros. |
-| R18 | Inicio con o sin archivo | Al arrancar se puede crear un espacio vacío o cargar una carpeta de datos existente; no se sobrescriben los archivos de demostración. |
+| R18 | Inicio con o sin archivo | Al arrancar se puede crear un espacio vacío o cargar una carpeta de datos existente; la interfaz protege la muestra pública mediante Guardar como. |
 | R19 | Archivos fuente y datos | Se identifican los dos fuentes entregables con iniciales definitivas, un conjunto de datos persistidos y archivos de identificación cuando Rafael los facilite. |
 | R20 | Especificación técnica en Word | Diseño de estructuras, algoritmo y estrategia, diagramas, casos de uso, requisitos, historias de usuario, instrucciones y evidencia de verificación. |
 
@@ -108,21 +108,11 @@ En **ambos lenguajes**, las estructuras y operaciones estarán escritas de forma
 
 ```text
 data/
-  demo/                   # Ejemplo versionado y documentado; se trata como solo lectura
-    manifest.csv
-    grupos.csv
-    investigadores.csv
-    productos.csv
-    membresias.csv
-    autorias.csv
-    grupos_productos.csv
-    planes.csv
-    cola_validacion.csv
-    historial.csv
+  real/                   # Registros públicos incluidos con procedencia documentada
   local/                  # Espacio de trabajo creado en ejecución; ignorado por Git
 ```
 
-`manifest.csv` contiene versión de esquema y metadatos necesarios para detectar datos incompatibles. Un guardado escribirá archivos temporales, comprobará su integridad y sustituirá los anteriores; se conservará una copia recuperable cuando corresponda. Los datos de `demo/` se copiarán a `local/` antes de editar. Si ambos programas apuntan a la misma carpeta, se usarán **por turnos** hasta que exista control de acceso concurrente probado.
+`manifest.csv` contiene versión de esquema y metadatos necesarios para detectar datos incompatibles. Un guardado escribirá archivos temporales, comprobará su integridad y sustituirá los anteriores; se conservará una copia recuperable cuando corresponda. La interfaz guarda una copia editable de `real/` fuera de esa carpeta. Si ambos programas apuntan a la misma carpeta, se usarán **por turnos** hasta que exista control de acceso concurrente probado.
 
 Los enlaces se reconstruirán a partir de CSV al cargar y se comprobará integridad referencial antes de mostrar estadísticas. Se guardarán estados desactivados, trabajos pendientes y el historial necesario para que la funcionalidad prometida sobreviva a un reinicio. Una carpeta sin datos debe ser válida y producir tablas/gráficos vacíos sin fallos.
 
@@ -171,7 +161,7 @@ pea-i-upc/
 │   ├── cpp/Taller2_REMR.cpp          # Fuente C++ con las iniciales indicadas
 │   └── python/Taller2_REMR.py        # Fuente Python requerido
 ├── data/
-│   └── demo/                       # CSV reproducibles y sus fuentes
+│   └── real/                       # CSV públicos y sus fuentes
 ├── tests/
 │   ├── cpp/                        # Casos C++ de estructuras e integración
 │   ├── python/                     # Casos Python y comprobación del dashboard
@@ -184,7 +174,7 @@ pea-i-upc/
 └── .github/workflows/ci.yml       # Verificación de compilación y pruebas al subir cambios
 ```
 
-El árbol muestra la estructura objetivo. Las fuentes con nombres definitivos, CMake, datos de demostración, pruebas y especificación DOCX ya existen; CI y algunas carpetas previstas aún no. GitHub conserva y muestra el contenido de carpetas; los problemas de ejecución al mover archivos se previenen usando rutas relativas a la raíz del proyecto, argumentos `--data-dir` y comandos de compilación explícitos.
+El árbol muestra la estructura objetivo. Las fuentes con nombres definitivos, CMake, datos públicos, pruebas y especificación DOCX ya existen; CI y algunas carpetas previstas aún no. GitHub conserva y muestra el contenido de carpetas; los problemas de ejecución al mover archivos se previenen usando rutas relativas a la raíz del proyecto, argumentos `--data-dir` y comandos de compilación explícitos.
 
 **Exclusiones en Git:** `.venv/`, `build/`, `data/local/`, `__pycache__/`, cachés de pruebas, copias locales de respaldo, contraseñas y exportaciones temporales. **Incluidos en Git:** fuentes, plan, documentación, muestras reproducibles, manifiestos y pruebas. Evitar archivos personales o datos innecesarios en un repositorio público.
 
@@ -233,9 +223,9 @@ cmake --build build --config Release
 1. Clonar y ejecutar los comandos anteriores sin corregir rutas ni instalar archivos fuera de las dependencias declaradas.
 2. Elegir «iniciar vacío»: crear un grupo, un investigador y un producto; relacionarlos y guardar.
 3. Cerrar y reabrir las dos aplicaciones; comprobar que los datos y las relaciones siguen presentes.
-4. Copiar `data/demo/` a una carpeta local separada o importarla desde el menú; mostrar las tres vistas y filtros 2/5 años.
+4. Abrir `data/real/` y mostrar las tres vistas y filtros 2/5 años; guardar una copia editable si se van a modificar registros.
 5. Encolar dos revisiones y demostrar FIFO; modificar un dato y demostrar deshacer mediante pila; comprobar persistencia.
-6. Ejecutar pruebas automáticas; confirmar que el conjunto de demostración incluido no se modificó.
+6. Ejecutar pruebas automáticas; confirmar que la muestra pública incluida no se modificó.
 
 ## 10. Plan de ejecución y puertas de salida
 
@@ -326,7 +316,7 @@ El DOCX se revisará visualmente antes de entregar: saltos, imágenes, tablas, e
 - [x] Python con Tkinter abre el dashboard de escritorio.
 - [ ] Ambas versiones cargan el mismo esquema CSV; sus estadísticas coinciden con las reglas documentadas.
 - [ ] CRUD, desactivación, relaciones, pila, cola, filtros y persistencia resisten reinicios.
-- [ ] Dataset de demostración completo, pequeño, lícito de compartir y con fuente/fecha.
+- [ ] Verificar que la muestra pública incluida tiene fuente y fecha documentadas.
 - [ ] Importación CSV probada en ambos; importaciones URL/PDF declaradas según funcionamiento real.
 - [ ] Pruebas relevantes y CI pasan; errores de red y datos defectuosos se manejan.
 - [ ] README probado literalmente en un clon nuevo en Linux y Windows; sin rutas absolutas ni archivos omitidos.

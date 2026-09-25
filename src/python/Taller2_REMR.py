@@ -2495,9 +2495,9 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
             self.sidebar = ttk.Frame(root, style="Sidebar.TFrame")
             self.sidebar.pack(side="left", fill="y")
             self.menu_expanded = True
-            self.burger = ttk.Button(self.sidebar, text="☰", style="Burger.TButton",
-                                     command=self._toggle_menu)
-            self.burger.pack(anchor="n", padx=8, pady=(10, 4))
+            self.burger = ttk.Button(self.sidebar, text="☰", width=3,
+                                     style="Burger.TButton", command=self._toggle_menu)
+            self.burger.pack(fill="x", padx=6, pady=(10, 4))
             self.sidebar_items = ttk.Frame(self.sidebar, style="Sidebar.TFrame")
             self.sidebar_items.pack(fill="both", expand=True)
             self.content = ttk.Frame(root)
@@ -2556,7 +2556,10 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
         def _toggle_menu(self) -> None:
             if self.menu_expanded:
                 self.sidebar_items.pack_forget()
+                self.sidebar.configure(width=56)
+                self.sidebar.pack_propagate(False)
             else:
+                self.sidebar.pack_propagate(True)
                 self.sidebar_items.pack(fill="both", expand=True)
             self.menu_expanded = not self.menu_expanded
 
@@ -2582,10 +2585,10 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
                                                  ("pressed", colors["hover"])],
                       foreground=[("active", colors["ink"] if theme == "light" else colors["header_fg"])])
             style.configure("Burger.TButton", background=colors["navy"], foreground=colors["header_fg"],
-                            bordercolor=colors["navy"], relief="flat", padding=(12, 6),
+                            bordercolor=colors["navy"], relief="flat", anchor="w", padding=(12, 6),
                             font=("Segoe UI", 16))
             style.map("Burger.TButton", background=[("active", colors["hover"])],
-                      foreground=[("active", colors["header_fg"])])
+                      foreground=[("active", colors["ink"] if theme == "light" else colors["header_fg"])])
             style.configure("Heading.TLabel", font=("Segoe UI", 19, "bold"), foreground=colors["strong"])
             style.configure("Metric.TLabel", font=("Segoe UI", 17, "bold"), foreground=colors["teal"])
             style.configure("TButton", padding=(11, 7), background=colors["surface"],
@@ -2655,7 +2658,6 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
             for label, command in (("Iniciar vacío", self.new_workspace),
                                    ("Abrir carpeta de datos...", self.open_folder),
                                    ("Cargar datos reales", self.load_real),
-                                   ("Cargar demostración", self.load_demo),
                                    ("Guardar", self.save), ("Guardar como...", self.save_as),
                                    ("Exportar para hoja de cálculo...", self.export_spreadsheet),
                                    ("Salir", self.close)):
@@ -3087,7 +3089,7 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
             if not isinstance(self.repo, CppRepository):
                 self.repo = new_repo
             data_root = Path(__file__).resolve().parents[2] / "data"
-            demo = demo or directory.resolve() in ((data_root / "demo").resolve(), (data_root / "real").resolve())
+            demo = demo or directory.resolve() == (data_root / "real").resolve()
             self.data_dir = None if demo or recovered else directory
             self.refresh()
             self.status.set(f"Datos cargados de {directory}" + (" (guardar como copia)" if demo or recovered else ""))
@@ -3098,10 +3100,6 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
             folder = filedialog.askdirectory(parent=self.root, title="Carpeta con manifest.csv")
             if folder:
                 self._load(Path(folder))
-
-        def load_demo(self) -> None:
-            if self._may_discard():
-                self._load(Path(__file__).resolve().parents[2] / "data" / "demo", demo=True)
 
         def load_real(self) -> None:
             if self._may_discard():
@@ -3128,7 +3126,7 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
                 return False
             chosen = Path(folder)
             data_root = Path(__file__).resolve().parents[2] / "data"
-            if chosen.resolve() in ((data_root / "demo").resolve(), (data_root / "real").resolve()):
+            if chosen.resolve() == (data_root / "real").resolve():
                 messagebox.showerror("Muestra protegida", "Guarde una copia en otra carpeta", parent=self.root)
                 return False
             if (chosen / "manifest.csv").exists() and chosen != self.data_dir:

@@ -9,7 +9,6 @@ Iniciar PEA-i.pyw                 Lanzador de doble clic en Windows
 src/cpp/Taller2_REMR.cpp         Consola y backend C++
 src/python/Taller2_REMR.py       Interfaz Tkinter y motor Python autónomo
 bin/windows/                    Ejecutable C++ de 64 bits y huellas de integridad
-data/demo/                       Datos ficticios para demostración
 data/real/                       Captura pública de grupos UPC y procedencia
 docs/especificacion_tecnica.docx Especificación técnica de entrega
 docs/esquema_datos.md            Contrato de persistencia CSV
@@ -49,11 +48,11 @@ cmake --build build
 ./build/pea_cpp
 ```
 
-Para indicar un ejecutable C++ propio use `--cpp-binary RUTA`. Para abrir una carpeta guardada al iniciar use `--data-dir RUTA`. La consola admite `--demo` y `--data-dir RUTA`.
+Para indicar un ejecutable C++ propio use `--cpp-binary RUTA`. Para abrir una carpeta guardada al iniciar use `--data-dir RUTA`; la consola también admite esa opción.
 
 ## Uso de la ventana
 
-Al iniciar se abre automáticamente `data/real`, salvo que se indique `--data-dir`. El menú **Archivo** permite iniciar vacío, abrir otra carpeta, cargar la demostración y guardar una copia. `data/demo` y `data/real` se tratan como muestras de solo lectura desde la ventana: use **Guardar como** para conservar cambios en otra carpeta.
+Al iniciar se abre automáticamente `data/real`, salvo que se indique `--data-dir`. El menú **Archivo** permite iniciar vacío, abrir otra carpeta y guardar una copia. `data/real` se trata como muestra de solo lectura desde la ventana: use **Guardar como** para conservar cambios en otra carpeta.
 
 La navegación lateral contiene Dashboard, Gráficos, Grupos, Investigadores, Productos, Planes, Relaciones y Cola de revisión. El botón ☰ contrae o despliega el menú. Las tablas muestran 100 filas por página y la búsqueda abarca el conjunto completo. En las pestañas de entidades, haga doble clic en una fila o pulse **Información** para abrir sus campos y productos relacionados.
 
@@ -73,7 +72,7 @@ La consola C++ importa CSV; en el uso integrado, Python consulta las fuentes y e
 
 ## Datos incluidos y persistencia
 
-`data/demo` contiene 2 grupos, 3 investigadores, 4 productos y 2 revisiones ficticias. `data/real` contiene **66 grupos, 2.736 investigadores, 6.363 productos, 66 planes, 3.291 membresías, 6.735 vínculos grupo-producto y 9.703 autorías** de fichas públicas GrupLAC. De los investigadores, 274 tienen una categoría CvLAC capturada; los campos sin fuente suficiente quedan vacíos. La [procedencia y límites de la captura](data/real/README.md) están documentados aparte. No se necesita Internet para consultar los CSV incluidos.
+`data/real` contiene **66 grupos, 2.736 investigadores, 6.363 productos, 66 planes, 3.291 membresías, 6.735 vínculos grupo-producto y 9.703 autorías** de fichas públicas GrupLAC. De los investigadores, 274 tienen una categoría CvLAC capturada; los campos sin fuente suficiente quedan vacíos. La [procedencia y límites de la captura](data/real/README.md) están documentados aparte. No se necesita Internet para consultar los CSV incluidos.
 
 Cada carpeta de trabajo contiene `manifest.csv`, cuatro CSV de entidades, tres de relaciones, `cola_validacion.csv` e `historial.csv`. El esquema actual es la **versión 2**. Las carpetas anteriores de versión 1 se abren en ambos motores y se convierten al guardar; conviene conservar una copia antes de abrirlas. La carpeta `.backup` guarda los archivos del guardado anterior. Abra una carpeta editable en una sola instancia a la vez.
 
@@ -98,6 +97,6 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-En Windows, sustituya `python3` por `py -3`. Las pruebas de PDF, Excel y Word omiten lo que dependa de herramientas opcionales no instaladas. Para actualizar un clon, cierre PEA-i y ejecute `git pull` desde la carpeta del proyecto; conserve sus datos de trabajo fuera de `data/demo` y `data/real`, por ejemplo en `data/local/`.
+En Windows, sustituya `python3` por `py -3`. Las pruebas de PDF, Excel y Word omiten lo que dependa de herramientas opcionales no instaladas. Para actualizar un clon, cierre PEA-i y ejecute `git pull` desde la carpeta del proyecto; conserve sus datos de trabajo fuera de `data/real`, por ejemplo en `data/local/`.
 
-`python3 scripts/build_demo.py` regenera la demostración. `python3 scripts/import_upc_dataset.py` vuelve a consultar la lista de grupos públicos; necesita Internet, no reemplaza el conjunto existente si falla alguna importación y puede producir datos diferentes si cambian las fichas. Para consultar solo parte de la lista, use `--limit N --output OTRA_CARPETA`. `python3 scripts/build_real_sample.py` genera por separado una muestra pequeña en `data/sample_scienti/` y no reemplaza el conjunto de 66 grupos.
+`python3 scripts/import_upc_dataset.py` vuelve a consultar la lista de grupos públicos; necesita Internet, no reemplaza el conjunto existente si falla alguna importación y puede producir datos diferentes si cambian las fichas. Para consultar solo parte de la lista, use `--limit N --output OTRA_CARPETA`. `python3 scripts/build_real_sample.py` genera por separado una muestra pequeña en `data/sample_scienti/` y no reemplaza el conjunto de 66 grupos.

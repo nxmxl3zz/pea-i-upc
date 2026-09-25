@@ -7,6 +7,8 @@ import importlib.util
 import os
 from pathlib import Path
 import shutil
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -448,12 +450,15 @@ class DomainTest(unittest.TestCase):
         self.assertEqual((kind, group["nombre"]), ("grupos", "Grupo PDF de prueba"))
 
     def test_demo_contract(self):
-        demo = pea.load_repository(SOURCE.parents[2] / "data" / "demo")
-        self.assertEqual(demo.statistics()["total"], 4)
-        self.assertEqual(demo.statistics(start=2025, end=2026)["total"], 2)
-        self.assertEqual(demo.statistics(start=2022, end=2026)["total"], 3)
-        self.assertEqual(demo.statistics(view="Grupo", selected_id="G-DEMO-1")["total"], 3)
-        self.assertEqual(demo.queue.peek()["producto_id"], "P-DEMO-2")
+        with tempfile.TemporaryDirectory(prefix="pea-fixture-") as folder:
+            subprocess.run([sys.executable, str(SOURCE.parents[2] / "scripts/build_demo.py"),
+                            "--output", folder], check=True, capture_output=True, text=True)
+            demo = pea.load_repository(Path(folder))
+            self.assertEqual(demo.statistics()["total"], 4)
+            self.assertEqual(demo.statistics(start=2025, end=2026)["total"], 2)
+            self.assertEqual(demo.statistics(start=2022, end=2026)["total"], 3)
+            self.assertEqual(demo.statistics(view="Grupo", selected_id="G-DEMO-1")["total"], 3)
+            self.assertEqual(demo.queue.peek()["producto_id"], "P-DEMO-2")
 
 
 class SecurityTest(unittest.TestCase):

@@ -365,8 +365,8 @@ def build() -> None:
                    "y se conserva .backup del guardado previo para recuperación.")
     paragraph(doc, "Las dos aplicaciones pueden abrir por turnos la misma carpeta. No existe bloqueo de "
                    "escritura multiusuario; abrir simultáneamente una carpeta editable puede producir "
-                   "conflictos. data/demo y data/real se tratan como muestras: las modificaciones se guardan "
-                   "en otra carpeta mediante Guardar como.")
+                   "conflictos. La interfaz Tkinter trata data/real como muestra de solo lectura: las "
+                   "modificaciones se guardan en otra carpeta mediante Guardar como.")
 
     heading(doc, "7 Adquisición e importación")
     paragraph(doc, "Ambos programas importan CSV del esquema PEA-i con vista previa y conteo de filas "

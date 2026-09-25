@@ -25,7 +25,7 @@ Ambos programas usan CSV UTF-8 con encabezados exactos y `\n` como fin de regist
 - Las listas dobles guardan entidades. Las multilistas guardan vínculos con recorrido por cualquiera de los dos extremos. Los índices auxiliares aceleran la búsqueda por ID y por código GrupLAC, CvLAC o DOI sin sustituir esas estructuras. La pila conserva hasta 30 acciones para deshacer; la cola atiende las revisiones en orden FIFO.
 - Los totales institucionales cuentan IDs de producto activos una sola vez, incluso con varios autores o grupos. Las vistas de grupo/investigador solo usan relaciones activas. Un rango de años excluye productos sin año. Los filtros de categoría y validación se aplican antes de agrupar.
 - La categoría del grupo y la del producto son campos distintos. Una ficha GrupLAC que solo declara la clasificación del grupo no determina la categoría de cada producto; ese campo queda vacío hasta encontrar una fuente específica o registrarlo manualmente.
-- La carpeta `.backup` conserva los CSV previos al último guardado. Ninguno de los dos programas guarda directamente sobre `data/demo` desde su interfaz.
+- La carpeta `.backup` conserva los CSV previos al último guardado. La interfaz Tkinter trata `data/real` como muestra de solo lectura y requiere **Guardar como** para guardar cambios.
 
 ## Compatibilidad y apertura en hojas de cálculo
 

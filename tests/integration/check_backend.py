@@ -4,6 +4,7 @@ import importlib.util
 import csv
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 
 
@@ -18,8 +19,11 @@ def main() -> None:
         raise SystemExit("Uso: python3 tests/integration/check_backend.py build/pea_cpp")
     binary = Path(sys.argv[1]).resolve()
     backend = pea.CppRepository(binary)
+    fixture = tempfile.TemporaryDirectory(prefix="pea-backend-fixture-")
     try:
-        backend.load(ROOT / "data" / "demo")
+        subprocess.run([sys.executable, str(ROOT / "scripts/build_demo.py"),
+                        "--output", fixture.name], check=True, capture_output=True, text=True)
+        backend.load(Path(fixture.name))
         assert backend.statistics()["total"] == 4
         assert backend.page("productos", limit=2)["total"] == 4
         assert len(backend.page("productos", limit=2)["rows"]) == 2
@@ -120,6 +124,7 @@ def main() -> None:
             assert backend.get("productos", "P-FORMULA")["titulo"] == "=1+1"
     finally:
         backend.close()
+        fixture.cleanup()
     assert backend.process.poll() is not None
     with tempfile.TemporaryDirectory(prefix="pea-legacy-") as folder:
         path = Path(folder)
