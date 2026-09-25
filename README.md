@@ -20,7 +20,6 @@ CMakeLists.txt                  Compilación C++
 ENUNCIADO_TALLER_2.md           Requisitos del taller
 ```
 
-`build/`, `data/local/`, `.claude/` y los archivos temporales no forman parte de la entrega. El documento de cambios de trabajo `docs/cambios_sesion.md` tampoco se publica.
 
 ## Instalación y ejecución
 
