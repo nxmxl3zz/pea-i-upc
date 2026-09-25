@@ -1415,6 +1415,11 @@ public:
                           std::optional<int> start = {}, std::optional<int> end = {},
                           const std::string& category = "", const std::string& status = "",
                           std::size_t offset = 0, std::size_t limit = SIZE_MAX) const {
+        // Hipercubo logico: el producto es el hecho; grupo e investigador se
+        // recorren por multilistas. Anio, tipologia, categoria y validacion son
+        // dimensiones consultables. La vista selecciona una dimension relacional
+        // y los agregados se calculan al consultar, sin materializar un cubo OLAP
+        // ni cruzar grupo e investigador simultaneamente.
         if (view != "Todos" && view != "Grupo" && view != "Investigador" && view != "Producto")
             throw DataError("Vista desconocida");
         if (start && end && *start > *end) throw DataError("El anio inicial supera al final");

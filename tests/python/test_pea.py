@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 
-SOURCE = Path(__file__).resolve().parents[2] / "src" / "python" / "Taller2_XX.py"
+SOURCE = Path(__file__).resolve().parents[2] / "src" / "python" / "Taller2_REMR.py"
 SPEC = importlib.util.spec_from_file_location("pea", SOURCE)
 pea = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(pea)
@@ -42,7 +42,7 @@ class StartupTest(unittest.TestCase):
         self.assertEqual(pea.bundled_windows_cpp(root), root / "bin/windows/pea_cpp.exe")
         with tempfile.TemporaryDirectory() as folder:
             checkout = Path(folder)
-            for name in ("CMakeLists.txt", "src/cpp/Taller2_XX.cpp"):
+            for name in ("CMakeLists.txt", "src/cpp/Taller2_REMR.cpp"):
                 copied = checkout / name
                 copied.parent.mkdir(parents=True, exist_ok=True)
                 content = (root / name).read_bytes().replace(b"\r\n", b"\n")

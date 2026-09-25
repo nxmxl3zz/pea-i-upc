@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 project(pea_i_upc LANGUAGES CXX)
 
-add_executable(pea_cpp src/cpp/Taller2_XX.cpp)
+add_executable(pea_cpp src/cpp/Taller2_REMR.cpp)
 target_compile_features(pea_cpp PRIVATE cxx_std_17)
 set_target_properties(pea_cpp PROPERTIES CXX_EXTENSIONS OFF)
 if(MSVC)

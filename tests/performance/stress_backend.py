@@ -20,7 +20,7 @@ import time
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SPEC = importlib.util.spec_from_file_location("pea", ROOT / "src/python/Taller2_XX.py")
+SPEC = importlib.util.spec_from_file_location("pea", ROOT / "src/python/Taller2_REMR.py")
 pea = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(pea)
 

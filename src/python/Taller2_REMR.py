@@ -1,6 +1,6 @@
 """PEA-i UPC: interfaz Tkinter conectada al backend C++.
 
-Ejecutar: python src/python/Taller2_XX.py [--data-dir CARPETA]
+Ejecutar: python src/python/Taller2_REMR.py [--data-dir CARPETA]
 Con --python-backend se usa la implementación Python independiente de estructuras enlazadas.
 La lógica de datos puede probarse sin un servidor gráfico.
 """
@@ -704,6 +704,11 @@ class Repository:
     def statistics(self, view: str = "Todos", selected_id: str = "", start: int | None = None,
                    end: int | None = None, category: str = "", status: str = "",
                    offset: int = 0, limit: int | None = None) -> dict[str, Any]:
+        # Hipercubo lógico: cada producto es un hecho; grupo e investigador llegan
+        # por multilistas, y año, tipología, categoría y validación son dimensiones.
+        # La vista elige grupo/investigador/producto; los filtros recortan el conjunto
+        # y estos conteos se calculan bajo demanda. No hay cubo OLAP materializado
+        # ni filtro simultáneo por grupo e investigador.
         if view not in ("Todos", "Grupo", "Investigador", "Producto"):
             raise DataError("Vista desconocida")
         if start is not None and end is not None and start > end:
@@ -861,7 +866,7 @@ def bundled_windows_cpp(root: Path) -> Path | None:
         return None
     try:
         digest = hashlib.sha256()
-        for source in (root / "CMakeLists.txt", root / "src/cpp/Taller2_XX.cpp"):
+        for source in (root / "CMakeLists.txt", root / "src/cpp/Taller2_REMR.cpp"):
             digest.update(source.relative_to(root).as_posix().encode("utf-8"))
             digest.update(b"\0")
             digest.update(source.read_bytes().replace(b"\r\n", b"\n"))
@@ -889,7 +894,7 @@ def cpp_executable(explicit: Path | None = None) -> Path:
     available = [item for item in candidates if item.is_file()]
     binary = max(available, key=lambda item: item.stat().st_mtime) if available else None
     newest_source = max((root / "CMakeLists.txt").stat().st_mtime,
-                        (root / "src" / "cpp" / "Taller2_XX.cpp").stat().st_mtime)
+                        (root / "src" / "cpp" / "Taller2_REMR.cpp").stat().st_mtime)
     if binary is not None and binary.stat().st_mtime >= newest_source:
         return binary
     if os.name == "nt":

@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / "src" / "python" / "Taller2_XX.py"
+SOURCE = ROOT / "src" / "python" / "Taller2_REMR.py"
 SPEC = importlib.util.spec_from_file_location("pea", SOURCE)
 pea = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(pea)

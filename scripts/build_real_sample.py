@@ -13,7 +13,7 @@ import runpy
 
 
 ROOT = Path(__file__).resolve().parents[1]
-pea = runpy.run_path(str(ROOT / "src" / "python" / "Taller2_XX.py"))
+pea = runpy.run_path(str(ROOT / "src" / "python" / "Taller2_REMR.py"))
 GROUP_URL = "https://scienti.minciencias.gov.co/gruplac/jsp/visualiza/visualizagr.jsp?nro=00000000002099"
 RESEARCHER_URL = "https://scienti.minciencias.gov.co/cvlac/visualizador/generarCurriculoCv.do?cod_rh=0000494917"
 

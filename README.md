@@ -2,7 +2,34 @@
 
 Dos programas para gestionar grupos de investigación, investigadores, productos, planes y sus relaciones. **C++** ofrece menús de consola y también actúa como backend de la **interfaz Python Tkinter**. Al abrir la ventana, Python inicia C++ automáticamente cuando está disponible: C++ gestiona los datos, validaciones, estadísticas, cola, historial y CSV; Tkinter muestra formularios y gráficos. Si C++ no puede arrancar, la ventana abre con el motor Python independiente.
 
-> **Estado actual:** las dos versiones están implementadas. `Taller2_XX.py` y `Taller2_XX.cpp` son nombres provisionales hasta definir las iniciales de los estudiantes. La especificación Word y la prueba manual en Windows siguen pendientes; el ejecutable Windows se verificó bajo Wine.
+> **Estado actual:** las dos versiones están implementadas y usan los nombres de entrega `Taller2_REMR.py` y `Taller2_REMR.cpp`. La aplicación abre en Windows; la revisión completa de sus flujos en ese sistema sigue pendiente. La [especificación técnica en Word](docs/especificacion_tecnica.docx) es el único documento de entrega.
+
+## Organización del repositorio
+
+```text
+pea-i-upc/
+├── Iniciar PEA-i.pyw              Inicio con doble clic en Windows
+├── src/
+│   ├── cpp/Taller2_REMR.cpp       Consola y motor de datos C++
+│   └── python/Taller2_REMR.py     Interfaz Tkinter y motor Python autónomo
+├── bin/windows/                   Ejecutable C++ de 64 bits y huella de fuentes
+├── data/
+│   ├── demo/                      Muestra ficticia en CSV
+│   └── real/                      Muestra pública y procedencia de sus datos
+├── docs/
+│   ├── especificacion_tecnica.docx  Especificación técnica de entrega
+│   ├── esquema_datos.md           Campos CSV y reglas de integridad
+│   └── protocolo_backend.md       Comunicación local entre Python y C++
+├── scripts/                       Generación de muestras, Word y binario Windows
+├── tests/                         Pruebas Python, integración y carga
+├── CMakeLists.txt                  Compilación del motor C++
+├── ENUNCIADO_TALLER_2.md          Requisitos del profesor
+├── PLAN_PROYECTO.md               Alcance y criterios de aceptación
+├── PROGRESO.md                    Avance y verificaciones del desarrollo
+└── README.md                      Esta guía
+```
+
+`build/` contiene compilaciones locales y no se sube al repositorio. `data/local/` queda reservado para datos de trabajo y también está excluido de Git. El Word de `docs/` puede abrirse y editarse en LibreOffice; `scripts/build_technical_spec.py` lo regenera desde código y sobrescribe los cambios manuales.
 
 ## Descargar y ejecutar
 
@@ -22,21 +49,21 @@ python3 -m tkinter
 El segundo comando abre una pequeña ventana de prueba; ciérrela y ejecute:
 
 ```bash
-python3 src/python/Taller2_XX.py
+python3 src/python/Taller2_REMR.py
 ```
 
 La ventana inicia y cierra su propio proceso de backend; no necesita abrir la consola C++ aparte. Para comprobar qué motor está usando, abra **Ayuda → Acerca de PEA-i**.
 
 ### Windows — doble clic
 
-Extraiga el ZIP completo o clone el repositorio. Haga doble clic en **`Iniciar PEA-i.pyw`** en la carpeta principal. También puede abrir directamente **`src/python/Taller2_XX.py`**. En Windows de 64 bits la interfaz usa el backend C++ incluido, sin abrir Dev-C++ ni instalar CMake. El archivo `.pyw` evita que aparezca una ventana de consola. Para comprobar el motor activo, abra **Ayuda → Acerca de PEA-i**.
+Extraiga el ZIP completo o clone el repositorio. Haga doble clic en **`Iniciar PEA-i.pyw`** en la carpeta principal. También puede abrir directamente **`src/python/Taller2_REMR.py`**. En Windows de 64 bits la interfaz usa el backend C++ incluido, sin abrir Dev-C++ ni instalar CMake. El archivo `.pyw` evita que aparezca una ventana de consola. Para comprobar el motor activo, abra **Ayuda → Acerca de PEA-i**.
 
 Si Windows abre el archivo como texto, instale Python 3.10 o posterior con Tkinter y asocie los archivos `.pyw` con Python; también puede iniciarlo desde PowerShell:
 
 ```powershell
 py -3 --version
 py -3 -m tkinter
-py -3 src/python/Taller2_XX.py
+py -3 src/python/Taller2_REMR.py
 ```
 
 Si `py` no está disponible, pruebe los mismos comandos con `python`. Cierre la ventana de prueba de Tkinter antes de iniciar PEA-i.
@@ -71,13 +98,13 @@ Para actualizar el ejecutable Windows incluido después de modificar C++, ejecut
 
 ### Dos modos de la ventana
 
-`python3 src/python/Taller2_XX.py` prefiere C++ como backend y usa Python si C++ no está disponible. Para forzar la implementación Python independiente, use `python3 src/python/Taller2_XX.py --python-backend`. La consola C++ se ejecuta con `./build/pea_cpp` en Linux o con `bin\windows\pea_cpp.exe` en Windows. Los tres modos usan el mismo [esquema CSV](docs/esquema_datos.md), pero abra una misma carpeta de datos en una sola instancia a la vez. La [conexión entre Tkinter y C++](docs/protocolo_backend.md) funciona localmente, sin red.
+`python3 src/python/Taller2_REMR.py` prefiere C++ como backend y usa Python si C++ no está disponible. Para forzar la implementación Python independiente, use `python3 src/python/Taller2_REMR.py --python-backend`. La consola C++ se ejecuta con `./build/pea_cpp` en Linux o con `bin\windows\pea_cpp.exe` en Windows. Los tres modos usan el mismo [esquema CSV](docs/esquema_datos.md), pero abra una misma carpeta de datos en una sola instancia a la vez. La [conexión entre Tkinter y C++](docs/protocolo_backend.md) funciona localmente, sin red.
 
 ### Mostrar el cruce en una demostración
 
-1. Abra `python3 src/python/Taller2_XX.py`. En **Ayuda → Acerca de PEA-i** puede ver el motor de datos activo; por defecto se inicia un proceso C++ en segundo plano.
+1. Abra `python3 src/python/Taller2_REMR.py`. En **Ayuda → Acerca de PEA-i** puede ver el motor de datos activo; por defecto se inicia un proceso C++ en segundo plano.
 2. Cargue la demostración y guarde una copia en otra carpeta, por ejemplo `data/local`. Cree o edite un registro en la ventana y guarde.
-3. Cierre la ventana y ejecute `./build/pea_cpp --data-dir data/local`. Consulte el mismo registro desde los menús C++. Para mostrar la segunda implementación autónoma, también puede abrir la copia con `python3 src/python/Taller2_XX.py --python-backend --data-dir data/local`.
+3. Cierre la ventana y ejecute `./build/pea_cpp --data-dir data/local`. Consulte el mismo registro desde los menús C++. Para mostrar la segunda implementación autónoma, también puede abrir la copia con `python3 src/python/Taller2_REMR.py --python-backend --data-dir data/local`.
 
 ## Primer uso y demostración
 
@@ -90,14 +117,14 @@ Al abrir la ventana Python, elija una de estas opciones:
 | **Cargar datos reales** | Abre [data/real](data/real/README.md), una captura de las fichas públicas GrupLAC/CvLAC del enunciado con 85 integrantes, un plan y 202 productos fechados. |
 | **Cargar demostración** | Abre `data/demo`, con datos **ficticios** para recorrer la aplicación sin Internet. |
 
-Para ver las fuentes reales, elija **Cargar datos reales** o ejecute `python3 src/python/Taller2_XX.py --data-dir data/real`. El dashboard muestra 202 productos fechados del grupo GISICO, con gráficos por año y tipología. La pestaña **Investigadores** contiene los 85 integrantes publicados en la ficha; **Relaciones → Integrantes** distingue 67 membresías actuales y 18 finalizadas. Hay 319 autorías vinculadas por coincidencia de nombre con el censo, y un plan estratégico en **Planes**. Solo el perfil CvLAC de Adith Bismarck Pérez Orozco se consultó individualmente para añadir su categoría; los demás conservan los datos publicados en el censo. Seleccione un grupo o investigador y pulse **Consultar fuente** para revisar su página pública y, si corresponde, completar su ficha. Las categorías de producto quedan vacías porque la fuente no declara una categoría comparable con ese campo.
+Para ver las fuentes reales, elija **Cargar datos reales** o ejecute `python3 src/python/Taller2_REMR.py --data-dir data/real`. El dashboard muestra 202 productos fechados del grupo GISICO, con gráficos por año y tipología. La pestaña **Investigadores** contiene los 85 integrantes publicados en la ficha; **Relaciones → Integrantes** distingue 67 membresías actuales y 18 finalizadas. Hay 319 autorías vinculadas por coincidencia de nombre con el censo, y un plan estratégico en **Planes**. Solo el perfil CvLAC de Adith Bismarck Pérez Orozco se consultó individualmente para añadir su categoría; los demás conservan los datos publicados en el censo. Seleccione un grupo o investigador y pulse **Consultar fuente** para revisar su página pública y, si corresponde, completar su ficha. Las categorías de producto quedan vacías porque la fuente no declara una categoría comparable con ese campo.
 
 Para comprobar rápidamente los filtros, cargue la demostración. En el **Dashboard** de Python o **Estadísticas** de C++, la vista **Todos** muestra cuatro productos. El rango **2025–2026** muestra dos; **2022–2026** muestra tres. El producto `P-DEMO-1` está vinculado a dos grupos y se cuenta una sola vez en el total institucional. En C++, seleccione la opción **4. Rango** para indicar esos años.
 
 Las carpetas `data/demo` y `data/real` se tratan como muestras de solo lectura en la ventana Python. Para conservar cambios en otra carpeta, por ejemplo `data/local`, use **Archivo → Guardar como...** en Python o **Datos → Guardar como** en C++. Después puede abrirla desde **Archivo → Abrir carpeta de datos...** en Python, desde **Datos → Abrir carpeta** en C++, o iniciar directamente con:
 
 ```bash
-python3 src/python/Taller2_XX.py --data-dir data/local
+python3 src/python/Taller2_REMR.py --data-dir data/local
 ./build/pea_cpp --data-dir data/local
 ```
 
@@ -164,7 +191,7 @@ En Linux se probó también `--products 225000 --people 9000 --links 225000 --jo
 
 ## Si algo no abre
 
-- **No encuentra `src/python/Taller2_XX.py`:** abra la terminal en la carpeta que contiene este README y repita el comando.
+- **No encuentra `src/python/Taller2_REMR.py`:** abra la terminal en la carpeta que contiene este README y repita el comando.
 - **El motor aparece como Python en Ayuda → Acerca de PEA-i:** la ventana está funcionando con el respaldo Python. En Windows de 64 bits, compruebe que descargó o clonó el repositorio completo y que existe `bin/windows/pea_cpp.exe`. En otros sistemas, instale CMake y un compilador C++17 para activar la conexión C++.
 - **Aparece `CMAKE_CXX_COMPILER not set` o un error de NMake al compilar manualmente:** CMake no está encontrando el compilador de Dev-C++. Agregue al `PATH` la carpeta que contiene `g++.exe` y `mingw32-make.exe`, y use `-G "MinGW Makefiles"` con una carpeta de compilación nueva. Para abrir la ventana normalmente en Windows, estos programas no son necesarios.
 - **Falla `python3 -m tkinter` o `py -3 -m tkinter`:** instale una distribución de Python que incluya Tkinter o el paquete Tkinter de su sistema.
@@ -173,4 +200,4 @@ En Linux se probó también `--products 225000 --people 9000 --links 225000 --jo
 - **Una URL no muestra datos útiles:** compruebe que es pública y que el contenido aparece en el HTML o documento descargado. Si la página carga todo mediante JavaScript o exige cuenta, use un CSV o PDF de texto exportado por el sitio.
 - **No se puede abrir una carpeta guardada:** verifique que contiene `manifest.csv` y todos los CSV del [esquema](docs/esquema_datos.md). Si un guardado se dañó y existe `.backup`, la aplicación ofrece abrir la copia anterior.
 
-La lógica Python y sus pruebas se verificaron en Linux con Python 3.14. C++ se compiló y probó en Linux; las pruebas de integración comprobaron la comunicación Tkinter/C++, el intercambio de CSV y el historial. La ventana conectada abrió y cargó la muestra pública en Linux. El ejecutable Windows incluido pasó su autoprueba y respondió al protocolo JSON bajo Wine; el doble clic aún debe comprobarse en un Windows real. El avance real y los límites se registran en [PROGRESO.md](PROGRESO.md); el [enunciado](ENUNCIADO_TALLER_2.md) y el [plan](PLAN_PROYECTO.md) conservan los requisitos del taller.
+La lógica Python y sus pruebas se verificaron en Linux con Python 3.14. C++ se compiló y probó en Linux; las pruebas de integración comprobaron la comunicación Tkinter/C++, el intercambio de CSV y el historial. La ventana conectada abrió y cargó la muestra pública en Linux. El ejecutable Windows incluido pasó su autoprueba y respondió al protocolo JSON bajo Wine; la interfaz también abrió en Windows. Todavía falta recorrer allí todos los formularios, importaciones y ciclos de guardado. El avance real y los límites se registran en [PROGRESO.md](PROGRESO.md); el [enunciado](ENUNCIADO_TALLER_2.md) y el [plan](PLAN_PROYECTO.md) conservan los requisitos del taller.

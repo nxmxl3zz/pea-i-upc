@@ -11,7 +11,7 @@ import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCES = (ROOT / "CMakeLists.txt", ROOT / "src/cpp/Taller2_XX.cpp")
+SOURCES = (ROOT / "CMakeLists.txt", ROOT / "src/cpp/Taller2_REMR.cpp")
 OUTPUT = ROOT / "bin/windows/pea_cpp.exe"
 FINGERPRINT = ROOT / "bin/windows/pea_cpp.source-sha256"
 

@@ -148,7 +148,7 @@ Se mantendrá una **muestra comprobable** para pruebas y demostración sin conex
 
 ### Python: aplicación de escritorio Tkinter
 
-- **Tkinter** para ejecutarlo como aplicación local con `python src/python/Taller2_XX.py`. No requiere publicar el sistema ni abrir una cuenta.
+- **Tkinter** para ejecutarlo como aplicación local con `python src/python/Taller2_REMR.py`. No requiere publicar el sistema ni abrir una cuenta.
 - Controles para grupo/investigador/producto, año inicial/final o últimos 2/5 años, estado y categoría.
 - Tarjetas de cifras con definiciones claras; histograma temporal de productos; barras por tipología/categoría; tabla consultable y fichas detalladas.
 - Formularios de creación/edición/desactivación; administración de relaciones y plan; importación con vista previa de aciertos/rechazos; guardado explícito.
@@ -168,8 +168,8 @@ pea-i-upc/
 ├── .gitignore
 ├── .gitattributes
 ├── src/
-│   ├── cpp/Taller2_XX.cpp          # Fuente C++ requerido; XX se sustituye por iniciales
-│   └── python/Taller2_XX.py        # Fuente Python requerido
+│   ├── cpp/Taller2_REMR.cpp          # Fuente C++ con las iniciales indicadas
+│   └── python/Taller2_REMR.py        # Fuente Python requerido
 ├── data/
 │   └── demo/                       # CSV reproducibles y sus fuentes
 ├── tests/
@@ -184,7 +184,7 @@ pea-i-upc/
 └── .github/workflows/ci.yml       # Verificación de compilación y pruebas al subir cambios
 ```
 
-El árbol muestra la estructura objetivo. Las fuentes, CMake, datos de demostración, pruebas Python y pruebas de integración ya existen; DOCX, CI y otras carpetas previstas aún no. Si el profesor exige nombres más concretos, se renombrarán los dos archivos finales y se actualizarán CMake, README y CI. GitHub conserva y muestra el contenido de carpetas; los problemas de ejecución al mover archivos se previenen usando rutas relativas a la raíz del proyecto, argumentos `--data-dir` y comandos de compilación explícitos.
+El árbol muestra la estructura objetivo. Las fuentes con nombres definitivos, CMake, datos de demostración, pruebas y especificación DOCX ya existen; CI y algunas carpetas previstas aún no. GitHub conserva y muestra el contenido de carpetas; los problemas de ejecución al mover archivos se previenen usando rutas relativas a la raíz del proyecto, argumentos `--data-dir` y comandos de compilación explícitos.
 
 **Exclusiones en Git:** `.venv/`, `build/`, `data/local/`, `__pycache__/`, cachés de pruebas, copias locales de respaldo, contraseñas y exportaciones temporales. **Incluidos en Git:** fuentes, plan, documentación, muestras reproducibles, manifiestos y pruebas. Evitar archivos personales o datos innecesarios en un repositorio público.
 
@@ -197,7 +197,7 @@ Los comandos definitivos del README se probarán literalmente desde una **clonac
 ```bash
 git clone URL_DEL_REPOSITORIO
 cd pea-i-upc
-python3 src/python/Taller2_XX.py --data-dir data/local
+python3 src/python/Taller2_REMR.py --data-dir data/local
 ```
 
 Para C++:
@@ -213,15 +213,20 @@ cmake --build build --config Release
 ```powershell
 git clone URL_DEL_REPOSITORIO
 cd pea-i-upc
-py -3 src/python/Taller2_XX.py --data-dir data/local
+py -3 "Iniciar PEA-i.pyw"
+```
+
+La interfaz de Windows de 64 bits usa el ejecutable C++ incluido y no exige instalar CMake ni un compilador. La compilación manual de la consola es opcional:
+
+```powershell
 cmake -S . -B build
 cmake --build build --config Release
 .\build\Release\pea_cpp.exe --data-dir data/local
 ```
 
-**Prerequisitos a documentar:** Git, Python con Tkinter, compilador C++17, CMake y conexión a Internet solo durante importación por URL. La ruta del ejecutable Windows depende del generador de CMake: para algunos será `build\pea_cpp.exe` y para Visual Studio `build\Release\pea_cpp.exe`. Se indicará cuál produjo la compilación real.
+**Prerrequisitos de uso:** Python 3.10 o posterior con Tkinter; Git solo para clonar. La conexión a Internet se necesita durante la importación por URL. Para compilar C++ por cuenta propia se necesitan además CMake y un compilador C++17. La ruta del ejecutable compilado depende del generador: puede ser `build\pea_cpp.exe` o `build\Release\pea_cpp.exe`.
 
-`XX` y `URL_DEL_REPOSITORIO` son **marcadores** que deben reemplazarse antes de publicar el README final. El uso de CSV y las estadísticas locales deben funcionar sin Internet.
+`URL_DEL_REPOSITORIO` representa la URL del repositorio; la URL real y las instrucciones actuales se encuentran en el README. El uso de CSV y las estadísticas locales funcionan sin Internet.
 
 ### Demostración reproducible desde CLI
 
@@ -317,23 +322,23 @@ El DOCX se revisará visualmente antes de entregar: saltos, imágenes, tablas, e
 ## 13. Definición de «listo para subir a GitHub y probar»
 
 - [ ] Requisitos R01–R20 revisados uno a uno con evidencia.
-- [ ] Código C++ compila de cero con CMake y ejecuta desde ruta documentada.
-- [ ] Python con Tkinter abre el dashboard de escritorio.
+- [x] Código C++ compila de cero con CMake y ejecuta desde ruta documentada.
+- [x] Python con Tkinter abre el dashboard de escritorio.
 - [ ] Ambas versiones cargan el mismo esquema CSV; sus estadísticas coinciden con las reglas documentadas.
 - [ ] CRUD, desactivación, relaciones, pila, cola, filtros y persistencia resisten reinicios.
 - [ ] Dataset de demostración completo, pequeño, lícito de compartir y con fuente/fecha.
 - [ ] Importación CSV probada en ambos; importaciones URL/PDF declaradas según funcionamiento real.
 - [ ] Pruebas relevantes y CI pasan; errores de red y datos defectuosos se manejan.
 - [ ] README probado literalmente en un clon nuevo en Linux y Windows; sin rutas absolutas ni archivos omitidos.
-- [ ] DOCX técnico completo y visualmente revisado; diagramas y ejemplos coinciden con el programa.
-- [ ] Archivos finales llevan nombres definitivos con las iniciales indicadas por el profesor.
+- [x] DOCX técnico redactado y visualmente revisado; diagramas y ejemplos coinciden con el programa. Falta completar la identificación de integrantes.
+- [x] Archivos finales llevan nombres definitivos con las iniciales indicadas por el profesor.
 - [ ] `git status` limpio después del commit final, sin secretos, cachés ni datos locales accidentales.
 
 ## 14. Decisiones abiertas para resolver al llegar a la fase pertinente
 
 | Tema | Decisión pendiente | Política provisional |
 |---|---|---|
-| Iniciales y nombres de archivos | Rafael confirmará los nombres finales. | Usar `Taller2_XX.cpp` y `Taller2_XX.py` solo durante el desarrollo. |
+| Iniciales y nombres de archivos | Resuelto: Rafael indicó `Taller2_REMR.cpp` y `Taller2_REMR.py`. | Mantener esos nombres en fuentes, CMake, pruebas y documentación. |
 | Muestra UPC | Determinar grupos y perfiles con información pública suficiente y procedencia verificable. | Empezar pequeño y ampliar tras comprobar la importación. |
 | Campos oficiales de productos | Precisar tipologías y categorías según el modelo consultado. | Conservar categoría textual, fuente y estado de validación separados. |
 | Extracción PDF | Comprobar si hay PDF de texto con campos aprovechables. | CSV obligatorio; PDF no se anunciará como completado antes de probarlo. |
