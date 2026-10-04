@@ -26,24 +26,22 @@ def main() -> None:
                         "--output", str(path)], check=True, capture_output=True, text=True)
         first = subprocess.run(
             [str(binary), "--data-dir", str(path)],
-            input="8\n3\nvalidado\nVerificado por C++\n0\n11\n0\n",
+            input="8\n3\nVerificado por C++\n0\n11\n0\n",
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             cwd=ROOT, timeout=20, check=True,
         )
-        assert "Procesado P-DEMO-2" in first.stdout
+        assert "Procesado P-DEMO-2 (validado)" in first.stdout
         python_repo = pea.load_repository(path)
-        assert python_repo.get("productos", "P-DEMO-2")["validacion"] == "validado"
+        assert python_repo.get("productos", "P-DEMO-2")["observacion"] == "Verificado por C++"
+        assert python_repo.statistics(limit=0)["por_validacion"] == {"validado": 3, "rechazado": 1}
         assert python_repo.queue.peek()["producto_id"] == "P-DEMO-3"
         assert python_repo.history.length == 1
         assert python_repo.undo()
         assert python_repo.queue.peek()["producto_id"] == "P-DEMO-2"
-        assert python_repo.get("productos", "P-DEMO-2")["validacion"] == "pendiente"
+        assert python_repo.get("productos", "P-DEMO-2")["observacion"] == ""
         python_repo = pea.load_repository(path)
 
-        python_repo.update(
-            "productos", "P-DEMO-1",
-            {"categoria": "Revisada en Python", "observacion": "Nueva razón en Python"},
-        )
+        python_repo.update("productos", "P-DEMO-1", {"observacion": "Nueva razón en Python"})
         pea.save_repository(python_repo, path)
         second = subprocess.run(
             [str(binary), "--data-dir", str(path)],
@@ -53,8 +51,8 @@ def main() -> None:
         )
         assert "Ultima accion deshecha" in second.stdout
         after = pea.load_repository(path)
-        assert after.get("productos", "P-DEMO-1")["categoria"] == "Ejemplo A"
-        assert after.get("productos", "P-DEMO-2")["validacion"] == "validado"
+        assert after.get("productos", "P-DEMO-1")["observacion"] == ""
+        assert after.get("productos", "P-DEMO-2")["observacion"] == "Verificado por C++"
         assert after.history.length == 1
 
         third = subprocess.run(
@@ -65,10 +63,19 @@ def main() -> None:
         )
         assert "Ultima accion deshecha" in third.stdout
         restored = pea.load_repository(path)
-        assert restored.get("productos", "P-DEMO-2")["validacion"] == "pendiente"
+        assert restored.get("productos", "P-DEMO-2")["observacion"] == ""
         assert restored.queue.peek()["producto_id"] == "P-DEMO-2"
         assert restored.queue.length == 2
-    print("Interoperabilidad C++/Python correcta: CSV, cola e historial.")
+        fourth = subprocess.run(
+            [str(binary), "--data-dir", str(path)],
+            input="8\n5\n0\n11\n0\n",
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=ROOT, timeout=20, check=True,
+        )
+        assert "Encolados: 1" in fourth.stdout
+        queued = pea.load_repository(path)
+        assert [job["motivo"] for job in queued.queue][-1] == "reglas:fuente"
+    print("Interoperabilidad C++/Python correcta: CSV, validación, cola e historial.")
 
 
 if __name__ == "__main__":

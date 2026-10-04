@@ -28,10 +28,11 @@ for row in (
 ):
     repo.create("investigadores", row, remember=False)
 for row in (
-    {"id": "P-DEMO-1", "titulo": "Análisis de redes de prueba", "anio": "2026", "familia": "Nuevo conocimiento", "tipologia": "Artículo", "categoria": "Ejemplo A", "validacion": "validado", "observacion": "Validación de demostración", "fuente": source},
-    {"id": "P-DEMO-2", "titulo": "Herramienta educativa de prueba", "anio": "2025", "familia": "Desarrollo tecnológico", "tipologia": "Software", "categoria": "Ejemplo B", "fuente": source},
-    {"id": "P-DEMO-3", "titulo": "Libro de muestra, tomo 1", "anio": "2023", "familia": "Nuevo conocimiento", "tipologia": "Libro", "categoria": "Ejemplo B", "fuente": source},
-    {"id": "P-DEMO-4", "titulo": "Informe histórico de ejemplo", "anio": "2021", "familia": "Apropiación social", "tipologia": "Informe", "categoria": "Sin categoría", "validacion": "rechazado", "observacion": "Caso ficticio para filtro", "fuente": source},
+    # P-DEMO-4 no declara URL ni DOI: la validación automática lo rechaza.
+    {"id": "P-DEMO-1", "titulo": "Análisis de redes de prueba", "anio": "2026", "familia": "Nuevo conocimiento", "tipologia": "Artículo", "doi": "10.5555/demo.1", "fuente": source},
+    {"id": "P-DEMO-2", "titulo": "Herramienta educativa de prueba", "anio": "2025", "familia": "Desarrollo tecnológico", "tipologia": "Software", "url": "https://example.org/demo/2", "fuente": source},
+    {"id": "P-DEMO-3", "titulo": "Libro de muestra, tomo 1", "anio": "2023", "familia": "Nuevo conocimiento", "tipologia": "Libro", "url": "https://example.org/demo/3", "fuente": source},
+    {"id": "P-DEMO-4", "titulo": "Informe histórico de ejemplo", "anio": "2021", "familia": "Apropiación social", "tipologia": "Informe", "fuente": source},
 ):
     repo.create("productos", row, remember=False)
 for row in (
@@ -62,7 +63,7 @@ for row in (
     {"grupo_id": "G-DEMO-1", "producto_id": "P-DEMO-4", "origen": source},
 ):
     repo.create("grupos_productos", row, remember=False)
-repo.queue.enqueue({"id": "Q-DEMO-1", "producto_id": "P-DEMO-2", "motivo": "Revisar categoría", "creado": "2026-09-24T09:00:00"})
+repo.queue.enqueue({"id": "Q-DEMO-1", "producto_id": "P-DEMO-2", "motivo": "Confirmar autores", "creado": "2026-09-24T09:00:00"})
 repo.queue.enqueue({"id": "Q-DEMO-2", "producto_id": "P-DEMO-3", "motivo": "Verificar fuente", "creado": "2026-09-24T09:05:00"})
 pea.save_repository(repo, args.output)
 print(f"Datos de prueba creados en {args.output}: 2 grupos, 3 investigadores, 4 productos, 2 revisiones")

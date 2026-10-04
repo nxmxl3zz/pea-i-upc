@@ -54,15 +54,21 @@ Para indicar un ejecutable C++ propio use `--cpp-binary RUTA`. Para abrir una ca
 
 Al iniciar se abre automáticamente `data/real`, salvo que se indique `--data-dir`. El menú **Archivo** permite iniciar vacío, abrir otra carpeta y guardar una copia. `data/real` se trata como muestra de solo lectura desde la ventana: use **Guardar como** para conservar cambios en otra carpeta.
 
-La navegación lateral contiene Dashboard, Gráficos, Grupos, Investigadores, Productos, Planes, Relaciones y Cola de revisión. El botón ☰ contrae o despliega el menú. Las tablas muestran 100 filas por página y la búsqueda abarca el conjunto completo. En las pestañas de entidades, haga doble clic en una fila o pulse **Información** para abrir sus campos y productos relacionados.
+La navegación lateral contiene Dashboard, Gráficos, Grupos, Investigadores, Productos, Planes, Relaciones y Cola de revisión. La sección actual queda resaltada; el botón ☰ contrae o despliega el menú. Las tablas muestran 100 filas por página y la búsqueda abarca el conjunto completo. Puede filtrar entidades por **Todos**, **Activos** o **Inactivos**.
 
-El dashboard muestra productos únicos por vista (Todos, Grupo, Investigador o Producto), con filtros de año, categoría y validación. Los filtros de selección se aplican al cambiarlos. Los gráficos agrupan por año, tipología, categoría y validación. Un dato vacío no se inventa: el producto sigue en el total y figura como «Sin dato» en la distribución correspondiente. La categoría del **grupo** no se copia a la categoría del **producto**.
+Pulse un producto para abrir su ficha completa, con **Resumen**, **Autores**, **Grupos** y **Estadísticas**. Abrir la ficha conserva la búsqueda y la página de la lista. Para otras entidades, haga doble clic o pulse **Abrir ficha**. Los grupos incluyen pestañas de integrantes, planes y productos; los investigadores incluyen sus grupos y productos. Desde estas fichas puede editar registros, crear planes, vincular entidades y editar, desactivar o eliminar vínculos. Los vínculos inactivos siguen visibles para consultar su historia. El resumen muestra solo los campos con datos y lista los vacíos en una línea «Sin registrar». Las tablas ocultan las columnas que ningún registro ha llenado y las muestran en cuanto alguno lo tiene. Las categorías aparecen solo en el módulo de grupos: la del grupo y la de sus integrantes.
 
-Puede crear, editar, desactivar y eliminar entidades y relaciones. El cambio de categoría o validación de un producto exige una observación nueva. La **Cola de revisión** procesa productos por orden de llegada; **Editar → Deshacer** revierte acciones. Los datos, la cola y el historial se conservan al guardar.
+El dashboard reúne filtros, cuatro tarjetas de resumen, un histograma anual, barras por tipología y los productos de la consulta. Ofrece vistas **Todos**, **Grupo**, **Investigador** y **Producto**, con filtros de año y validación. Todos los filtros responden automáticamente al seleccionar o escribir; el rango personalizado también acepta Enter. No hay botones Aplicar/Limpiar. **Elegir…** abre un selector por nombre o ID con búsqueda y páginas sobre todos los registros, incluso los posteriores a la fila 100.
+
+El histograma agrupa los productos de **20 años o más** en una columna; en 2026 incluye **2006 y anteriores**. El corte avanza con el año actual y siempre respeta la ventana elegida. La vista previa agrupa las tipologías menos frecuentes como «Otras tipologías (agrupadas)». **Gráficos** ofrece el desglose completo por año, tipología, validación y reglas incumplidas, con el mismo contexto del dashboard y barras desplazables. Un dato vacío no se inventa: el producto sigue en el total y aparece como «Sin dato». Los porcentajes usan el total de productos de la consulta, incluidos los datos desconocidos.
+
+Puede crear, editar, desactivar y eliminar entidades y relaciones. Los formularios muestran campos obligatorios y conservan lo escrito si falla la validación. La **validación es automática**: un producto queda validado si tiene año, tipología, un autor y un grupo activos, y una URL o un DOI válido; si no, queda rechazado y su ficha indica qué reglas incumple. En la muestra incluida, 6.323 productos quedan validados y 40 rechazados (37 sin autor del censo y 3 con DOI mal formado). La **Cola de revisión** atiende esos casos por orden de llegada: **Enviar rechazados** los encola en una acción y **Revisar siguiente** permite corregir el producto y cerrar la revisión con una nota obligatoria. **Editar → Deshacer** revierte acciones. Los datos, la cola y el historial se conservan al guardar.
+
+La barra superior indica la carpeta o muestra abierta y los cambios pendientes, con **Guardar** o **Guardar copia**. La barra inferior muestra resultados y errores. Atajos: **Ctrl+S** guardar, **Ctrl+Shift+S** guardar como, **Ctrl+N** iniciar vacío, **Ctrl+Z** deshacer y **Ctrl+Enter** guardar un formulario. El dashboard se desplaza verticalmente en ventanas pequeñas y ambas apariencias se conservan al navegar.
 
 ### Importar información
 
-- **CSV:** ambos motores importan los archivos con los encabezados de [esquema_datos.md](docs/esquema_datos.md). La vista previa indica filas aceptables y rechazadas.
+- **CSV:** ambos motores importan los archivos con los encabezados de [esquema_datos.md](docs/esquema_datos.md). La ventana propone el tipo según los encabezados y permite seleccionarlo por nombre. La vista previa indica filas aceptables y rechazadas.
 - **Excel `.xlsx`:** la interfaz Python convierte la primera hoja a CSV antes de la vista previa. Requiere `openpyxl` (`pip install openpyxl`).
 - **URL pública:** la interfaz Python muestra HTML, texto, CSV o PDF de texto antes de crear registros. Reconoce fichas GrupLAC/CvLAC y metadatos explícitos de artículos; otros sitios pueden mostrarse sin proponer campos. No ejecuta JavaScript de la página ni inicia sesión en sitios externos.
 - **PDF local:** la interfaz Python requiere `pdftotext` de Poppler y texto seleccionable. Un PDF escaneado necesita OCR externo.
@@ -74,9 +80,9 @@ La consola C++ importa CSV; en el uso integrado, Python consulta las fuentes y e
 
 `data/real` contiene **66 grupos, 2.736 investigadores, 6.363 productos, 66 planes, 3.291 membresías, 6.735 vínculos grupo-producto y 9.703 autorías** de fichas públicas GrupLAC. De los investigadores, 274 tienen una categoría CvLAC capturada; los campos sin fuente suficiente quedan vacíos. La [procedencia y límites de la captura](data/real/README.md) están documentados aparte. No se necesita Internet para consultar los CSV incluidos.
 
-Cada carpeta de trabajo contiene `manifest.csv`, cuatro CSV de entidades, tres de relaciones, `cola_validacion.csv` e `historial.csv`. El esquema actual es la **versión 2**. Las carpetas anteriores de versión 1 se abren en ambos motores y se convierten al guardar; conviene conservar una copia antes de abrirlas. La carpeta `.backup` guarda los archivos del guardado anterior. Abra una carpeta editable en una sola instancia a la vez.
+Cada carpeta de trabajo contiene `manifest.csv`, cuatro CSV de entidades, tres de relaciones, `cola_validacion.csv` e `historial.csv`. El esquema actual es la **versión 3**: los productos ya no tienen categoría, porque las fichas GrupLAC no la publican por producto. Las carpetas anteriores de versiones 1 y 2 se abren en ambos motores y se convierten al guardar (una categoría de producto escrita a mano se conserva en la observación); conviene conservar una copia antes de abrirlas. La carpeta `.backup` guarda los archivos del guardado anterior. Abra una carpeta editable en una sola instancia a la vez.
 
-La versión 2 neutraliza en disco los valores que una hoja de cálculo podría interpretar como fórmulas y los recupera al cargar. **Archivo → Exportar para hoja de cálculo** crea una copia segura para consulta; esa exportación no incluye la cola ni el historial y no sustituye una carpeta de trabajo.
+El esquema neutraliza en disco los valores que una hoja de cálculo podría interpretar como fórmulas y los recupera al cargar. **Archivo → Exportar para hoja de cálculo** crea una copia segura para consulta; esa exportación no incluye la cola ni el historial y no sustituye una carpeta de trabajo.
 
 ## Medidas y límites de seguridad
 
@@ -98,5 +104,13 @@ ctest --test-dir build --output-on-failure
 ```
 
 En Windows, sustituya `python3` por `py -3`. Las pruebas de PDF, Excel y Word omiten lo que dependa de herramientas opcionales no instaladas. Para actualizar un clon, cierre PEA-i y ejecute `git pull` desde la carpeta del proyecto; conserve sus datos de trabajo fuera de `data/real`, por ejemplo en `data/local/`.
+
+Las regresiones de interfaz requieren una sesión gráfica y se omiten si no existe. Para recorrerlas también con C++, después de compilar:
+
+```bash
+PEA_TEST_CPP=build/pea_cpp python3 -m unittest discover -s tests/python -v
+```
+
+En Windows PowerShell: `$env:PEA_TEST_CPP = 'bin/windows/pea_cpp.exe'`, seguido de `py -3 -m unittest discover -s tests/python -v`. Estas pruebas usan repositorios temporales y no guardan cambios en `data/real`. El [plan UI/UX](PLAN_UI_UX.md) y la [guía de verificación](docs/UI_UX_VERIFICACION.md) describen el alcance, las comprobaciones y el recorrido manual para Windows.
 
 `python3 scripts/import_upc_dataset.py` vuelve a consultar la lista de grupos públicos; necesita Internet, no reemplaza el conjunto existente si falla alguna importación y puede producir datos diferentes si cambian las fichas. Para consultar solo parte de la lista, use `--limit N --output OTRA_CARPETA`. `python3 scripts/build_real_sample.py` genera por separado una muestra pequeña en `data/sample_scienti/` y no reemplaza el conjunto de 66 grupos.

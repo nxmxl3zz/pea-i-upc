@@ -53,7 +53,7 @@ const std::map<std::string, std::vector<std::string>> FIELDS = {
     {"grupos", {"id", "nombre", "codigo_gruplac", "fecha_creacion", "unidad", "responsable",
                 "categoria", "descripcion", "objetivos", "mision", "vision", "lineas", "url", "fuente", "activo"}},
     {"investigadores", {"id", "nombre", "codigo_cvlac", "afiliacion", "categoria", "contacto", "url", "fuente", "activo"}},
-    {"productos", {"id", "titulo", "anio", "fecha", "familia", "tipologia", "categoria",
+    {"productos", {"id", "titulo", "anio", "fecha", "familia", "tipologia",
                    "validacion", "observacion", "doi", "url", "fuente", "activo"}},
     {"planes", {"id", "grupo_id", "nombre", "inicio", "fin", "objetivo", "indicador", "meta", "actividad", "activo"}},
     {"membresias", {"grupo_id", "investigador_id", "rol", "inicio", "fin", "activo"}},
@@ -84,6 +84,15 @@ const std::map<std::string, std::string> LABELS = {
     {"objetivo", "Objetivo"}, {"indicador", "Indicador"}, {"meta", "Meta"},
     {"actividad", "Actividad"}, {"rol", "Rol"}, {"orden", "Orden"}, {"origen", "Origen"}
 };
+const std::string SCHEMA_VERSION = "3";
+// Validacion automatica de productos. Codigos y orden compartidos con Python.
+const std::array<std::string, 6> RULE_CODES = {"anio", "tipologia", "autor", "grupo", "doi", "fuente"};
+const std::map<std::string, std::string> RULE_LABELS = {
+    {"anio", "Sin anio de publicacion"}, {"tipologia", "Sin tipologia"},
+    {"autor", "Sin autor activo registrado"}, {"grupo", "Sin grupo activo asociado"},
+    {"doi", "DOI con formato invalido"}, {"fuente", "Sin fuente verificable (URL o DOI)"}
+};
+const std::string AUTO_REASON_PREFIX = "reglas:";
 
 const std::string& field(const Row& row, const std::string& key) {
     static const std::string empty;
@@ -235,9 +244,10 @@ Row cleanRow(const std::string& kind, const Row& input) {
             catch (const std::exception&) { throw DataError("Anio invalido"); }
             if (year < 1900 || year > currentYear() + 1) throw DataError("Anio fuera de rango");
         }
-        if (row["validacion"].empty()) row["validacion"] = "pendiente";
+        // El repositorio recalcula este campo; "pendiente" procede de carpetas anteriores.
+        if (row["validacion"].empty()) row["validacion"] = "rechazado";
         if (row["validacion"] != "pendiente" && row["validacion"] != "validado" && row["validacion"] != "rechazado")
-            throw DataError("Validacion: pendiente, validado o rechazado");
+            throw DataError("Validacion: validado o rechazado");
     }
     if (kind == "autorias" && !row["orden"].empty()) {
         if (!digits(row["orden"])) throw DataError("Orden de autor debe ser positivo");
@@ -261,6 +271,38 @@ Row cleanRow(const std::string& kind, const Row& input) {
         if (value.size() > MAX_FIELD_LENGTH)
             throw DataError(label(name) + " supera el tamano permitido");
     return row;
+}
+
+// Adapta filas de las versiones 1 y 2 (y del historial guardado con ellas).
+Row legacyRow(const std::string& kind, Row row) {
+    if (kind == "grupos") row.erase("sigla");
+    if (kind == "productos") {
+        if (!row.count("validacion")) row["validacion"] = "pendiente";
+        auto category = row.find("categoria");
+        if (category != row.end()) {
+            const std::string value = trim(category->second);
+            row.erase(category);
+            if (!value.empty())
+                row["observacion"] = trim(trim(field(row, "observacion")) +
+                    "\nCategoría registrada antes de la versión 3: " + value);
+        }
+    }
+    return row;
+}
+bool validDoi(const std::string& doi) {
+    if (!startsWith(doi, "10.")) return false;
+    const auto slash = doi.find('/', 3);
+    if (slash == std::string::npos) return false;
+    const std::string prefix = doi.substr(3, slash - 3);
+    const std::string suffix = doi.substr(slash + 1);
+    if (prefix.size() < 4 || prefix.size() > 9 || !digits(prefix) || suffix.empty()) return false;
+    return suffix.find_first_of(" \t\n\r\f\v") == std::string::npos;
+}
+bool verifiableUrl(const std::string& url) {
+    const std::string text = lowercase(trim(url));
+    for (const std::string scheme : {"http://", "https://"})
+        if (startsWith(text, scheme) && text.size() > scheme.size()) return true;
+    return false;
 }
 
 // Nodos doblemente enlazados: la lista es la fuente de verdad; el mapa solo ubica un nodo.
@@ -979,8 +1021,8 @@ struct Statistics {
     std::size_t total = 0;
     std::map<std::string, int> byYear;
     std::map<std::string, int> byType;
-    std::map<std::string, int> byCategory;
     std::map<std::string, int> byValidation;
+    std::map<std::string, int> byRule;
 };
 struct ImportResult {
     std::size_t total = 0;
@@ -998,7 +1040,53 @@ class Repository {
     std::unordered_map<std::string, std::size_t> queueProductCounts_;
     std::set<std::string> queueIds_;
     LinkedStack history_;
+    // Reglas incumplidas por producto; se mantiene junto con el campo "validacion".
+    std::unordered_map<std::string, std::vector<std::string>> issues_;
     bool dirty_ = false;
+
+    std::vector<std::string> ruleFailures(const Row& product) const {
+        std::vector<std::string> failed;
+        const std::string id = field(product, "id");
+        if (field(product, "anio").empty()) failed.push_back("anio");
+        if (field(product, "tipologia").empty()) failed.push_back("tipologia");
+        bool author = false, group = false;
+        relations_[1].forEachRelated(id, true, [&](const Row& link) {
+            const Row* person = get("investigadores", field(link, "investigador_id"));
+            if (field(link, "activo") == "1" && person && field(*person, "activo") == "1") author = true;
+        });
+        relations_[2].forEachRelated(id, false, [&](const Row& link) {
+            const Row* owner = get("grupos", field(link, "grupo_id"));
+            if (field(link, "activo") == "1" && owner && field(*owner, "activo") == "1") group = true;
+        });
+        if (!author) failed.push_back("autor");
+        if (!group) failed.push_back("grupo");
+        const std::string doi = normalizedExternal("productos", field(product, "doi"));
+        if (!doi.empty() && !validDoi(doi)) failed.push_back("doi");
+        if (!verifiableUrl(field(product, "url")) && !(!doi.empty() && validDoi(doi)))
+            failed.push_back("fuente");
+        return failed;
+    }
+    void revalidate(const std::vector<std::string>& productIds) {
+        for (const std::string& id : productIds) {
+            Row* product = entities_[2].get(id);
+            if (!product) { issues_.erase(id); continue; }
+            auto failed = ruleFailures(*product);
+            (*product)["validacion"] = failed.empty() ? "validado" : "rechazado";
+            issues_[id] = std::move(failed);
+        }
+    }
+    std::vector<std::string> affectedProducts(const std::string& kind, const Row& row) const {
+        std::vector<std::string> ids;
+        if (kind == "productos") ids.push_back(field(row, "id"));
+        else if (kind == "autorias" || kind == "grupos_productos") ids.push_back(field(row, "producto_id"));
+        else if (kind == "investigadores")
+            relations_[1].forEachRelated(field(row, "id"), false,
+                [&](const Row& link) { ids.push_back(field(link, "producto_id")); });
+        else if (kind == "grupos")
+            relations_[2].forEachRelated(field(row, "id"), true,
+                [&](const Row& link) { ids.push_back(field(link, "producto_id")); });
+        return ids;
+    }
 
     static Row undoRow(const std::string& op, const std::string& kind, Row row) {
         row["__op"] = op;
@@ -1038,8 +1126,7 @@ class Repository {
                 Row row = change;
                 row.erase("__op");
                 row.erase("__kind");
-                if (kind == "grupos") row.erase("sigla");
-                cleanRow(kind, row);
+                cleanRow(kind, legacyRow(kind, std::move(row)));
             } else if (FIELDS.count(kind) && op == "delete") {
                 if (entityIndex(kind) >= 0 ? field(change, "id").empty() :
                     (field(change, RELATION_ENDS.at(kind)[0]).empty() ||
@@ -1078,8 +1165,7 @@ class Repository {
                 Row row = change;
                 row.erase("__op");
                 row.erase("__kind");
-                if (kind == "grupos") row.erase("sigla");
-                row = cleanRow(kind, row);
+                row = cleanRow(kind, legacyRow(kind, std::move(row)));
                 if (op == "create") create(kind, row, false);
                 else {
                     Row* current = get(kind, key, second);
@@ -1087,6 +1173,7 @@ class Repository {
                     checkExternal(kind, row, key);
                     if (entityIndex(kind) >= 0) reindexExternal(kind, current, &row);
                     *current = std::move(row);
+                    revalidate(affectedProducts(kind, *current));
                 }
             }
         }
@@ -1241,6 +1328,7 @@ public:
                     {RELATION_ENDS.at(kind)[1], field(row, RELATION_ENDS.at(kind)[1])}};
             remember({undoRow("delete", kind, std::move(key))});
         }
+        const auto affected = affectedProducts(kind, row);
         if (entity >= 0) {
             const std::string id = field(row, "id");
             entities_[static_cast<std::size_t>(entity)].append(std::move(row));
@@ -1250,6 +1338,7 @@ public:
                 throw;
             }
         } else relations_[static_cast<std::size_t>(relationIndex(kind))].add(std::move(row));
+        revalidate(affected);
     }
     void update(const std::string& kind, const std::string& key, const std::string& second,
                 const Row& changes, bool withUndo = true) {
@@ -1269,15 +1358,10 @@ public:
                 throw DataError("Los extremos son estables; cree otra relacion");
         }
         checkLinks(kind, updated);
-        if (kind == "productos" &&
-            (field(updated, "categoria") != field(*current, "categoria") ||
-             field(updated, "validacion") != field(*current, "validacion")) &&
-            (field(updated, "observacion").empty() ||
-             field(updated, "observacion") == field(*current, "observacion")))
-            throw DataError("Explique el cambio de categoria o validacion en Observacion");
         if (withUndo) remember({undoRow("replace", kind, *current)});
         if (entityIndex(kind) >= 0) reindexExternal(kind, current, &updated);
         *current = std::move(updated);
+        revalidate(affectedProducts(kind, *current));
         dirty_ = true;
     }
     void erase(const std::string& kind, const std::string& key,
@@ -1301,11 +1385,13 @@ public:
                 throw DataError("Hay revisiones pendientes para el producto");
         }
         if (withUndo) remember({undoRow("create", kind, *get(kind, key, second))});
+        const auto affected = affectedProducts(kind, *get(kind, key, second));
         if (entity >= 0) {
             reindexExternal(kind, get(kind, key), nullptr);
             entities_[static_cast<std::size_t>(entity)].erase(key);
         }
         else relations_[static_cast<std::size_t>(relationIndex(kind))].erase(key, second);
+        revalidate(affected);
         dirty_ = true;
     }
     void toggle(const std::string& kind, const std::string& key, const std::string& second = "") {
@@ -1347,10 +1433,7 @@ public:
         Repository fresh;
         for (const auto& kind : ENTITY_KINDS) {
             if (!parsed.count(kind)) throw DataError("Historial sin " + kind);
-            for (Row row : parsed.at(kind)) {
-                if (kind == "grupos") row.erase("sigla");
-                fresh.create(kind, row, false);
-            }
+            for (Row row : parsed.at(kind)) fresh.create(kind, legacyRow(kind, std::move(row)), false);
         }
         for (const auto& kind : RELATION_KINDS) {
             if (!parsed.count(kind)) throw DataError("Historial sin " + kind);
@@ -1364,6 +1447,7 @@ public:
         queue_ = std::move(fresh.queue_);
         queueProductCounts_ = std::move(fresh.queueProductCounts_);
         queueIds_ = std::move(fresh.queueIds_);
+        issues_ = std::move(fresh.issues_);
         dirty_ = true;
     }
     bool undo() {
@@ -1392,41 +1476,82 @@ public:
             history_.push(state);
         }
     }
+    static Row newJob(const std::string& productId, const std::string& reason) {
+        static std::uint64_t counter = 0;
+        const auto ticks = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+        return {{"id", "Q-" + std::to_string(ticks) + "-" + std::to_string(++counter)},
+                {"producto_id", productId}, {"motivo", trim(reason)}, {"creado", nowIso()}};
+    }
     void enqueueReview(const std::string& productId, const std::string& reason) {
         if (!get("productos", productId)) throw DataError("Producto inexistente");
         if (queueProductCounts_.count(productId)) throw DataError("El producto ya esta en la cola");
-        static std::uint64_t counter = 0;
-        const auto ticks = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-        Row job = {{"id", "Q-" + std::to_string(ticks) + "-" + std::to_string(++counter)},
-                   {"producto_id", productId}, {"motivo", trim(reason)}, {"creado", nowIso()}};
+        Row job = newJob(productId, reason);
         remember({undoRow("queue_remove", "", {{"id", field(job, "id")}})});
         queue_.enqueue(std::move(job));
         indexJob(*queue_.back());
         dirty_ = true;
     }
-    Row processReview(const std::string& status, const std::string& observation) {
+    // Encola los productos activos rechazados que aun no esperan revision (una accion).
+    std::size_t enqueueRejected() {
+        Rows jobs;
+        entities_[2].forEach([&](const Row& product) {
+            const std::string id = field(product, "id");
+            if (field(product, "activo") != "1" || field(product, "validacion") != "rechazado" ||
+                queueProductCounts_.count(id)) return;
+            std::string reason = AUTO_REASON_PREFIX;
+            const auto found = issues_.find(id);
+            if (found != issues_.end())
+                for (std::size_t i = 0; i < found->second.size(); ++i)
+                    reason += (i ? "," : "") + found->second[i];
+            jobs.push_back(newJob(id, reason));
+        });
+        if (jobs.empty()) return 0;
+        Rows inverse;
+        for (const Row& job : jobs) inverse.push_back(undoRow("queue_remove", "", {{"id", field(job, "id")}}));
+        remember(std::move(inverse));
+        for (Row& job : jobs) {
+            queue_.enqueue(std::move(job));
+            indexJob(*queue_.back());
+        }
+        dirty_ = true;
+        return jobs.size();
+    }
+    // Cierra la revision del frente con una nota; la validacion sigue siendo automatica.
+    Row processReview(const std::string& observation) {
         const Row* job = queue_.peek();
         if (!job) throw DataError("La cola esta vacia");
-        if (status != "validado" && status != "rechazado" && status != "pendiente")
-            throw DataError("Estado invalido");
         if (trim(observation).empty()) throw DataError("Debe registrar una observacion");
         Row* product = get("productos", field(*job, "producto_id"));
         if (!product) throw DataError("Producto inexistente");
-        if (field(*product, "validacion") != status && field(*product, "observacion") == trim(observation))
-            throw DataError("Escriba una observacion nueva");
         cleanRow("productos", [&] {
             Row proposed = *product;
-            proposed["validacion"] = status;
             proposed["observacion"] = observation;
             return proposed;
         }());
         remember({undoRow("replace", "productos", *product),
                   undoRow("queue_prepend", "", *job)});
         Row completed = *job;
-        update("productos", field(*job, "producto_id"), "", {{"validacion", status}, {"observacion", observation}}, false);
+        update("productos", field(*job, "producto_id"), "", {{"observacion", observation}}, false);
+        completed["validacion"] = field(*get("productos", field(completed, "producto_id")), "validacion");
         unindexJob(*queue_.dequeue());
         dirty_ = true;
         return completed;
+    }
+    std::vector<std::string> productIssues(const std::string& productId) const {
+        if (!get("productos", productId)) throw DataError("Producto inexistente");
+        const auto found = issues_.find(productId);
+        return found == issues_.end() ? std::vector<std::string>{} : found->second;
+    }
+    // Registros con valor por campo; la interfaz oculta columnas que nadie ha llenado.
+    std::map<std::string, int> fieldUsage(const std::string& kind) const {
+        if (!FIELDS.count(kind)) throw DataError("Tipo desconocido: " + kind);
+        std::map<std::string, int> usage;
+        for (const auto& name : FIELDS.at(kind)) usage[name] = 0;
+        forEachRow(kind, [&](const Row& row) {
+            for (const auto& [name, value] : row)
+                if (!value.empty()) ++usage[name];
+        });
+        return usage;
     }
     Row discardReview() {
         if (!queue_.peek()) throw DataError("La cola esta vacia");
@@ -1438,16 +1563,18 @@ public:
     }
     Statistics statistics(const std::string& view = "Todos", const std::string& selectedId = "",
                           std::optional<int> start = {}, std::optional<int> end = {},
-                          const std::string& category = "", const std::string& status = "",
+                          const std::string& status = "",
                           std::size_t offset = 0, std::size_t limit = SIZE_MAX) const {
         // Hipercubo logico: el producto es el hecho; grupo e investigador se
-        // recorren por multilistas. Anio, tipologia, categoria y validacion son
+        // recorren por multilistas. Anio, tipologia y validacion son
         // dimensiones consultables. La vista selecciona una dimension relacional
         // y los agregados se calculan al consultar, sin materializar un cubo OLAP
         // ni cruzar grupo e investigador simultaneamente.
         if (view != "Todos" && view != "Grupo" && view != "Investigador" && view != "Producto")
             throw DataError("Vista desconocida");
         if (start && end && *start > *end) throw DataError("El anio inicial supera al final");
+        if (!status.empty() && status != "validado" && status != "rechazado")
+            throw DataError("Validacion: validado o rechazado");
         std::optional<std::set<std::string>> selected;
         if (view == "Grupo") {
             selected.emplace();
@@ -1471,7 +1598,6 @@ public:
             if ((start || end) && yearText.empty()) return;
             if (start && std::stoi(yearText) < *start) return;
             if (end && std::stoi(yearText) > *end) return;
-            if (!category.empty() && field(product, "categoria") != category) return;
             if (!status.empty() && field(product, "validacion") != status) return;
             if (result.total >= offset && result.products.size() < limit)
                 result.products.push_back(product);
@@ -1482,8 +1608,10 @@ public:
             };
             count(result.byYear, "anio");
             count(result.byType, "tipologia");
-            count(result.byCategory, "categoria");
             count(result.byValidation, "validacion");
+            const auto found = issues_.find(field(product, "id"));
+            if (found != issues_.end())
+                for (const auto& code : found->second) ++result.byRule[code];
         });
         return result;
     }
@@ -1499,6 +1627,7 @@ std::vector<std::string> dataFiles() {
     result.push_back("historial.csv");
     return result;
 }
+// Compara el conjunto de encabezados (sin importar el orden) para detectar formatos anteriores.
 bool headerMatches(const fs::path& path, const std::vector<std::string>& fields) {
     std::ifstream input(path, std::ios::binary);
     if (!input) throw DataError("No se pudo abrir " + path.string());
@@ -1506,10 +1635,10 @@ bool headerMatches(const fs::path& path, const std::vector<std::string>& fields)
     std::getline(input, first);
     if (startsWith(first, "\xef\xbb\xbf")) first.erase(0, 3);
     if (!first.empty() && first.back() == '\r') first.pop_back();
-    std::string expected;
-    for (std::size_t i = 0; i < fields.size(); ++i)
-        expected += (i ? "," : "") + fields[i];
-    return first == expected;
+    std::set<std::string> actual;
+    std::stringstream names(first);
+    for (std::string name; std::getline(names, name, ',');) actual.insert(name);
+    return actual == std::set<std::string>(fields.begin(), fields.end());
 }
 Repository loadRepository(const fs::path& directory) {
     std::string version;
@@ -1519,9 +1648,10 @@ Repository loadRepository(const fs::path& directory) {
         if (++manifestRows > 1) throw DataError("Manifest con mas de una fila");
         version = field(row, "version");
     });
-    if (manifestRows != 1 || (version != "1" && version != "2"))
+    if (manifestRows != 1 || (version != "1" && version != "2" && version != SCHEMA_VERSION))
         throw DataError("Version de datos incompatible");
     const bool legacy = version == "1";
+    const bool upgrade = version != SCHEMA_VERSION;
     Repository repo;
     for (const auto& kind : ENTITY_KINDS) {
         auto columns = FIELDS.at(kind);
@@ -1531,16 +1661,25 @@ Repository loadRepository(const fs::path& directory) {
             oldColumns.insert(oldColumns.begin() + 2, "sigla");
             if (headerMatches(path, oldColumns)) columns = std::move(oldColumns);
         }
-        if (legacy && kind == "productos") {
-            auto oldColumns = columns;
-            oldColumns.erase(std::remove(oldColumns.begin(), oldColumns.end(), "validacion"), oldColumns.end());
-            if (headerMatches(path, oldColumns)) columns = std::move(oldColumns);
+        if (upgrade && kind == "productos") {
+            // v2 guarda "categoria"; en v1 puede faltar "validacion". El orden no importa.
+            auto withCategory = columns;
+            withCategory.push_back("categoria");
+            std::vector<std::vector<std::string>> candidates = {columns, withCategory};
+            if (legacy) {
+                for (auto base : {withCategory, columns}) {
+                    base.erase(std::remove(base.begin(), base.end(), "validacion"), base.end());
+                    candidates.push_back(std::move(base));
+                }
+            }
+            columns = withCategory;
+            for (const auto& candidate : candidates)
+                if (headerMatches(path, candidate)) { columns = candidate; break; }
         }
         readCsvEach(path, columns,
                     [&](Row row, std::size_t number) {
             try {
-                if (legacy && kind == "grupos") row.erase("sigla");
-                repo.create(kind, row, false);
+                repo.create(kind, upgrade ? legacyRow(kind, std::move(row)) : std::move(row), false);
             }
             catch (const DataError& error) {
                 throw DataError(kind + ".csv, fila " + std::to_string(number) + ": " + error.what());
@@ -1589,7 +1728,7 @@ void saveRepository(Repository& repo, const fs::path& directory) {
     const auto tick = std::chrono::high_resolution_clock::now().time_since_epoch().count();
     StagingFolder stage(directory / (".pea-stage-" + std::to_string(tick)));
     writeCsv(stage.path / "manifest.csv", MANIFEST_FIELDS,
-             {{{"version", "2"}, {"guardado", nowIso()}}});
+             {{{"version", SCHEMA_VERSION}, {"guardado", nowIso()}}});
     for (const auto& kind : ALL_KINDS)
         writeCsvEach(stage.path / (kind + ".csv"), FIELDS.at(kind),
                      [&](const auto& visit) { repo.forEachRow(kind, visit); }, true);
@@ -1759,10 +1898,10 @@ Row inputRecord(const std::string& kind, const Row* original = nullptr) {
     if (original) std::cout << "Enter conserva el valor; :vaciar lo borra.\n";
     for (const auto& name : fields) {
         if (original && (name == "id" || name == first || name == second)) continue;
+        if (name == "validacion") continue;  // Se calcula con las reglas de validacion.
         std::string defaultValue;
         if (!original && name == "id") defaultValue = newId(kind);
         else if (!original && name == "activo") defaultValue = "1";
-        else if (!original && name == "validacion") defaultValue = "pendiente";
         const std::string current = original ? field(*original, name) : defaultValue;
         std::string prompt = label(name);
         if (!current.empty()) prompt += " [" + display(current, 48) + "]";
@@ -1845,6 +1984,9 @@ void printDetail(const Repository& repo, const std::string& kind,
         printRelated("Grupos", "membresias", key, false, "grupo_id", "grupos");
         printRelated("Productos", "autorias", key, false, "producto_id", "productos");
     } else if (kind == "productos") {
+        const auto failed = repo.productIssues(key);
+        std::cout << "\nReglas incumplidas: " << (failed.empty() ? "ninguna" : "") << '\n';
+        for (const auto& code : failed) std::cout << "- " << RULE_LABELS.at(code) << '\n';
         printRelated("Autores", "autorias", key, true, "investigador_id", "investigadores");
         printRelated("Grupos", "grupos_productos", key, false, "grupo_id", "grupos");
     }
@@ -1928,9 +2070,8 @@ void statisticsMenu(const Repository& repo) {
         start = parse(from);
         end = parse(to);
     }
-    const std::string category = ask("Categoria exacta (vacio = todas): ");
-    const std::string validation = ask("Validacion exacta (vacio = todas): ");
-    const Statistics stats = repo.statistics(view, selected, start, end, category, validation, 0, 40);
+    const std::string validation = lowercase(ask("Validacion (validado/rechazado, vacio = todas): "));
+    const Statistics stats = repo.statistics(view, selected, start, end, validation, 0, 40);
     const auto [activeGroups, activePeople] = repo.activeCounts();
     std::cout << "\nVista: " << view;
     if (!selected.empty()) std::cout << " " << selected;
@@ -1939,15 +2080,16 @@ void statisticsMenu(const Repository& repo) {
               << "\nInvestigadores activos: " << activePeople << '\n';
     printTally("Por anio", stats.byYear);
     printTally("Por tipologia", stats.byType);
-    printTally("Por categoria", stats.byCategory);
     printTally("Por validacion", stats.byValidation);
-    std::cout << "\nProductos (ID | Anio | Titulo | Categoria | Validacion):\n";
+    std::map<std::string, int> rules;
+    for (const auto& [code, count] : stats.byRule) rules[RULE_LABELS.at(code)] = count;
+    printTally("Reglas incumplidas", rules);
+    std::cout << "\nProductos (ID | Anio | Titulo | Validacion):\n";
     std::size_t shown = 0;
     for (const Row& row : stats.products) {
         if (++shown > 40) break;
         std::cout << display(field(row, "id"), 22) << " | " << field(row, "anio")
-                  << " | " << display(field(row, "titulo"), 48)
-                  << " | " << display(field(row, "categoria"), 24)
+                  << " | " << display(field(row, "titulo"), 56)
                   << " | " << field(row, "validacion") << '\n';
     }
     if (stats.total > 40) std::cout << "(primeros 40 mostrados)\n";
@@ -1957,8 +2099,8 @@ void queueMenu(Repository& repo) {
     while (true) {
         std::cout << "\n=== Cola de revision FIFO ===\n"
                   << "1. Ver pendientes  2. Encolar producto  3. Procesar frente\n"
-                  << "4. Descartar frente  0. Volver\n";
-        const int option = askNumber("Opcion: ", 0, 4);
+                  << "4. Descartar frente  5. Encolar rechazados  0. Volver\n";
+        const int option = askNumber("Opcion: ", 0, 5);
         if (option == 0) return;
         try {
             if (option == 1) {
@@ -1974,16 +2116,20 @@ void queueMenu(Repository& repo) {
                 const std::string reason = ask("Motivo: ");
                 repo.enqueueReview(id, reason);
                 std::cout << "Revision encolada.\n";
+            } else if (option == 5) {
+                std::cout << "Encolados: " << repo.enqueueRejected() << '\n';
             } else {
                 auto job = repo.queueFront();
                 if (!job) throw DataError("La cola esta vacia");
                 std::cout << "Frente: " << field(*job, "producto_id") << " - "
                           << field(*job, "motivo") << '\n';
                 if (option == 3) {
-                    const std::string status = lowercase(ask("Estado (validado/rechazado/pendiente): "));
-                    const std::string observation = ask("Observacion nueva: ");
-                    const Row completed = repo.processReview(status, observation);
-                    std::cout << "Procesado " << field(completed, "producto_id") << ".\n";
+                    for (const auto& code : repo.productIssues(field(*job, "producto_id")))
+                        std::cout << "- " << RULE_LABELS.at(code) << '\n';
+                    const std::string observation = ask("Observacion de la revision: ");
+                    const Row completed = repo.processReview(observation);
+                    std::cout << "Procesado " << field(completed, "producto_id") << " ("
+                              << field(completed, "validacion") << ").\n";
                 } else if (confirm("Descartar esta revision?")) {
                     repo.discardReview();
                     std::cout << "Revision retirada.\n";
@@ -2187,8 +2333,8 @@ std::string jsonStatistics(const Statistics& value) {
            ",\"total\":" + std::to_string(value.total) +
            ",\"por_anio\":" + jsonTally(value.byYear) +
            ",\"por_tipologia\":" + jsonTally(value.byType) +
-           ",\"por_categoria\":" + jsonTally(value.byCategory) +
-           ",\"por_validacion\":" + jsonTally(value.byValidation) + "}";
+           ",\"por_validacion\":" + jsonTally(value.byValidation) +
+           ",\"por_regla\":" + jsonTally(value.byRule) + "}";
 }
 std::string jsonImport(const ImportResult& value) {
     std::string errors = "[";
@@ -2239,7 +2385,7 @@ class ApiApp {
         const std::string kind = field(request, "kind");
         const std::string key = field(request, "key");
         const std::string second = field(request, "second");
-        if (action == "ping") return "{\"backend\":\"cpp\",\"protocol\":\"1\"}";
+        if (action == "ping") return "{\"backend\":\"cpp\",\"protocol\":\"2\"}";
         if (action == "state") return state();
         if (action == "new_id") {
             if (entityIndex(kind) < 0) throw DataError("Tipo de entidad desconocido");
@@ -2266,10 +2412,15 @@ class ApiApp {
                                       pageNumber(request, "limit", 100, 200), field(request, "query")));
         if (action == "summary") {
             const auto counts = repo_.activeCounts();
-            const auto categories = repo_.statistics("Todos", "", {}, {}, "", "", 0, 0).byCategory;
             return "{\"active_groups\":" + std::to_string(counts.first) +
-                   ",\"active_people\":" + std::to_string(counts.second) +
-                   ",\"categories\":" + jsonTally(categories) + "}";
+                   ",\"active_people\":" + std::to_string(counts.second) + "}";
+        }
+        if (action == "field_usage") return jsonTally(repo_.fieldUsage(kind));
+        if (action == "product_issues") {
+            std::string result = "[";
+            const auto failed = repo_.productIssues(key);
+            for (std::size_t i = 0; i < failed.size(); ++i) result += (i ? "," : "") + jsonString(failed[i]);
+            return result + "]";
         }
         if (action == "get") {
             if (!FIELDS.count(kind)) throw DataError("Tipo desconocido");
@@ -2305,7 +2456,7 @@ class ApiApp {
             return jsonStatistics(repo_.statistics(
                 field(request, "view"), field(request, "selected"),
                 optionalYear(request, "start"), optionalYear(request, "end"),
-                field(request, "category"), field(request, "status"),
+                field(request, "status"),
                 pageNumber(request, "offset", 0, SIZE_MAX),
                 pageNumber(request, "limit", 100, 200)));
         }
@@ -2321,8 +2472,8 @@ class ApiApp {
             repo_.enqueueReview(field(request, "product_id"), field(request, "reason"));
             return "null";
         }
-        if (action == "process_review")
-            return jsonRow(repo_.processReview(field(request, "status"), field(request, "observation")));
+        if (action == "enqueue_rejected") return std::to_string(repo_.enqueueRejected());
+        if (action == "process_review") return jsonRow(repo_.processReview(field(request, "observation")));
         if (action == "discard_review") return jsonRow(repo_.discardReview());
         if (action == "undo") return repo_.undo() ? "true" : "false";
         if (action == "clear_history") { repo_.clearHistory(); return "null"; }
@@ -2395,12 +2546,12 @@ void selfTest() {
     repo.create("grupos", {{"id", "G-DEMO-2"}, {"nombre", "Grupo dos"}}, false);
     repo.create("investigadores", {{"id", "I-DEMO-1"}, {"nombre", "Ana"}}, false);
     repo.create("investigadores", {{"id", "I-DEMO-2"}, {"nombre", "Bruno"}}, false);
-    repo.create("productos", {{"id", "P-DEMO-1"}, {"titulo", "Producto uno"},
-                             {"anio", "2026"}, {"categoria", "Ejemplo A"}}, false);
-    repo.create("productos", {{"id", "P-DEMO-2"}, {"titulo", "Producto dos"},
-                             {"anio", "2025"}}, false);
-    repo.create("productos", {{"id", "P-DEMO-3"}, {"titulo", "Producto tres"},
-                             {"anio", "2023"}}, false);
+    repo.create("productos", {{"id", "P-DEMO-1"}, {"titulo", "Producto uno"}, {"anio", "2026"},
+                             {"tipologia", "Articulo"}, {"doi", "https://doi.org/10.1234/demo.1"}}, false);
+    repo.create("productos", {{"id", "P-DEMO-2"}, {"titulo", "Producto dos"}, {"anio", "2025"},
+                             {"tipologia", "Software"}, {"url", "https://example.org/p2"}}, false);
+    repo.create("productos", {{"id", "P-DEMO-3"}, {"titulo", "Producto tres"}, {"anio", "2023"},
+                             {"tipologia", "Libro"}, {"url", "https://example.org/p3"}}, false);
     repo.create("productos", {{"id", "P-DEMO-4"}, {"titulo", "Producto cuatro"},
                              {"anio", "2021"}}, false);
     for (const char* id : {"P-DEMO-1", "P-DEMO-2", "P-DEMO-4"})
@@ -2412,18 +2563,30 @@ void selfTest() {
     repo.enqueueReview("P-DEMO-2", "Revisar");
     repo.enqueueReview("P-DEMO-3", "Verificar");
     repo.clearHistory();
+    auto state = [&](const char* id) { return field(*repo.get("productos", id), "validacion"); };
     require(repo.statistics().products.size() == 4, "total sin duplicados");
     require(repo.statistics("Todos", "", 2025, 2026).products.size() == 2, "ventana de dos anios");
     require(repo.statistics("Todos", "", 2022, 2026).products.size() == 3, "ventana de cinco anios");
     require(repo.statistics("Grupo", "G-DEMO-1").products.size() == 3, "vista por grupo");
     require(repo.statistics("Investigador", "I-DEMO-2").products.size() == 2, "vista por investigador");
-    require(repo.statistics("Todos", "", {}, {}, "Ejemplo A").products.size() == 1,
-            "filtro de categoria");
+    require(state("P-DEMO-1") == "validado" && state("P-DEMO-2") == "validado", "validacion automatica");
+    require(repo.productIssues("P-DEMO-3") == std::vector<std::string>{"autor"}, "regla de autor");
+    require(repo.productIssues("P-DEMO-4") == std::vector<std::string>{"tipologia", "autor", "fuente"},
+            "reglas en orden");
+    require(repo.statistics("Todos", "", {}, {}, "validado").products.size() == 2, "filtro de validacion");
+    require(repo.statistics().byRule.at("autor") == 2, "conteo de reglas");
     require(repo.queueSize() == 2 && field(*repo.queueFront(), "producto_id") == "P-DEMO-2",
             "cola persistida");
+    repo.toggle("investigadores", "I-DEMO-2");
+    require(state("P-DEMO-1") == "rechazado", "autor inactivo invalida el producto");
+    require(repo.undo() && state("P-DEMO-1") == "validado", "deshacer revalida");
+    repo.update("productos", "P-DEMO-1", "", {{"doi", "10.12/x"}});
+    require(repo.productIssues("P-DEMO-1") == std::vector<std::string>{"doi", "fuente"}, "DOI mal formado");
+    require(repo.undo() && state("P-DEMO-1") == "validado", "deshacer DOI");
     repo.toggle("grupos_productos", "G-DEMO-1", "P-DEMO-1");
     require(repo.statistics("Grupo", "G-DEMO-1").products.size() == 2,
             "vinculo inactivo fuera de la vista");
+    require(state("P-DEMO-1") == "rechazado", "vinculo de grupo inactivo");
     require(repo.undo() && repo.statistics("Grupo", "G-DEMO-1").products.size() == 3,
             "deshacer vinculo");
     try {
@@ -2439,26 +2602,24 @@ void selfTest() {
         repo.erase("grupos", "G-DEMO-1");
         throw std::runtime_error("No se bloqueo el borrado con relaciones");
     } catch (const DataError&) {}
-    repo.update("productos", "P-DEMO-1", "",
-                {{"categoria", "Categoria revisada"}, {"observacion", "Nueva evidencia"}});
-    require(field(*repo.get("productos", "P-DEMO-1"), "categoria") == "Categoria revisada",
-            "editar categoria");
-    require(repo.undo(), "deshacer disponible");
-    require(field(*repo.get("productos", "P-DEMO-1"), "categoria") == "Ejemplo A",
-            "deshacer categoria");
-    repo.enqueueReview("P-DEMO-4", "Otra revision");
-    require(repo.queueSize() == 3, "encolar");
+    require(repo.enqueueRejected() == 1 && repo.queueSize() == 3, "encolar rechazados");
+    require(field(repo.queuePage(2, 1).rows.front(), "motivo") == "reglas:tipologia,autor,fuente",
+            "motivo automatico");
     require(repo.undo() && repo.queueSize() == 2, "deshacer cola");
+    const Row legacy = legacyRow("productos", {{"id", "P"}, {"titulo", "T"}, {"categoria", "A1"}});
+    require(!legacy.count("categoria") && field(legacy, "observacion") ==
+            "Categoría registrada antes de la versión 3: A1", "migrar categoria de producto");
 
     const auto tick = std::chrono::high_resolution_clock::now().time_since_epoch().count();
     StagingFolder temp(fs::temp_directory_path() / ("pea-cpp-test-" + std::to_string(tick)));
-    repo.update("productos", "P-DEMO-2", "",
-                {{"validacion", "validado"}, {"observacion", "Revision de prueba"}});
+    const Row processed = repo.processReview("Revision de prueba");
+    require(field(processed, "producto_id") == "P-DEMO-2" && field(processed, "validacion") == "validado",
+            "procesar revision");
     saveRepository(repo, temp.path);
     Repository loaded = loadRepository(temp.path);
     require(loaded.snapshot() == repo.snapshot(), "CSV y JSON de historial ida y vuelta");
     require(loaded.undo(), "historial cargado");
-    require(field(*loaded.get("productos", "P-DEMO-2"), "validacion") == "pendiente",
+    require(field(*loaded.get("productos", "P-DEMO-2"), "observacion").empty() && loaded.queueSize() == 2,
             "deshacer tras reinicio");
 
     Repository extra;
@@ -2483,7 +2644,7 @@ void selfTest() {
     require(applied.accepted == 1 && again.get("productos", "P-IMPORT"),
             "importacion CSV parcial");
     require(again.undo() && !again.get("productos", "P-IMPORT"), "deshacer importacion");
-    std::cout << "Autoprueba C++ correcta: estructuras, vistas, integridad, CSV y persistencia.\n";
+    std::cout << "Autoprueba C++ correcta: estructuras, vistas, validacion, integridad, CSV y persistencia.\n";
 }
 
 } // namespace pea

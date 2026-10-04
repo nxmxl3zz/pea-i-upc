@@ -34,12 +34,17 @@ def main() -> None:
         assert backend.queue_front()["producto_id"] == "P-DEMO-2"
         assert backend.suggest_id("productos").startswith("P-")
 
-        backend.process_review("validado", "Aprobado desde Tkinter")
-        assert backend.get("productos", "P-DEMO-2")["validacion"] == "validado"
+        assert backend.statistics(limit=0)["por_validacion"] == {"validado": 3, "rechazado": 1}
+        assert backend.statistics(status="rechazado", limit=0)["por_regla"] == {"fuente": 1}
+        done = backend.process_review("Aprobado desde Tkinter")
+        assert done["validacion"] == "validado"
+        assert backend.get("productos", "P-DEMO-2")["observacion"] == "Aprobado desde Tkinter"
         assert backend.queue_size() == 1
         assert backend.undo()
-        assert backend.get("productos", "P-DEMO-2")["validacion"] == "pendiente"
+        assert backend.get("productos", "P-DEMO-2")["observacion"] == ""
         assert backend.queue_size() == 2
+        assert backend.enqueue_rejected() == 1 and backend.queue_size() == 3
+        assert backend.undo() and backend.queue_size() == 2
 
         backend.reset()
         backend.create("grupos", {"id": "G-B", "nombre": "Grupo interfaz"})
@@ -54,6 +59,11 @@ def main() -> None:
         assert backend.statistics("Grupo", "G-B")["total"] == 0
         backend.toggle("grupos_productos", ("G-B", "P-B"))
         assert backend.get("productos", "P-B")["titulo"] == "Acción, línea\nsegunda"
+        assert backend.product_issues("P-B") == ["tipologia", "fuente"]
+        assert backend.field_usage("productos")["doi"] == 0
+        backend.update("productos", "P-B", {"tipologia": "Artículo", "doi": "10.1234/interfaz"})
+        assert backend.get("productos", "P-B")["validacion"] == "validado"
+        assert backend.undo() and backend.get("productos", "P-B")["validacion"] == "rechazado"
         try:
             backend.delete("grupos", "G-B")
             raise AssertionError("C++ permitió borrar un grupo con vínculos")
@@ -98,18 +108,18 @@ def main() -> None:
             loaded = pea.load_repository(path)
             assert loaded.statistics(view="Grupo", selected_id="G-B")["total"] == 1
             assert loaded.get("productos", "P-B")["titulo"] == "Acción, línea\nsegunda"
-            backend.update("productos", "P-B", {"categoria": "Nueva", "observacion": "Revisada"})
+            backend.update("productos", "P-B", {"observacion": "Revisada"})
             assert backend.history_size() > 0
             backend.save(path)
             reopened = pea.CppRepository(binary)
             python_with_cpp_history = pea.load_repository(path)
             assert python_with_cpp_history.undo()
-            assert python_with_cpp_history.get("productos", "P-B")["categoria"] == ""
+            assert python_with_cpp_history.get("productos", "P-B")["observacion"] == ""
             try:
                 reopened.load(path)
-                assert reopened.get("productos", "P-B")["categoria"] == "Nueva"
+                assert reopened.get("productos", "P-B")["observacion"] == "Revisada"
                 assert reopened.undo()
-                assert reopened.get("productos", "P-B")["categoria"] == ""
+                assert reopened.get("productos", "P-B")["observacion"] == ""
             finally:
                 reopened.close()
             backend.create("productos", {"id": "P-FORMULA", "titulo": "=1+1"})
@@ -151,12 +161,35 @@ def main() -> None:
         legacy = pea.CppRepository(binary)
         try:
             legacy.load(path)
-            assert legacy.get("productos", "P-OLD")["validacion"] == "pendiente"
+            assert legacy.get("productos", "P-OLD")["validacion"] == "rechazado"
+            assert legacy.product_issues("P-OLD") == ["anio", "tipologia", "autor", "grupo", "fuente"]
             legacy.save(path)
             assert pea.load_repository(path).get("grupos", "G-OLD")["nombre"] == "Grupo anterior"
         finally:
             legacy.close()
-    print("Backend C++ conectado: CRUD, estadísticas, cola, deshacer y CSV.")
+    with tempfile.TemporaryDirectory(prefix="pea-v2-") as folder:
+        path = Path(folder)
+        old = pea.Repository()
+        old.create("productos", {"id": "P-V2", "titulo": "Producto v2"}, remember=False)
+        pea.save_repository(old, path)
+        with (path / "manifest.csv").open("w", encoding="utf-8", newline="") as stream:
+            csv.writer(stream).writerows((("version", "guardado"), ("2", "2026-09-24T00:00:00")))
+        products = pea._csv_read(path / "productos.csv", pea.ENTITY_FIELDS["productos"], encoded=True)
+        products[0].update(categoria="B", validacion="pendiente")
+        with (path / "productos.csv").open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=(*pea.ENTITY_FIELDS["productos"][:6], "categoria",
+                                                        *pea.ENTITY_FIELDS["productos"][6:]))
+            writer.writeheader()
+            writer.writerows(products)
+        upgraded = pea.CppRepository(binary)
+        try:
+            upgraded.load(path)
+            expected = pea.load_repository(path).get("productos", "P-V2")
+            assert upgraded.get("productos", "P-V2") == expected
+            assert expected["observacion"] == "Categoría registrada antes de la versión 3: B"
+        finally:
+            upgraded.close()
+    print("Backend C++ conectado: CRUD, estadísticas, validación, cola, deshacer y CSV.")
 
 
 if __name__ == "__main__":

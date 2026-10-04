@@ -27,8 +27,8 @@ def sample() -> pea.Repository:
     repo.create("grupos", {"id": "G2", "nombre": "Grupo dos"})
     repo.create("investigadores", {"id": "I1", "nombre": "Ana"})
     repo.create("investigadores", {"id": "I2", "nombre": "Beto"})
-    repo.create("productos", {"id": "P1", "titulo": "Artículo, con coma", "anio": "2025", "tipologia": "Artículo", "categoria": "A1"})
-    repo.create("productos", {"id": "P2", "titulo": "Trabajo\nmultilínea", "anio": "2024", "tipologia": "Libro", "categoria": "B"})
+    repo.create("productos", {"id": "P1", "titulo": "Artículo, con coma", "anio": "2025", "tipologia": "Artículo", "url": "https://example.org/p1"})
+    repo.create("productos", {"id": "P2", "titulo": "Trabajo\nmultilínea", "anio": "2024", "tipologia": "Libro"})
     repo.create("membresias", {"grupo_id": "G1", "investigador_id": "I1", "rol": "Líder"})
     repo.create("membresias", {"grupo_id": "G1", "investigador_id": "I2", "rol": "Integrante"})
     repo.create("membresias", {"grupo_id": "G2", "investigador_id": "I1", "rol": "Integrante"})
@@ -116,7 +116,10 @@ class DomainTest(unittest.TestCase):
         self.assertEqual(repo.statistics(view="Investigador", selected_id="I1")["total"], 1)
         self.assertEqual(repo.statistics(view="Grupo", selected_id="G1", start=2025, end=2025)["total"], 1)
         self.assertEqual(repo.statistics(view="Grupo", selected_id="")["total"], 0)
-        self.assertEqual(repo.statistics(category="A1")["total"], 1)
+        self.assertEqual(repo.statistics(status="validado")["total"], 1)
+        self.assertEqual(repo.statistics(status="rechazado")["por_regla"], {"autor": 1, "fuente": 1})
+        with self.assertRaises(pea.DataError):
+            repo.statistics(status="pendiente")
 
     def test_integrity_validation_and_undo(self):
         repo = sample()
@@ -125,25 +128,61 @@ class DomainTest(unittest.TestCase):
         with self.assertRaises(pea.DataError):
             repo.create("autorias", {"producto_id": "P1", "investigador_id": "missing"})
         with self.assertRaises(pea.DataError):
-            repo.update("productos", "P1", {"categoria": "A2"})
-        repo.update("productos", "P1", {"categoria": "A2", "observacion": "Revisado por comité"})
-        self.assertEqual(repo.get("productos", "P1")["categoria"], "A2")
+            repo.create("productos", {"id": "P9", "titulo": "Con categoría", "categoria": "A1"})
+        repo.update("productos", "P1", {"observacion": "Revisado por comité"})
         self.assertTrue(repo.undo())
-        self.assertEqual(repo.get("productos", "P1")["categoria"], "A1")
+        self.assertEqual(repo.get("productos", "P1")["observacion"], "")
         repo.toggle("productos", "P1")
         self.assertEqual(repo.statistics()["total"], 1)
+
+    def test_automatic_validation_follows_links(self):
+        repo = sample()
+        self.assertEqual(repo.get("productos", "P1")["validacion"], "validado")
+        self.assertEqual(repo.product_issues("P2"), ["autor", "fuente"])
+        repo.update("productos", "P2", {"validacion": "validado", "url": "https://example.org/p2"})
+        self.assertEqual((repo.get("productos", "P2")["validacion"], repo.product_issues("P2")),
+                         ("rechazado", ["autor"]))
+        repo.create("autorias", {"producto_id": "P2", "investigador_id": "I2"})
+        self.assertEqual(repo.get("productos", "P2")["validacion"], "validado")
+        repo.toggle("investigadores", "I2")
+        self.assertEqual(repo.product_issues("P2"), ["autor"])
+        self.assertEqual(repo.get("productos", "P1")["validacion"], "validado")
+        self.assertTrue(repo.undo())
+        self.assertEqual(repo.get("productos", "P2")["validacion"], "validado")
+        repo.toggle("grupos_productos", ("G2", "P2"))
+        self.assertEqual(repo.product_issues("P2"), ["grupo"])
+        repo.update("productos", "P1", {"doi": "10.12/corto"})
+        self.assertEqual(repo.product_issues("P1"), ["doi"])
+        repo.update("productos", "P1", {"doi": "https://doi.org/10.1234/ok", "url": ""})
+        self.assertEqual(repo.product_issues("P1"), [])
+        repo.delete("autorias", ("P2", "I2"))
+        self.assertIn("autor", repo.product_issues("P2"))
 
     def test_review_queue_and_undo(self):
         repo = sample()
         repo.enqueue_review("P1", "Verificar")
         repo.enqueue_review("P2", "Verificar")
         self.assertEqual(repo.queue.peek()["producto_id"], "P1")
-        repo.process_review("validado", "Evidencia suficiente")
+        with self.assertRaises(pea.DataError):
+            repo.process_review("  ")
+        done = repo.process_review("Evidencia suficiente")
+        self.assertEqual((done["producto_id"], done["validacion"]), ("P1", "validado"))
         self.assertEqual(repo.queue.peek()["producto_id"], "P2")
-        self.assertEqual(repo.get("productos", "P1")["validacion"], "validado")
+        self.assertEqual(repo.get("productos", "P1")["observacion"], "Evidencia suficiente")
         repo.undo()
         self.assertEqual(repo.queue.peek()["producto_id"], "P1")
-        self.assertEqual(repo.get("productos", "P1")["validacion"], "pendiente")
+        self.assertEqual(repo.get("productos", "P1")["observacion"], "")
+
+    def test_rejected_products_enter_queue_once(self):
+        repo = sample()
+        self.assertEqual(repo.enqueue_rejected(), 1)
+        job = repo.queue.peek()
+        self.assertEqual((job["producto_id"], job["motivo"]), ("P2", "reglas:autor,fuente"))
+        self.assertEqual(pea.auto_reason_codes(job["motivo"]), ["autor", "fuente"])
+        self.assertIsNone(pea.auto_reason_codes("Revisión manual"))
+        self.assertEqual(repo.enqueue_rejected(), 0)
+        self.assertTrue(repo.undo())
+        self.assertEqual(repo.queue_size(), 0)
 
     def test_save_load_utf8_and_history(self):
         repo = sample()
@@ -354,8 +393,7 @@ class DomainTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual((rows[0]["titulo"], rows[0]["anio"], rows[0]["doi"]),
                          ("Estudio verificable", "2024", "10.1000/uno"))
-        self.assertEqual(rows[0]["categoria"], "")
-        self.assertEqual(rows[0]["validacion"], "pendiente")
+        self.assertNotIn("categoria", rows[0])
         self.assertEqual(pea.parse_web_page(html, url).related_products[0]["id"], rows[0]["id"])
 
     def test_gruplac_roster_plan_products_and_repeat_import(self):
@@ -417,7 +455,9 @@ class DomainTest(unittest.TestCase):
         self.assertEqual(len(real.rows("planes")), 66)
         self.assertEqual(len(real.rows("autorias")), 9703)
         self.assertEqual(len(real.rows("grupos_productos")), 6735)
-        self.assertTrue(all(not row["categoria"] for row in real.rows("productos")))
+        self.assertNotIn("categoria", pea.ENTITY_FIELDS["productos"])
+        self.assertEqual(real.statistics(limit=0)["por_validacion"], {"validado": 6323, "rechazado": 40})
+        self.assertEqual(real.statistics(limit=0)["por_regla"], {"autor": 37, "doi": 3})
         self.assertEqual(sum(bool(row["categoria"]) for row in real.rows("investigadores")), 274)
         self.assertEqual(real.get("investigadores", "I-0000494917")["categoria"], "Investigador Asociado (I)")
 
@@ -459,6 +499,8 @@ class DomainTest(unittest.TestCase):
             self.assertEqual(demo.statistics(start=2022, end=2026)["total"], 3)
             self.assertEqual(demo.statistics(view="Grupo", selected_id="G-DEMO-1")["total"], 3)
             self.assertEqual(demo.queue.peek()["producto_id"], "P-DEMO-2")
+            self.assertEqual(demo.statistics(limit=0)["por_validacion"], {"validado": 3, "rechazado": 1})
+            self.assertEqual(demo.product_issues("P-DEMO-4"), ["fuente"])
 
 
 class SecurityTest(unittest.TestCase):
@@ -549,14 +591,37 @@ class SecurityTest(unittest.TestCase):
             self.assertEqual(pea.load_repository(path).get("grupos", "G1")["nombre"], "Grupo uno")
             products = pea._csv_read(path / "productos.csv", pea.ENTITY_FIELDS["productos"], encoded=True)
             with (path / "productos.csv").open("w", encoding="utf-8", newline="") as stream:
-                fields = tuple(field for field in pea.ENTITY_FIELDS["productos"] if field != "validacion")
+                fields = (*(field for field in pea.ENTITY_FIELDS["productos"] if field != "validacion"), "categoria")
                 writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
                 writer.writeheader()
                 writer.writerows(products)
             (path / "cola_validacion.csv").unlink()
             loaded = pea.load_repository(path)
-            self.assertEqual(loaded.get("productos", "P1")["validacion"], "pendiente")
+            self.assertEqual(loaded.get("productos", "P1")["validacion"], "validado")
             self.assertEqual(loaded.queue_size(), 0)
+
+    def test_version_2_product_category_moves_to_observation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)
+            pea.save_repository(sample(), path)
+            with (path / "manifest.csv").open("w", encoding="utf-8", newline="") as stream:
+                csv.writer(stream).writerows((("version", "guardado"), ("2", "2026-09-24T00:00:00")))
+            products = pea._csv_read(path / "productos.csv", pea.ENTITY_FIELDS["productos"], encoded=True)
+            products[0].update(categoria="A1", validacion="pendiente")
+            products[1].update(categoria="")
+            with (path / "productos.csv").open("w", encoding="utf-8", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=(*pea.ENTITY_FIELDS["productos"][:6], "categoria",
+                                                            *pea.ENTITY_FIELDS["productos"][6:]))
+                writer.writeheader()
+                writer.writerows(products)
+            loaded = pea.load_repository(path)
+            self.assertEqual(loaded.get("productos", "P1")["observacion"],
+                             "Categoría registrada antes de la versión 3: A1")
+            self.assertEqual(loaded.get("productos", "P1")["validacion"], "validado")
+            self.assertEqual(loaded.get("productos", "P2")["observacion"], "")
+            pea.save_repository(loaded, path)
+            with (path / "manifest.csv").open(encoding="utf-8") as stream:
+                self.assertEqual(next(csv.DictReader(stream))["version"], "3")
 
     def test_extract_pdf_text_caps_output(self):
         class Stream:

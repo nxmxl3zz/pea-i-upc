@@ -82,7 +82,7 @@ def model_image(path: Path) -> None:
     box(draw, (1205, 270, 1585, 445), ["INVESTIGADOR", "autoría"])
     box(draw, (575, 15, 1025, 175), ["TIEMPO", "año / fecha"])
     box(draw, (390, 555, 790, 715), ["TIPO", "familia / tipología"])
-    box(draw, (815, 555, 1240, 715), ["ESTADO", "categoría / validación"])
+    box(draw, (815, 555, 1240, 715), ["ESTADO", "validación automática"])
     arrow(draw, (400, 357), (565, 357))
     arrow(draw, (1195, 357), (1035, 357))
     arrow(draw, (800, 180), (800, 250))
@@ -321,13 +321,13 @@ def build() -> None:
                    "Ficha y productos vinculados; integrantes y planes."],
                   ["Investigador", "ID, nombre, CvLAC, afiliación, categoría, contacto público, estado y fuente.",
                    "Ficha, grupos y productos de autoría."],
-                  ["Producto", "ID, título, año o fecha, familia, tipología, categoría, validación, observación, DOI y fuente.",
+                  ["Producto", "ID, título, año o fecha, familia, tipología, observación, DOI, URL y fuente; la validación se calcula.",
                    "Ficha, grupos, autores y contribución a estadísticas."],
                   ["Plan", "ID, grupo, plazo, objetivo, indicador, meta y actividad.",
                    "Plan consultable dentro del grupo."],
               ], [2.5, 7.3, 7.0])
     paragraph(doc, "Las salidas estadísticas son total de productos únicos, conteos por año, tipología, "
-                   "categoría y validación, más listas paginadas. Los campos vacíos no se completan con valores "
+                   "validación y reglas incumplidas, más listas paginadas. Los campos vacíos no se completan con valores "
                    "supuestos. Las variables exactas de persistencia figuran en el diccionario del apartado 12.")
 
     heading(doc, "4 Estructuras de datos y complejidad")
@@ -352,14 +352,16 @@ def build() -> None:
     bullet(doc, "Alta, búsqueda, consulta, edición, desactivación, reactivación y baja de entidades y relaciones; los IDs y los extremos de una relación no se editan.")
     bullet(doc, "No se elimina en cascada un grupo, investigador o producto con relaciones pendientes; primero se resuelven esos vínculos o se desactiva el registro.")
     bullet(doc, "Los códigos GrupLAC, CvLAC y DOI no vacíos son únicos. El DOI se compara sin distinguir mayúsculas ni el prefijo doi.org. Las fechas siguen AAAA-MM-DD; el año del producto debe concordar con su fecha.")
-    bullet(doc, "Cambiar categoría o validación de un producto exige una observación nueva. La validación de PEA-i es interna y no equivale a la clasificación oficial de Minciencias.")
+    bullet(doc, "La validación de un producto es automática: queda validado si tiene año, tipología, una autoría activa de un investigador activo, un vínculo activo con un grupo activo y una URL o un DOI válido. Se recalcula al cambiar el producto o sus vínculos y no equivale a la clasificación oficial de Minciencias.")
+    bullet(doc, "Los productos no tienen categoría: GrupLAC solo publica la clasificación del grupo. La categoría se gestiona en grupos e investigadores y la interfaz la muestra en el módulo de grupos.")
     bullet(doc, "La cola conserva trabajos pendientes y la pila permite deshacer. Ambas se guardan junto con las entidades y relaciones.")
 
     heading(doc, "6 Persistencia e interoperabilidad")
     paragraph(doc, "Cada carpeta de datos contiene manifest.csv, cuatro archivos de entidades, tres de relaciones, "
                    "cola_validacion.csv e historial.csv. El formato común es CSV UTF-8 con encabezados, "
-                   "comillas y saltos de línea conforme al formato CSV. manifest.csv declara la versión 2. "
-                   "Ambos motores leen la versión 1 y la migran al guardar. La versión 2 neutraliza los "
+                   "comillas y saltos de línea conforme al formato CSV. manifest.csv declara la versión 3. "
+                   "Ambos motores leen las versiones 1 y 2 y las migran al guardar; una categoría de producto "
+                   "anterior se conserva en la observación. El formato neutraliza los "
                    "valores que una hoja de cálculo interpretaría como fórmulas y recupera su valor original "
                    "al cargar. Se valida la integridad referencial. Se preparan archivos temporales "
                    "y se conserva .backup del guardado previo para recuperación.")
@@ -396,10 +398,10 @@ def build() -> None:
     heading(doc, "8 Hipercubo lógico y estadísticas")
     paragraph(doc, "El hipercubo se implementa como consulta multidimensional calculada bajo demanda: "
                    "cada producto es un hecho único; grupo e investigador son dimensiones "
-                   "relacionales, y año, tipología, categoría y validación son atributos de análisis. "
+                   "relacionales, y año, tipología y validación son atributos de análisis. "
                    "La vista selecciona todos los productos o un grupo, investigador o producto. Después "
-                   "se aplican rango de años, categoría y estado; el resultado se agrupa por año, "
-                   "tipología, categoría y validación.")
+                   "se aplican rango de años y estado de validación; el resultado se agrupa por año, "
+                   "tipología, validación y reglas incumplidas.")
     paragraph(doc, "Total(vista, filtros) = número de IDs de producto activos distintos que satisfacen "
                    "los vínculos activos y todos los filtros. Un producto unido a varios grupos o autores "
                    "se cuenta una sola vez dentro de la vista. Cuando se fija un rango temporal, "
@@ -408,7 +410,7 @@ def build() -> None:
     paragraph(doc, "No se almacena un cubo OLAP materializado. Cada solicitud selecciona una dimensión "
                    "relacional; la consulta no admite una intersección simultánea de grupo e investigador. "
                    "La consola muestra tablas y cifras; Tkinter muestra "
-                   "barras por año, tipología, categoría y validación, además de una tabla de productos.")
+                   "barras por año, tipología, validación y reglas incumplidas, además de una tabla de productos.")
 
     heading(doc, "9 Historias de usuario y aceptación")
     add_table(doc,
@@ -421,7 +423,7 @@ def build() -> None:
                   ["HU03", "Como revisor quiero procesar productos en orden y deshacer errores.",
                    "La cola atiende FIFO; la pila restaura la acción reversible más reciente."],
                   ["HU04", "Como analista quiero filtrar los resultados.",
-                   "Las vistas por grupo, investigador y producto respetan años, categoría y validación."],
+                   "Las vistas por grupo, investigador y producto respetan años y validación."],
                   ["HU05", "Como gestor quiero importar una fuente pública o CSV.",
                    "La vista previa identifica la fuente, muestra campos y registra aceptación o rechazo."],
               ], [1.8, 7.2, 7.8])
@@ -431,7 +433,7 @@ def build() -> None:
         ("R01", "Dos soluciones", "Consola C++17; interfaz Tkinter y motor Python autónomo."),
         ("R02", "Grupos", "Registro con ID, código GrupLAC, categoría, líneas, fuente y estado."),
         ("R03", "Investigadores", "Registro con ID, CvLAC, afiliación, categoría, fuente y estado."),
-        ("R04", "Productos", "Registro con fecha, tipología, categoría, validación y DOI."),
+        ("R04", "Productos", "Registro con fecha, tipología, DOI y URL; validación automática."),
         ("R05", "Integrantes y planes", "Membresía grupo-investigador y plan con grupo_id."),
         ("R06", "Entradas y salidas", "Campos del apartado 3; CSV y distribuciones del apartado 8."),
         ("R07", "Fuentes externas", "CSV en ambos motores; URL pública, PDF, XLSX y DOCX en Python."),
@@ -439,12 +441,12 @@ def build() -> None:
         ("R09", "Multilistas", "Vínculos indexados y recorribles desde ambos extremos."),
         ("R10", "Pilas", "Deshacer LIFO de hasta 30 acciones, persistido en historial.csv."),
         ("R11", "Colas", "Revisión FIFO persistida en cola_validacion.csv."),
-        ("R12", "CRUD y persistencia", "Operaciones de dominio y esquema CSV versión 2, con migración de la versión 1."),
-        ("R13", "Categoría y validación", "Actualización condicionada a observación nueva."),
+        ("R12", "CRUD y persistencia", "Operaciones de dominio y esquema CSV versión 3, con migración de las versiones 1 y 2."),
+        ("R13", "Categoría y validación", "Categoría en grupos e investigadores; validación de productos por reglas, recalculada en cada cambio."),
         ("R14", "Ventanas temporales", "Dos años, cinco años o intervalo personalizado."),
         ("R15", "Vistas estadísticas", "Total, grupo, investigador o producto sin duplicar IDs."),
         ("R16", "Presentación C++", "Menús, tablas y resúmenes numéricos en consola."),
-        ("R17", "Presentación Python", "Barras por año, tipología, categoría y validación; tabla paginada."),
+        ("R17", "Presentación Python", "Barras por año, tipología, validación y reglas incumplidas; tabla paginada."),
         ("R18", "Inicio con o sin datos", "Carga inicial de data/real, inicio vacío y apertura de carpeta CSV."),
         ("R19", "Archivos fuente", "Taller2_REMR.cpp y Taller2_REMR.py."),
         ("R20", "Especificación", "Modelo, estructuras, algoritmos, contratos y diagramas."),
@@ -456,8 +458,8 @@ def build() -> None:
     paragraph(doc, "El conjunto data/real reúne fichas públicas GrupLAC de 66 grupos UPC. Contiene "
                    "2.736 investigadores, 3.291 membresías, 66 planes, 6.363 productos únicos, 6.735 "
                    "vínculos grupo-producto y 9.703 autorías. Hay 274 investigadores con categoría "
-                   "CvLAC capturada. La categoría del grupo no se asigna a sus productos: cuando la "
-                   "fuente no clasifica un producto, su categoría queda vacía. Las fichas públicas pueden "
+                   "CvLAC capturada. La validación automática deja 6.323 productos validados y 40 "
+                   "rechazados (37 sin autor del censo y 3 con DOI mal formado). Las fichas públicas pueden "
                    "cambiar; este conjunto no constituye un censo institucional actualizado.")
     paragraph(doc, "La extracción de URL depende del contenido público entregado por el servidor. Los PDF "
                    "escaneados requieren OCR externo; las páginas que generan sus datos exclusivamente con "
@@ -474,7 +476,7 @@ def build() -> None:
         ["manifest.csv", "version, guardado"],
         ["grupos.csv", "id, nombre, codigo_gruplac, fecha_creacion, unidad, responsable, categoria, descripcion, objetivos, mision, vision, lineas, url, fuente, activo"],
         ["investigadores.csv", "id, nombre, codigo_cvlac, afiliacion, categoria, contacto, url, fuente, activo"],
-        ["productos.csv", "id, titulo, anio, fecha, familia, tipologia, categoria, validacion, observacion, doi, url, fuente, activo"],
+        ["productos.csv", "id, titulo, anio, fecha, familia, tipologia, validacion, observacion, doi, url, fuente, activo"],
         ["planes.csv", "id, grupo_id, nombre, inicio, fin, objetivo, indicador, meta, actividad, activo"],
         ["membresias.csv", "grupo_id, investigador_id, rol, inicio, fin, activo"],
         ["autorias.csv", "producto_id, investigador_id, orden, rol, activo"],
@@ -517,12 +519,12 @@ def build() -> None:
          "Un nodo activo queda indexado por ID; no se crean relaciones implícitas."],
         ["Vincular grupo y producto", "IDs de ambos extremos existentes; par no duplicado.",
          "La relación activa se consulta desde grupo y desde producto."],
-        ["Actualizar validación", "Producto existente, estado permitido y observación nueva.",
-         "Se conserva el nuevo estado y la modificación entra en la pila de deshacer."],
+        ["Cerrar revisión", "Cola no vacía y nota de revisión no vacía.",
+         "La nota queda en la observación, el producto sale del frente y la acción entra en la pila; la validación se recalcula sola."],
         ["Consultar estadísticas", "Vista válida; ID seleccionado cuando corresponde; rango inicial no mayor que el final.",
          "Total único y distribuciones calculadas tras filtrar; paginar no modifica el total."],
         ["Guardar carpeta", "Datos con integridad referencial y ruta de destino escribible.",
-         "Se escriben diez CSV del esquema 2 y se conserva el guardado anterior en .backup."],
+         "Se escriben diez CSV del esquema 3 y se conserva el guardado anterior en .backup."],
     ], [3.15, 6.8, 6.85])
 
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)

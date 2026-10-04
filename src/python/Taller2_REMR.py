@@ -16,6 +16,7 @@ import http.client
 import io
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -34,11 +35,11 @@ import uuid
 import zipfile
 
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 ENTITY_FIELDS = {
     "grupos": ("id", "nombre", "codigo_gruplac", "fecha_creacion", "unidad", "responsable", "categoria", "descripcion", "objetivos", "mision", "vision", "lineas", "url", "fuente", "activo"),
     "investigadores": ("id", "nombre", "codigo_cvlac", "afiliacion", "categoria", "contacto", "url", "fuente", "activo"),
-    "productos": ("id", "titulo", "anio", "fecha", "familia", "tipologia", "categoria", "validacion", "observacion", "doi", "url", "fuente", "activo"),
+    "productos": ("id", "titulo", "anio", "fecha", "familia", "tipologia", "validacion", "observacion", "doi", "url", "fuente", "activo"),
     "planes": ("id", "grupo_id", "nombre", "inicio", "fin", "objetivo", "indicador", "meta", "actividad", "activo"),
 }
 RELATION_FIELDS = {
@@ -72,6 +73,19 @@ LABELS = {
     "actividad": "Actividad", "rol": "Rol", "orden": "Orden",
     "origen": "Origen de asociación",
 }
+# Validación automática de productos. El orden de los códigos es parte del contrato
+# con el backend C++: ambos motores devuelven las mismas reglas en el mismo orden.
+VALIDATION_RULES = {
+    "anio": "Sin año de publicación",
+    "tipologia": "Sin tipología",
+    "autor": "Sin autor activo registrado",
+    "grupo": "Sin grupo activo asociado",
+    "doi": "DOI con formato inválido",
+    "fuente": "Sin fuente verificable (URL o DOI)",
+}
+VALIDATION_STATES = ("validado", "rechazado")
+# Motivo de cola generado por la validación: "reglas:" seguido de códigos separados por comas.
+AUTO_REASON_PREFIX = "reglas:"
 LONG_FIELDS = {"descripcion", "objetivos", "mision", "vision", "lineas", "observacion", "objetivo", "indicador", "meta", "actividad", "fuente"}
 MAX_FIELD_LEN = 100_000
 MAX_CSV_ROWS = 500_000
@@ -362,9 +376,11 @@ def clean_row(kind: str, values: dict[str, Any]) -> dict[str, str]:
             if not 1900 <= year <= date.today().year + 1:
                 raise DataError("Año fuera de rango")
     if kind == "productos":
-        row["validacion"] = row["validacion"] or "pendiente"
-        if row["validacion"] not in ("pendiente", "validado", "rechazado"):
-            raise DataError("Validación: pendiente, validado o rechazado")
+        # El repositorio recalcula este campo; aquí solo se admite un valor conocido.
+        # «pendiente» procede de carpetas anteriores a la validación automática.
+        row["validacion"] = row["validacion"] or "rechazado"
+        if row["validacion"] not in (*VALIDATION_STATES, "pendiente"):
+            raise DataError("Validación: validado o rechazado")
     if kind == "autorias" and row["orden"]:
         if not row["orden"].isdigit() or int(row["orden"]) < 1:
             raise DataError("Orden de autor debe ser positivo")
@@ -387,13 +403,44 @@ def clean_row(kind: str, values: dict[str, Any]) -> dict[str, str]:
 
 
 def _legacy_row(kind: str, values: dict[str, str]) -> dict[str, str]:
-    """Adapta filas de la versión 1 sin alterar los datos persistidos de origen."""
+    """Adapta filas de las versiones 1 y 2 sin alterar los datos persistidos de origen."""
     row = values.copy()
     if kind == "grupos":
         row.pop("sigla", None)
     if kind == "productos":
         row.setdefault("validacion", "pendiente")
+        # La versión 3 retira la categoría de producto; un valor escrito a mano se conserva en la observación.
+        category = (row.pop("categoria", "") or "").strip()
+        if category:
+            note = f"Categoría registrada antes de la versión 3: {category}"
+            row["observacion"] = f"{row.get('observacion', '').strip()}\n{note}".strip()
     return row
+
+
+def _doi_text(value: str) -> str:
+    text = value.strip().lower()
+    return text[len("https://doi.org/"):] if text.startswith("https://doi.org/") else text
+
+
+def _valid_doi(doi: str) -> bool:
+    """10.NNNN/sufijo sin espacios; se evalúa igual que en C++ (sin expresiones regulares)."""
+    if not doi.startswith("10."):
+        return False
+    prefix, slash, suffix = doi[3:].partition("/")
+    return (bool(slash) and 4 <= len(prefix) <= 9 and prefix.isascii() and prefix.isdigit()
+            and bool(suffix) and not any(ch in " \t\n\r\f\v" for ch in suffix))
+
+
+def _verifiable_url(url: str) -> bool:
+    text = url.strip().lower()
+    return any(text.startswith(scheme) and len(text) > len(scheme) for scheme in ("http://", "https://"))
+
+
+def auto_reason_codes(reason: str) -> list[str] | None:
+    """Códigos de reglas de un motivo generado automáticamente; None si el motivo es manual."""
+    if not reason.startswith(AUTO_REASON_PREFIX):
+        return None
+    return [code for code in reason[len(AUTO_REASON_PREFIX):].split(",") if code in VALIDATION_RULES]
 
 
 class Repository:
@@ -406,6 +453,7 @@ class Repository:
         }
         self.history = LinkedStack()
         self.queue = LinkedQueue()
+        self.issues: dict[str, tuple[str, ...]] = {}
         self.dirty = False
 
     def rows(self, kind: str) -> list[dict[str, str]]:
@@ -438,14 +486,68 @@ class Repository:
         return {"rows": page_rows, "total": total}
 
     def summary(self) -> dict[str, Any]:
-        categories: dict[str, int] = {}
-        for product in self.entities["productos"]:
-            if product["activo"] == "1":
-                name = product["categoria"] or "Sin dato"
-                categories[name] = categories.get(name, 0) + 1
         return {"active_groups": sum(row["activo"] == "1" for row in self.entities["grupos"]),
-                "active_people": sum(row["activo"] == "1" for row in self.entities["investigadores"]),
-                "categories": categories}
+                "active_people": sum(row["activo"] == "1" for row in self.entities["investigadores"])}
+
+    def field_usage(self, kind: str) -> dict[str, int]:
+        """Registros con valor por campo; la interfaz oculta columnas que nadie ha llenado."""
+        source = self.entities.get(kind) or self.relations.get(kind)
+        if source is None:
+            raise DataError(f"Tipo desconocido: {kind}")
+        usage = dict.fromkeys(ALL_FIELDS[kind], 0)
+        for row in source:
+            for field, value in row.items():
+                if value:
+                    usage[field] += 1
+        return usage
+
+    # Validación automática: un producto es «validado» si cumple todas las reglas.
+    # Depende de sus vínculos, así que se recalcula al cambiar el producto, sus
+    # autorías o grupos, o el estado de un investigador o grupo enlazado.
+    def _rule_failures(self, product: dict[str, str]) -> tuple[str, ...]:
+        failed = []
+        if not product["anio"]:
+            failed.append("anio")
+        if not product["tipologia"]:
+            failed.append("tipologia")
+        if not any(link["activo"] == "1" and (person := self.get("investigadores", link["investigador_id"]))
+                   and person["activo"] == "1" for link in self.relations["autorias"].by_left(product["id"])):
+            failed.append("autor")
+        if not any(link["activo"] == "1" and (group := self.get("grupos", link["grupo_id"]))
+                   and group["activo"] == "1" for link in self.relations["grupos_productos"].by_right(product["id"])):
+            failed.append("grupo")
+        doi = _doi_text(product["doi"])
+        if doi and not _valid_doi(doi):
+            failed.append("doi")
+        if not _verifiable_url(product["url"]) and not (doi and _valid_doi(doi)):
+            failed.append("fuente")
+        return tuple(failed)
+
+    def _revalidate(self, product_ids: Any) -> None:
+        for product_id in set(product_ids):
+            product = self.get("productos", product_id)
+            if product is None:
+                self.issues.pop(product_id, None)
+                continue
+            failed = self._rule_failures(product)
+            self.issues[product_id] = failed
+            product["validacion"] = "rechazado" if failed else "validado"
+
+    def _affected_products(self, kind: str, row: dict[str, str]) -> list[str]:
+        if kind == "productos":
+            return [row["id"]]
+        if kind in ("autorias", "grupos_productos"):
+            return [row["producto_id"]]
+        if kind == "investigadores":
+            return [link["producto_id"] for link in self.relations["autorias"].by_right(row["id"])]
+        if kind == "grupos":
+            return [link["producto_id"] for link in self.relations["grupos_productos"].by_left(row["id"])]
+        return []
+
+    def product_issues(self, product_id: str) -> list[str]:
+        if self.get("productos", product_id) is None:
+            raise DataError("Producto inexistente")
+        return list(self.issues.get(product_id, ()))
 
     def get(self, kind: str, key: str | tuple[str, str]) -> dict[str, str] | None:
         if kind in ENTITY_FIELDS:
@@ -497,6 +599,7 @@ class Repository:
             fresh._validate_job(job)
             fresh.queue.enqueue(job)
         self.entities, self.relations, self.queue = fresh.entities, fresh.relations, fresh.queue
+        self.issues = fresh.issues
         self.dirty = True
 
     def _remember(self) -> None:
@@ -553,6 +656,7 @@ class Repository:
                     if current is None:
                         raise DataError("Registro de historial no encontrado")
                     current.update(row)
+                    self._revalidate(self._affected_products(kind, current))
         self.dirty = True
 
     def undo(self) -> bool:
@@ -608,6 +712,7 @@ class Repository:
             self.entities[kind].append(row)
         else:
             self.relations[kind].add(row)
+        self._revalidate(self._affected_products(kind, row))
         return row
 
     def update(self, kind: str, key: str | tuple[str, str], values: dict[str, Any], remember: bool = True) -> dict[str, str]:
@@ -621,12 +726,10 @@ class Repository:
         self._check_links(kind, updated)
         if kind in ENTITY_FIELDS:
             self._unique_external(kind, updated, current["id"])
-        if kind == "productos" and (current["validacion"] != updated["validacion"] or current["categoria"] != updated["categoria"]):
-            if not updated["observacion"] or updated["observacion"] == current["observacion"]:
-                raise DataError("Explique el cambio de categoría o validación en Observación")
         if remember:
             self._remember()
         current.update(updated)
+        self._revalidate(self._affected_products(kind, current))
         return current
 
     def delete(self, kind: str, key: str | tuple[str, str], remember: bool = True) -> None:
@@ -644,10 +747,12 @@ class Repository:
                 raise DataError("Hay revisiones pendientes para el producto")
         if remember:
             self._remember()
+        affected = self._affected_products(kind, row)
         if kind in ENTITY_FIELDS:
             self.entities[kind].remove(str(key))
         else:
             self.relations[kind].remove(*key)
+        self._revalidate(affected)
 
     def toggle(self, kind: str, key: str | tuple[str, str]) -> None:
         row = self.get(kind, key)
@@ -667,10 +772,10 @@ class Repository:
         return [p for p in self.entities["productos"] if p["activo"] == "1" and (ids is None or p["id"] in ids)]
 
     def statistics(self, view: str = "Todos", selected_id: str = "", start: int | None = None,
-                   end: int | None = None, category: str = "", status: str = "",
+                   end: int | None = None, status: str = "",
                    offset: int = 0, limit: int | None = None) -> dict[str, Any]:
         # Hipercubo lógico: cada producto es un hecho; grupo e investigador llegan
-        # por multilistas, y año, tipología, categoría y validación son dimensiones.
+        # por multilistas, y año, tipología y validación son dimensiones.
         # La vista elige grupo/investigador/producto; los filtros recortan el conjunto
         # y estos conteos se calculan bajo demanda. No hay cubo OLAP materializado
         # ni filtro simultáneo por grupo e investigador.
@@ -678,16 +783,17 @@ class Repository:
             raise DataError("Vista desconocida")
         if start is not None and end is not None and start > end:
             raise DataError("El año inicial supera al final")
+        if status and status not in VALIDATION_STATES:
+            raise DataError("Validación: validado o rechazado")
         products = []
         total = 0
-        tallies: dict[str, dict[str, int]] = {name: {} for name in ("anio", "tipologia", "categoria", "validacion")}
+        tallies: dict[str, dict[str, int]] = {name: {} for name in ("anio", "tipologia", "validacion")}
+        rules: dict[str, int] = {}
         for row in self.product_scope(view, selected_id):
             year = int(row["anio"]) if row["anio"] else None
             if start is not None and (year is None or year < start):
                 continue
             if end is not None and (year is None or year > end):
-                continue
-            if category and row["categoria"] != category:
                 continue
             if status and row["validacion"] != status:
                 continue
@@ -697,9 +803,11 @@ class Repository:
             for name, counts in tallies.items():
                 key = row[name] or "Sin dato"
                 counts[key] = counts.get(key, 0) + 1
+            for code in self.issues.get(row["id"], ()):
+                rules[code] = rules.get(code, 0) + 1
         return {"productos": products, "total": total,
                 "por_anio": tallies["anio"], "por_tipologia": tallies["tipologia"],
-                "por_categoria": tallies["categoria"], "por_validacion": tallies["validacion"]}
+                "por_validacion": tallies["validacion"], "por_regla": rules}
 
 
     def queue_rows(self) -> list[dict[str, str]]:
@@ -723,33 +831,42 @@ class Repository:
             raise DataError("La cola referencia un producto inexistente")
         if not job["id"] or not job["creado"]:
             raise DataError("Trabajo de cola incompleto")
+    @staticmethod
+    def _new_job(product_id: str, reason: str) -> dict[str, str]:
+        return {"id": uuid.uuid4().hex[:12], "producto_id": product_id,
+                "motivo": reason.strip(), "creado": datetime.now().isoformat(timespec="seconds")}
     def enqueue_review(self, product_id: str, reason: str) -> None:
         if not self.get("productos", product_id):
             raise DataError("Producto inexistente")
         if any(job["producto_id"] == product_id for job in self.queue):
             raise DataError("El producto ya está en la cola")
-        job = {"id": uuid.uuid4().hex[:12], "producto_id": product_id,
-               "motivo": reason.strip(), "creado": datetime.now().isoformat(timespec="seconds")}
         self._remember()
-        self.queue.enqueue(job)
-    def process_review(self, status: str, observation: str) -> dict[str, str]:
+        self.queue.enqueue(self._new_job(product_id, reason))
+    def enqueue_rejected(self) -> int:
+        """Encola los productos activos rechazados que aún no esperan revisión (una acción)."""
+        queued = {job["producto_id"] for job in self.queue}
+        targets = [row["id"] for row in self.entities["productos"]
+                   if row["activo"] == "1" and row["validacion"] == "rechazado" and row["id"] not in queued]
+        if targets:
+            self._remember()
+            for product_id in targets:
+                self.queue.enqueue(self._new_job(product_id, AUTO_REASON_PREFIX + ",".join(self.issues.get(product_id, ()))))
+        return len(targets)
+    def process_review(self, observation: str) -> dict[str, str]:
+        """Cierra la revisión del frente con una nota; la validación sigue siendo automática."""
         job = self.queue.peek()
         if not job:
             raise DataError("La cola está vacía")
-        if status not in ("validado", "rechazado", "pendiente"):
-            raise DataError("Estado inválido")
         if not observation.strip():
             raise DataError("Debe registrar una observación")
         current = self.get("productos", job["producto_id"])
         if current is None:
             raise DataError("El producto ya no existe")
-        clean_row("productos", {**current, "validacion": status, "observacion": observation})
-        if current["validacion"] != status and current["observacion"] == observation.strip():
-            raise DataError("Escriba una observación nueva para cambiar la validación")
+        clean_row("productos", {**current, "observacion": observation})
         self._remember()
-        self.update("productos", job["producto_id"], {"validacion": status, "observacion": observation}, remember=False)
+        self.update("productos", job["producto_id"], {"observacion": observation}, remember=False)
         self.queue.dequeue()
-        return job
+        return {**job, "validacion": current["validacion"]}
     def discard_review(self) -> dict[str, str]:
         if not self.queue.peek():
             raise DataError("La cola está vacía")
@@ -760,14 +877,19 @@ def _storage_cell(value: str) -> str:
     return "'" + value if value.startswith(("=", "+", "-", "@", "\t", "\r", "'")) else value
 
 
-def _csv_read(path: Path, fields: tuple[str, ...], *, legacy: bool = False,
+def _csv_read(path: Path, fields: tuple[str, ...], *, version: str = SCHEMA_VERSION,
               encoded: bool = False) -> list[dict[str, str]]:
+    legacy = version != SCHEMA_VERSION
     with path.open("r", encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
         actual = set(reader.fieldnames or ())
         expected = set(fields)
-        old_groups = legacy and path.stem == "grupos" and actual == expected | {"sigla"}
-        old_products = legacy and path.stem == "productos" and actual == expected - {"validacion"}
+        # v1: grupos con «sigla» y productos sin «validacion»; v1 y v2: productos con «categoria».
+        old_groups = version == "1" and path.stem == "grupos" and actual == expected | {"sigla"}
+        old_products = legacy and path.stem == "productos" and (
+            actual == expected | {"categoria"}
+            or (version == "1" and actual in ((expected | {"categoria"}) - {"validacion"},
+                                              expected - {"validacion"})))
         if reader.fieldnames is None or not (actual == expected or old_groups or old_products):
             raise DataError(f"Encabezados incorrectos en {path.name}; se esperan: {', '.join(fields)}")
         rows = []
@@ -917,13 +1039,14 @@ def save_repository(repo: Repository, directory: Path) -> None:
 def load_repository(directory: Path) -> Repository:
     directory = Path(directory)
     manifest = _csv_read(directory / "manifest.csv", ("version", "guardado"), encoded=True)
-    if len(manifest) != 1 or manifest[0]["version"] not in ("1", SCHEMA_VERSION):
+    if len(manifest) != 1 or manifest[0]["version"] not in ("1", "2", SCHEMA_VERSION):
         raise DataError("Versión de datos incompatible")
-    legacy = manifest[0]["version"] == "1"
+    version = manifest[0]["version"]
+    legacy = version == "1"
     repo = Repository()
     for kind in ENTITY_FIELDS:
         for number, row in enumerate(_csv_read(directory / f"{kind}.csv", ENTITY_FIELDS[kind],
-                                               legacy=legacy, encoded=not legacy), start=2):
+                                               version=version, encoded=not legacy), start=2):
             try:
                 repo.create(kind, row, remember=False)
             except DataError as exc:
@@ -1069,6 +1192,9 @@ def cpp_executable(explicit: Path | None = None) -> Path:
     return binary
 
 
+CPP_PROTOCOL = "2"
+
+
 class CppRepository:
     """Adaptador local: Tkinter envía operaciones y el proceso C++ conserva el estado."""
 
@@ -1088,7 +1214,7 @@ class CppRepository:
         self._queue_size = 0
         try:
             hello = self._request("ping")
-            if hello != {"backend": "cpp", "protocol": "1"}:
+            if hello != {"backend": "cpp", "protocol": CPP_PROTOCOL}:
                 raise DataError("El backend C++ usa un protocolo incompatible")
         except Exception:
             self.close()
@@ -1135,6 +1261,12 @@ class CppRepository:
     def summary(self) -> dict[str, Any]:
         return self._request("summary")
 
+    def field_usage(self, kind: str) -> dict[str, int]:
+        return self._request("field_usage", kind=kind)
+
+    def product_issues(self, product_id: str) -> list[str]:
+        return self._request("product_issues", key=product_id)
+
     def get(self, kind: str, key: str | tuple[str, str]) -> dict[str, str] | None:
         return self._request("get", kind=kind, **self._keys(key))
 
@@ -1160,12 +1292,12 @@ class CppRepository:
         self._request("toggle", kind=kind, **self._keys(key))
 
     def statistics(self, view: str = "Todos", selected_id: str = "", start: int | None = None,
-                   end: int | None = None, category: str = "", status: str = "",
+                   end: int | None = None, status: str = "",
                    offset: int = 0, limit: int = PAGE_SIZE) -> dict[str, Any]:
         return self._request("statistics", view=view, selected=selected_id,
                              start="" if start is None else str(start),
                              end="" if end is None else str(end),
-                             category=category, status=status, offset=str(offset), limit=str(limit))
+                             status=status, offset=str(offset), limit=str(limit))
 
     def history_size(self) -> int:
         return self._history_size
@@ -1206,8 +1338,10 @@ class CppRepository:
         return self._queue_size
     def enqueue_review(self, product_id: str, reason: str) -> None:
         self._request("enqueue_review", product_id=product_id, reason=reason)
-    def process_review(self, status: str, observation: str) -> dict[str, str]:
-        return self._request("process_review", status=status, observation=observation)
+    def enqueue_rejected(self) -> int:
+        return self._request("enqueue_rejected")
+    def process_review(self, observation: str) -> dict[str, str]:
+        return self._request("process_review", observation=observation)
     def discard_review(self) -> dict[str, str]:
         return self._request("discard_review")
 
@@ -2080,67 +2214,404 @@ def open_gui_repository(*, python_backend: bool = False,
         return Repository(), str(exc).splitlines()[0]
 
 
-def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
-            cpp_binary: Path | None = None) -> None:
+def build_gui(root: Any, repository: Repository | CppRepository,
+              data_dir: Path | None = None, *, load_on_start: bool = True) -> Any:
+    """Construye la ventana; permite verificar sus flujos con un repositorio aislado."""
     import tkinter as tk
+    import tkinter.font as tkfont
     from tkinter import filedialog, messagebox, simpledialog, ttk
+
+    available_fonts = set(tkfont.families(root))
+
+    def first_font(*names: str) -> str | None:
+        return next((name for name in names if name in available_fonts), None)
+
+    BODY_FONT = first_font("Segoe UI Variable Text", "Segoe UI", "Inter", "Noto Sans", "DejaVu Sans") or "TkDefaultFont"
+    STRONG_FONT = first_font("Segoe UI Semibold", "Segoe UI Variable Text Semibold")
+    FIGURE_FONT = first_font("Bahnschrift SemiBold", "Bahnschrift", "Inter Display")
+
+    def font(size: int, weight: str = "normal") -> tuple[Any, ...]:
+        """weight: normal, strong (títulos) o figure (cifras)."""
+        if weight == "figure" and FIGURE_FONT:
+            return (FIGURE_FONT, size) if "Bahnschrift" in FIGURE_FONT else (FIGURE_FONT, size, "bold")
+        if weight != "normal":
+            return (STRONG_FONT, size) if STRONG_FONT else (BODY_FONT, size, "bold")
+        return (BODY_FONT, size)
+
+    # Campos, menús y diálogos estándar usan las fuentes con nombre de Tk.
+    for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont", "TkCaptionFont"):
+        try:
+            tkfont.nametofont(name, root=root).configure(family=BODY_FONT, size=10)
+        except tk.TclError:
+            pass
+
+    SIDEBAR_WIDTH = 196
+    PAGE_PADDING = (24, 18, 24, 14)
+
+    TITLES = {"grupos": "Grupos", "investigadores": "Investigadores", "productos": "Productos",
+              "planes": "Planes", "membresias": "Integrantes", "autorias": "Autorías",
+              "grupos_productos": "Grupos y productos"}
+
+    def record_name(row: dict[str, str]) -> str:
+        return row.get("nombre") or row.get("titulo") or row["id"]
+
+    def display_value(field: str, value: str) -> str:
+        if field == "activo":
+            return "Activo" if value == "1" else "Inactivo"
+        if field == "validacion":
+            return value.capitalize()
+        return value or "Sin dato"
+
+    def reason_text(reason: str, short: bool = False) -> str:
+        codes = auto_reason_codes(reason)
+        if codes is None:
+            return reason or "Sin motivo registrado"
+        rules = "; ".join(VALIDATION_RULES[code] for code in codes) or "rechazado"
+        return rules if short else "Validación automática: " + rules
+
+    def cell_value(field: str, value: str) -> str:
+        """Texto de una celda de tabla: una línea y un guion discreto para lo vacío."""
+        return " ".join(display_value(field, value).split()) if value or field == "activo" else "—"
+
+    def show_columns(table: ttk.Treeview, columns: tuple[str, ...], usage: dict[str, int],
+                     keep: tuple[str, ...] = ()) -> None:
+        """Oculta las columnas que ningún registro ha llenado; reaparecen al tener datos."""
+        shown = [name for name in columns
+                 if name in keep or name.startswith("_") or usage.get(name, 1) > 0]
+        if tuple(table.cget("displaycolumns")) != tuple(shown):
+            table.configure(displaycolumns=shown)
+
+    def place_dialog(dialog: tk.Toplevel, parent: tk.Misc, width: int, height: int) -> None:
+        host = parent.winfo_toplevel()
+        dialog.transient(host)
+        width = min(width, host.winfo_screenwidth() - 60)
+        height = min(height, host.winfo_screenheight() - 100)
+        x = max(0, min(host.winfo_rootx() + (host.winfo_width() - width) // 2,
+                       host.winfo_screenwidth() - width))
+        y = max(0, min(host.winfo_rooty() + (host.winfo_height() - height) // 2,
+                       host.winfo_screenheight() - height))
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+
+    def text_field(parent: tk.Misc, **options: Any) -> tk.Text:
+        """tk.Text con el aspecto de los campos ttk del tema activo."""
+        style = ttk.Style()
+        return tk.Text(parent, wrap="word", font=font(10), relief="flat", borderwidth=0, padx=7, pady=5,
+                       background=style.lookup("TEntry", "fieldbackground"),
+                       foreground=style.lookup("TEntry", "foreground"),
+                       insertbackground=style.lookup("TEntry", "foreground"),
+                       selectbackground=style.lookup(".", "selectbackground"),
+                       highlightthickness=1, highlightbackground=style.lookup("TEntry", "bordercolor"),
+                       highlightcolor=style.lookup(".", "focuscolor"), **options)
+
+    class AutoScrollbar(ttk.Scrollbar):
+        """Solo ocupa espacio cuando el contenido no cabe (requiere grid)."""
+        def grid(self, **options: Any) -> None:
+            self._grid_options = options
+            self._shown = True
+            super().grid(**options)
+
+        def set(self, first: Any, last: Any) -> None:
+            needed = not (float(first) <= 0.0 and float(last) >= 1.0)
+            if needed != getattr(self, "_shown", True) and hasattr(self, "_grid_options"):
+                if needed:
+                    super().grid(**self._grid_options)
+                else:
+                    self.grid_remove()
+                self._shown = needed
+            super().set(first, last)
+
+    class ScrolledPage(ttk.Frame):
+        def __init__(self, parent: tk.Misc):
+            super().__init__(parent)
+            self.columnconfigure(0, weight=1)
+            self.rowconfigure(0, weight=1)
+            self.scroll_canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0)
+            scroll = AutoScrollbar(self, command=self.scroll_canvas.yview, style="Page.Vertical.TScrollbar")
+            self.scroll_canvas.configure(yscrollcommand=scroll.set)
+            self.scroll_canvas.grid(row=0, column=0, sticky="nsew")
+            scroll.grid(row=0, column=1, sticky="ns")
+            self.body = ttk.Frame(self.scroll_canvas, padding=PAGE_PADDING)
+            window = self.scroll_canvas.create_window((0, 0), window=self.body, anchor="nw")
+            self.body.bind("<Configure>", lambda _e: self.scroll_canvas.configure(
+                scrollregion=self.scroll_canvas.bbox("all")))
+            self.scroll_canvas.bind("<Configure>", lambda event: self.scroll_canvas.itemconfigure(
+                window, width=event.width))
+
+    class ChoiceDialog(tk.Toplevel):
+        def __init__(self, parent: tk.Misc, title: str, prompt: str,
+                     options: dict[str, str], default: str = ""):
+            super().__init__(parent)
+            self.title(title)
+            place_dialog(self, parent, 530, 220)
+            self.minsize(400, 200)
+            self.result: str | None = None
+            self.options = options
+            self.columnconfigure(0, weight=1)
+            ttk.Label(self, text=prompt, wraplength=480, padding=12).grid(row=0, column=0, sticky="ew")
+            self.value = tk.StringVar(value=next((label for label, value in options.items() if value == default), next(iter(options))))
+            self.box = ttk.Combobox(self, textvariable=self.value, values=list(options), state="readonly")
+            self.box.grid(row=1, column=0, sticky="ew", padx=12)
+            footer = ttk.Frame(self, padding=12)
+            footer.grid(row=2, column=0, sticky="ew")
+            ttk.Button(footer, text="Continuar", style="Accent.TButton", command=self.accept).pack(side="right")
+            ttk.Button(footer, text="Cancelar", command=self.destroy).pack(side="right", padx=6)
+            self.bind("<Escape>", lambda _e: self.destroy())
+            self.bind("<Return>", lambda _e: self.accept())
+            previous = self.grab_current()
+            self.grab_set()
+            self.box.focus_set()
+            self.wait_window()
+            if previous is not None and previous.winfo_exists():
+                previous.grab_set()
+
+        def accept(self) -> None:
+            self.result = self.options[self.value.get()]
+            self.destroy()
+
+    class RecordPicker(tk.Toplevel):
+        """Consulta paginada: el límite por página no limita las opciones disponibles."""
+        def __init__(self, parent: tk.Misc, repo: Repository | CppRepository,
+                     kind: str, current: str = ""):
+            super().__init__(parent)
+            self.title("Seleccionar " + TITLES[kind].lower())
+            place_dialog(self, parent, 740, 530)
+            self.minsize(500, 350)
+            self.repo, self.kind = repo, kind
+            self.result: str | None = None
+            self.offset = 0
+            self._timer: str | None = None
+            self.search = tk.StringVar()
+            self.columnconfigure(0, weight=1)
+            self.rowconfigure(1, weight=1)
+            top = ttk.Frame(self, padding=12)
+            top.grid(row=0, column=0, sticky="ew")
+            top.columnconfigure(1, weight=1)
+            ttk.Label(top, text="Buscar nombre o ID").grid(row=0, column=0, padx=(0, 10))
+            self.search_entry = ttk.Entry(top, textvariable=self.search)
+            self.search_entry.grid(row=0, column=1, sticky="ew")
+            self.search.trace_add("write", self._search_changed)
+            body = ttk.Frame(self, padding=(12, 0))
+            body.grid(row=1, column=0, sticky="nsew")
+            body.columnconfigure(0, weight=1)
+            body.rowconfigure(0, weight=1)
+            self.table = ttk.Treeview(body, columns=("nombre", "id", "activo"),
+                                      show="headings", selectmode="browse")
+            for field, title, width in (("nombre", "Nombre / título", 380), ("id", "ID", 180),
+                                         ("activo", "Estado", 90)):
+                self.table.heading(field, anchor="w", text=title)
+                self.table.column(field, width=width, minwidth=80)
+            scroll = AutoScrollbar(body, command=self.table.yview)
+            self.table.configure(yscrollcommand=scroll.set)
+            self.table.grid(row=0, column=0, sticky="nsew")
+            scroll.grid(row=0, column=1, sticky="ns")
+            footer = ttk.Frame(self, padding=12)
+            footer.grid(row=2, column=0, sticky="ew")
+            pager = ttk.Frame(footer)
+            pager.pack(fill="x", pady=(0, 6))
+            self.previous = ttk.Button(pager, text="Anterior", command=lambda: self.move(-1))
+            self.previous.pack(side="left")
+            self.count = tk.StringVar()
+            ttk.Label(pager, textvariable=self.count).pack(side="left", padx=10)
+            self.next = ttk.Button(pager, text="Siguiente", command=lambda: self.move(1))
+            self.next.pack(side="left")
+            self.choose = ttk.Button(footer, text="Seleccionar", style="Accent.TButton", command=self.accept)
+            self.choose.pack(side="right")
+            ttk.Button(footer, text="Cancelar", command=self.destroy).pack(side="right", padx=6)
+            self.table.bind("<<TreeviewSelect>>", lambda _e: self.choose.configure(
+                state="normal" if self.table.selection() else "disabled"))
+            self.table.bind("<Double-1>", lambda _e: self.accept())
+            self.table.bind("<Return>", lambda _e: self.accept())
+            self.bind("<Escape>", lambda _e: self.destroy())
+            self.refresh()
+            if current and self.table.exists(current):
+                self.table.selection_set(current)
+            previous_grab = self.grab_current()
+            self.grab_set()
+            self.search_entry.focus_set()
+            self.wait_window()
+            if previous_grab is not None and previous_grab.winfo_exists():
+                previous_grab.grab_set()
+
+        def _search_changed(self, *_: Any) -> None:
+            if self._timer:
+                self.after_cancel(self._timer)
+            self.offset = 0
+            self._timer = self.after(200, self.refresh)
+
+        def refresh(self) -> None:
+            if self._timer:
+                self.after_cancel(self._timer)
+                self._timer = None
+            page = self.repo.page(self.kind, self.offset, PAGE_SIZE, self.search.get())
+            self.table.delete(*self.table.get_children())
+            for row in page["rows"]:
+                self.table.insert("", "end", iid=row["id"],
+                                  values=(record_name(row), row["id"], display_value("activo", row["activo"])))
+            first = self.offset + 1 if page["total"] else 0
+            self.count.set(f"{first}–{self.offset + len(page['rows'])} de {page['total']}")
+            self.previous.configure(state="normal" if self.offset else "disabled")
+            self.next.configure(state="normal" if self.offset + PAGE_SIZE < page["total"] else "disabled")
+            self.choose.configure(state="disabled")
+
+        def move(self, direction: int) -> None:
+            self.offset = max(0, self.offset + direction * PAGE_SIZE)
+            self.refresh()
+
+        def accept(self) -> None:
+            selected = self.table.selection()
+            if selected:
+                self.result = selected[0]
+                self.destroy()
+
+        def destroy(self) -> None:
+            if self._timer:
+                self.after_cancel(self._timer)
+                self._timer = None
+            super().destroy()
+
+    class ReferenceInput(ttk.Frame):
+        def __init__(self, parent: tk.Misc, repo: Repository | CppRepository, kind: str, value: str = "",
+                     variable: tk.StringVar | None = None, command: Callable[[], Any] | None = None,
+                     style: str = "TFrame"):
+            super().__init__(parent, style=style)
+            self.repo, self.kind, self.command = repo, kind, command
+            self.value = variable if variable is not None else tk.StringVar()
+            self.label = tk.StringVar()
+            self._trace = self.value.trace_add("write", lambda *_: self._update_label())
+            self.columnconfigure(0, weight=1)
+            self.entry = ttk.Entry(self, textvariable=self.label, state="readonly")
+            self.entry.grid(row=0, column=0, sticky="ew")
+            self.button = ttk.Button(self, text="Elegir…", command=self.select)
+            self.button.grid(row=0, column=1, padx=(6, 0))
+            self.set(value)
+
+        def get(self) -> str:
+            return self.value.get()
+
+        def set(self, value: str) -> None:
+            self.value.set(value)
+
+        def _update_label(self) -> None:
+            value = self.value.get()
+            row = self.repo.get(self.kind, value) if value else None
+            self.label.set(f"{record_name(row)} · {value}" if row else value)
+
+        def select(self) -> None:
+            picker = RecordPicker(self, self.repo, self.kind, self.get())
+            if picker.result:
+                self.set(picker.result)
+                if self.command:
+                    self.command()
+
+        def set_enabled(self, enabled: bool) -> None:
+            self.button.configure(state="normal" if enabled else "disabled")
+
+        def destroy(self) -> None:
+            self.value.trace_remove("write", self._trace)
+            super().destroy()
 
     class RecordDialog(tk.Toplevel):
         def __init__(self, parent: tk.Misc, kind: str, initial: dict[str, str] | None = None,
-                     choices: dict[str, list[str]] | None = None, suggested_id: str = "",
-                     external: bool = False):
+                     suggested_id: str = "", external: bool = False,
+                     repo: Repository | CppRepository | None = None,
+                     on_save: Callable[[dict[str, str]], Any] | None = None,
+                     is_new: bool = False, locked_fields: tuple[str, ...] = ()):
             super().__init__(parent)
-            self.title(("Revisar " if external else "Editar " if initial else "Crear ") + kind.replace("_", " "))
-            self.transient(parent)
+            self.title(("Revisar " if external else "Crear " if is_new or initial is None else "Editar ")
+                       + TITLES[kind].lower())
+            place_dialog(self, parent, 760, 650)
             self.resizable(True, True)
-            self.geometry("760x650")
+            self.minsize(540, 420)
             self.result: dict[str, str] | None = None
-            self.kind = kind
+            self.kind, self.on_save = kind, on_save
             self.inputs: dict[str, Any] = {}
+            self.error = tk.StringVar()
             self.columnconfigure(0, weight=1)
             self.rowconfigure(0, weight=1)
-            canvas = tk.Canvas(self, highlightthickness=0)
-            scrollbar = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+            canvas = tk.Canvas(self, highlightthickness=0, background=ttk.Style().lookup("TFrame", "background"))
+            self.scroll_canvas = canvas
+            scrollbar = AutoScrollbar(self, orient="vertical", command=canvas.yview)
             canvas.configure(yscrollcommand=scrollbar.set)
             canvas.grid(row=0, column=0, sticky="nsew")
             scrollbar.grid(row=0, column=1, sticky="ns")
-            body = ttk.Frame(canvas, padding=12)
+            body = ttk.Frame(canvas, padding=(18, 12))
             window = canvas.create_window((0, 0), window=body, anchor="nw")
             body.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
             canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=event.width))
             body.columnconfigure(1, weight=1)
-            fields = ALL_FIELDS[kind]
-            for index, field in enumerate(fields):
-                ttk.Label(body, text=LABELS.get(field, field)).grid(row=index, column=0, sticky="nw", padx=4, pady=3)
+            sections = {
+                "grupos": (("Identificación", ("id", "nombre", "codigo_gruplac", "fecha_creacion", "unidad", "responsable", "categoria", "activo")),
+                           ("Perfil de investigación", ("descripcion", "objetivos", "mision", "vision", "lineas")),
+                           ("Procedencia", ("url", "fuente"))),
+                "investigadores": (("Información personal pública", ("id", "nombre", "afiliacion", "contacto", "activo")),
+                                    ("Clasificación", ("codigo_cvlac", "categoria")), ("Procedencia", ("url", "fuente"))),
+                "productos": (("Producto", ("id", "titulo", "anio", "fecha", "doi", "activo")),
+                               ("Clasificación y revisión", ("familia", "tipologia", "observacion")),
+                               ("Procedencia", ("url", "fuente"))),
+                "planes": (("Plan del grupo", ("id", "grupo_id", "nombre", "inicio", "fin", "activo")),
+                            ("Objetivos y actividades", ("objetivo", "indicador", "meta", "actividad"))),
+            }.get(kind, (("Asociación", ALL_FIELDS[kind]),))
+            fields = [field for _, group in sections for field in group]
+            headings = {group[0]: title for title, group in sections}
+            index = 0
+            for field in fields:
+                if field in headings:
+                    ttk.Label(body, text=headings[field], style="Section.TLabel").grid(
+                        row=index, column=0, columnspan=2, sticky="w", padx=4, pady=(10, 6))
+                    index += 1
+                required = field in REQUIRED.get(kind, ()) or field.endswith("_id")
+                label = LABELS.get(field, field).replace(" (ID)", "") + (" *" if required else "")
+                ttk.Label(body, text=label).grid(row=index, column=0, sticky="nw", padx=4, pady=6)
                 value = initial.get(field, "") if initial else ""
                 if field == "activo" and not initial:
                     value = "1"
-                if field == "id" and not initial:
+                if field == "id" and not value:
                     value = suggested_id
                 if field in LONG_FIELDS:
-                    widget = tk.Text(body, height=2, width=58, wrap="word")
+                    widget = text_field(body, height=3, width=40)
                     widget.insert("1.0", value)
-                elif field in ("activo", "validacion"):
-                    options = ("1", "0") if field == "activo" else ("pendiente", "validado", "rechazado")
-                    widget = ttk.Combobox(body, values=options, state="readonly", width=54)
-                    widget.set(value)
-                elif choices and field in choices:
-                    widget = ttk.Combobox(body, values=choices[field], width=54)
-                    widget.set(value)
+                elif field == "activo":
+                    widget = ttk.Combobox(body, values=("Activo", "Inactivo"), state="readonly", width=30)
+                    widget.set(display_value(field, value or "1"))
+                elif field.endswith("_id") and repo is not None:
+                    ref_kind = {"grupo_id": "grupos", "investigador_id": "investigadores", "producto_id": "productos"}[field]
+                    widget = ReferenceInput(body, repo, ref_kind, value)
                 else:
-                    widget = ttk.Entry(body, width=57)
+                    widget = ttk.Entry(body, width=40)
                     widget.insert(0, value)
                 widget.grid(row=index, column=1, sticky="ew", padx=4, pady=3)
-                if initial and not external and (field == "id" or field in RELATION_ENDS.get(kind, ())[:2]):
-                    widget.configure(state="disabled")
+                stable = initial and not external and not is_new and (field == "id" or field in RELATION_ENDS.get(kind, ())[:2])
+                if stable or field in locked_fields:
+                    if isinstance(widget, ReferenceInput):
+                        widget.set_enabled(False)
+                    else:
+                        widget.configure(state="readonly")
                 self.inputs[field] = widget
-            actions = ttk.Frame(body)
-            actions.grid(row=len(fields), column=0, columnspan=2, pady=12)
-            ttk.Button(actions, text="Guardar", command=self.accept).pack(side="left", padx=5)
-            ttk.Button(actions, text="Cancelar", command=self.destroy).pack(side="left", padx=5)
+                index += 1
+            help_text = "* Campo obligatorio. Fechas: AAAA-MM-DD. Ctrl+Enter guarda."
+            if kind == "productos":
+                help_text += ("\nLa validación es automática y se recalcula al guardar: requiere año, tipología, "
+                              "un autor y un grupo activos, y una URL o un DOI válido.")
+            ttk.Label(body, text=help_text, style="Muted.TLabel", wraplength=500).grid(
+                row=index, column=0, columnspan=2, sticky="w", pady=8)
+            footer = ttk.Frame(self, padding=12)
+            footer.grid(row=1, column=0, columnspan=2, sticky="ew")
+            footer.columnconfigure(0, weight=1)
+            self.error_label = ttk.Label(footer, textvariable=self.error, style="Error.TLabel", wraplength=600)
+            self.error_label.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+            ttk.Button(footer, text="Guardar", style="Accent.TButton", command=self.accept).grid(row=1, column=1)
+            ttk.Button(footer, text="Cancelar", command=self.destroy).grid(row=1, column=0, sticky="e", padx=8)
             self.bind("<Escape>", lambda _event: self.destroy())
+            self.bind("<Control-Return>", lambda _event: self.accept())
+            self.error_label.bind("<Configure>", lambda event: self.error_label.configure(wraplength=max(220, event.width - 10)))
+            previous_grab = self.grab_current()
             self.grab_set()
+            focus = self.inputs.get("nombre") or self.inputs.get("titulo")
+            if focus is not None:
+                focus.focus_set()
             self.wait_window()
+            if previous_grab is not None and previous_grab.winfo_exists():
+                previous_grab.grab_set()
 
         def accept(self) -> None:
             result = {}
@@ -2149,53 +2620,159 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
                     result[field] = widget.get("1.0", "end-1c").strip()
                 else:
                     result[field] = widget.get().strip()
+                if field == "activo":
+                    result[field] = "1" if result[field] == "Activo" else "0"
+            try:
+                result = clean_row(self.kind, result)
+                if self.on_save:
+                    self.on_save(result)
+            except (DataError, OSError, ValueError) as exc:
+                self.error.set(str(exc))
+                return
             self.result = result
+            self.destroy()
+
+    class ReviewDialog(tk.Toplevel):
+        """Revisión del frente de la cola: corregir el producto y cerrar con una nota."""
+        def __init__(self, parent: tk.Misc, app: "App", job: dict[str, str]):
+            super().__init__(parent)
+            self.title("Revisar siguiente producto")
+            place_dialog(self, parent, 680, 540)
+            self.minsize(480, 420)
+            self.app, self.job = app, job
+            self.result: dict[str, str] | None = None
+            self.columnconfigure(0, weight=1)
+            self.rowconfigure(5, weight=1)
+            product = app.repo.get("productos", job["producto_id"])
+            ttk.Label(self, text=record_name(product), style="Title.TLabel", wraplength=620,
+                      padding=(18, 16, 18, 4)).grid(row=0, column=0, sticky="ew")
+            ttk.Label(self, text="Motivo: " + reason_text(job["motivo"]), style="Muted.TLabel", wraplength=620,
+                      padding=(18, 0)).grid(row=1, column=0, sticky="ew")
+            state = ttk.Frame(self, style="Card.TFrame", padding=(14, 10))
+            state.grid(row=2, column=0, sticky="ew", padx=18, pady=12)
+            state.columnconfigure(0, weight=1)
+            self.state_text = tk.StringVar()
+            self.state_label = ttk.Label(state, textvariable=self.state_text, style="Card.TLabel",
+                                         wraplength=520, justify="left")
+            self.state_label.grid(row=0, column=0, sticky="ew")
+            ttk.Button(state, text="Editar producto", command=self.edit_product).grid(row=0, column=1, sticky="ne", padx=(10, 0))
+            ttk.Label(self, text="Nota de la revisión *", padding=(18, 0)).grid(row=4, column=0, sticky="w")
+            self.observation = text_field(self, height=5, width=40)
+            self.observation.grid(row=5, column=0, sticky="nsew", padx=18, pady=6)
+            self.error = tk.StringVar()
+            ttk.Label(self, textvariable=self.error, style="Error.TLabel", wraplength=620,
+                      padding=(18, 0)).grid(row=6, column=0, sticky="ew")
+            footer = ttk.Frame(self, padding=(18, 12))
+            footer.grid(row=7, column=0, sticky="ew")
+            ttk.Button(footer, text="Ver ficha", command=lambda: app.open_detail("productos", product["id"], self)).pack(side="left")
+            ttk.Button(footer, text="Cerrar revisión", style="Accent.TButton", command=self.accept).pack(side="right")
+            ttk.Button(footer, text="Cancelar", command=self.destroy).pack(side="right", padx=6)
+            self._update_state()
+            self.bind("<Escape>", lambda _e: self.destroy())
+            self.bind("<Control-Return>", lambda _e: self.accept())
+            previous = self.grab_current()
+            self.grab_set()
+            self.observation.focus_set()
+            self.wait_window()
+            if previous is not None and previous.winfo_exists():
+                previous.grab_set()
+
+        def _update_state(self) -> None:
+            product = self.app.repo.get("productos", self.job["producto_id"])
+            issues = self.app.repo.product_issues(self.job["producto_id"])
+            if product["validacion"] == "validado":
+                self.state_text.set("Validado: el producto cumple todas las reglas.")
+                self.state_label.configure(style="Card.TLabel")
+            else:
+                self.state_text.set("Rechazado. Corrija el producto o explique en la nota por qué no es posible:\n"
+                                    + "\n".join("• " + VALIDATION_RULES[code] for code in issues))
+                self.state_label.configure(style="Rejected.Card.TLabel")
+
+        def edit_product(self) -> None:
+            self.app.edit_record("productos", key=self.job["producto_id"], parent=self)
+            self._update_state()
+
+        def accept(self) -> None:
+            try:
+                self.result = self.app.repo.process_review(self.observation.get("1.0", "end-1c"))
+            except (DataError, OSError, ValueError) as exc:
+                self.error.set(str(exc))
+                return
             self.destroy()
 
     class EntityTab(ttk.Frame):
         def __init__(self, parent: tk.Misc, app: "App", kind: str):
-            super().__init__(parent, padding=8)
+            super().__init__(parent, padding=PAGE_PADDING)
             self.app, self.kind = app, kind
             self.search = tk.StringVar()
+            self.state_filter = tk.StringVar(value="Todos")
             self.offset = 0
             self._search_timer: str | None = None
+            heading = ttk.Frame(self)
+            heading.pack(fill="x", pady=(0, 14))
+            ttk.Label(heading, text=TITLES[kind], style="Heading.TLabel").pack(side="left")
+            ttk.Button(heading, text="Nuevo", style="Accent.TButton", command=self.create).pack(side="right")
             toolbar = ttk.Frame(self)
             toolbar.pack(fill="x")
-            ttk.Label(toolbar, text="Buscar").pack(side="left")
-            ttk.Entry(toolbar, textvariable=self.search, width=26).pack(side="left", padx=5)
+            ttk.Label(toolbar, text="Buscar", style="Muted.TLabel").pack(side="left")
+            ttk.Entry(toolbar, textvariable=self.search, width=20).pack(side="left", padx=8, fill="x", expand=True)
+            state_box = ttk.Combobox(toolbar, textvariable=self.state_filter, values=("Todos", "Activos", "Inactivos"),
+                                    state="readonly", width=10)
+            state_box.pack(side="left")
+            state_box.bind("<<ComboboxSelected>>", lambda _e: self._search_changed())
             self.search.trace_add("write", lambda *_: self._search_changed())
-            for label, action in (("Nuevo", self.create), ("Editar", self.edit),
-                                  ("Activar/desactivar", self.toggle), ("Eliminar", self.delete),
-                                  ("Información", self.open_detail)):
-                ttk.Button(toolbar, text=label, command=action).pack(side="left", padx=3)
+            actions = ttk.Frame(self)
+            actions.pack(fill="x", pady=(10, 0))
+            self.selection_buttons = []
+            for label, action in (("Abrir ficha", self.open_detail), ("Editar", self.edit),
+                                  ("Desactivar", self.toggle), ("Eliminar", self.delete)):
+                button = ttk.Button(actions, text=label, command=action,
+                                    style="Danger.TButton" if label == "Eliminar" else "TButton")
+                button.pack(side="left", padx=(0, 6))
+                self.selection_buttons.append(button)
+                if label == "Desactivar":
+                    self.toggle_button = button
+            # La categoría solo se muestra en el módulo de grupos. Las columnas sin datos se ocultan al refrescar.
             visible = {
-                "grupos": ("id", "nombre", "categoria", "activo"),
-                "investigadores": ("id", "nombre", "afiliacion", "categoria", "activo"),
-                "productos": ("id", "titulo", "anio", "tipologia", "categoria", "validacion", "activo"),
-                "planes": ("id", "grupo_id", "nombre", "inicio", "fin", "activo"),
+                "grupos": ("nombre", "categoria", "responsable", "activo", "id"),
+                "investigadores": ("nombre", "afiliacion", "contacto", "activo", "id"),
+                "productos": ("titulo", "anio", "tipologia", "validacion", "activo", "id"),
+                "planes": ("grupo_id", "nombre", "objetivo", "inicio", "fin", "activo", "id"),
             }[kind]
             table_frame = ttk.Frame(self)
-            table_frame.pack(fill="both", expand=True, pady=(7, 0))
+            table_frame.pack(fill="both", expand=True, pady=(10, 0))
             table_frame.columnconfigure(0, weight=1)
             table_frame.rowconfigure(0, weight=1)
             self.table = ttk.Treeview(table_frame, columns=visible, show="headings", selectmode="browse", height=14)
             self.table.tag_configure("stripe", background=self.app.colors["stripe"])
             for field in visible:
-                self.table.heading(field, text=LABELS[field])
-                self.table.column(field, width=85 if field in ("id", "anio", "activo") else 180, stretch=True)
-            table_y = ttk.Scrollbar(table_frame, orient="vertical", command=self.table.yview)
-            table_x = ttk.Scrollbar(table_frame, orient="horizontal", command=self.table.xview)
+                self.table.heading(field, anchor="w", text="Estado" if field == "activo" else LABELS[field].replace(" (ID)", ""))
+                width = (360 if field == "objetivo" else 300 if field in ("titulo", "nombre", "grupo_id") else
+                         220 if field in ("responsable", "tipologia", "afiliacion") else
+                         180 if field in ("id", "contacto") else 110)
+                self.table.column(field, width=width, minwidth=65, stretch=True)
+            table_y = AutoScrollbar(table_frame, orient="vertical", command=self.table.yview)
+            table_x = AutoScrollbar(table_frame, orient="horizontal", command=self.table.xview)
             self.table.configure(yscrollcommand=table_y.set, xscrollcommand=table_x.set)
             self.table.grid(row=0, column=0, sticky="nsew")
             table_y.grid(row=0, column=1, sticky="ns")
             table_x.grid(row=1, column=0, sticky="ew")
-            self.table.bind("<Double-1>", lambda _event: self.open_detail())
-            pager = ttk.Frame(self)
-            pager.pack(fill="x")
-            ttk.Button(pager, text="Anterior", command=lambda: self._move(-1)).pack(side="left")
+            if kind == "productos":
+                self.table.bind("<ButtonRelease-1>", lambda event: self.open_detail() if self.table.identify_row(event.y) else None)
+            else:
+                self.table.bind("<Double-1>", lambda _event: self.open_detail())
+            self.table.bind("<Return>", lambda _event: self.open_detail())
+            self.table.bind("<<TreeviewSelect>>", lambda _event: self._selection_changed())
+            self.empty_state = ttk.Label(table_frame, text="Sin registros. Cree uno nuevo o cambie la búsqueda.",
+                                          style="Muted.TLabel", wraplength=400)
+            pager = ttk.Frame(self, padding=(0, 10, 0, 0))
+            pager.pack(side="bottom", fill="x", before=table_frame)
+            self.previous = ttk.Button(pager, text="Anterior", command=lambda: self._move(-1))
+            self.previous.pack(side="left")
             self.page_label = tk.StringVar()
             ttk.Label(pager, textvariable=self.page_label).pack(side="left", padx=10)
-            ttk.Button(pager, text="Siguiente", command=lambda: self._move(1)).pack(side="left")
+            self.next = ttk.Button(pager, text="Siguiente", command=lambda: self._move(1))
+            self.next.pack(side="left")
             if kind in ("grupos", "investigadores"):
                 ttk.Button(pager, text="Consultar fuente", command=self.open_source).pack(side="right")
             self.visible = visible
@@ -2203,6 +2780,13 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
         def selected(self) -> str | None:
             selection = self.table.selection()
             return selection[0] if selection else None
+
+        def _selection_changed(self) -> None:
+            key = self.selected()
+            for button in self.selection_buttons:
+                button.configure(state="normal" if key else "disabled")
+            row = self.app.record(self.kind, key) if key else None
+            self.toggle_button.configure(text="Activar" if row and row["activo"] == "0" else "Desactivar")
 
         def _search_changed(self) -> None:
             self.offset = 0
@@ -2224,122 +2808,41 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
                 self._search_timer = None
             current = self.selected()
             self.table.delete(*self.table.get_children())
-            page = self.app.repo.page(self.kind, self.offset, PAGE_SIZE, self.search.get())
+            page = self.app.entity_page(self.kind, self.offset, self.search.get(), self.state_filter.get())
             if self.offset and self.offset >= page["total"]:
                 self.offset = max(0, (page["total"] - 1) // PAGE_SIZE * PAGE_SIZE)
-                page = self.app.repo.page(self.kind, self.offset, PAGE_SIZE, self.search.get())
+                page = self.app.entity_page(self.kind, self.offset, self.search.get(), self.state_filter.get())
             for index, row in enumerate(page["rows"]):
-                self.table.insert("", "end", iid=row["id"], values=tuple(row[field] for field in self.visible),
+                self.app._record_cache[(self.kind, row["id"])] = row
+                values = [self.app.reference_label("grupos", row[field]) if field == "grupo_id" else cell_value(field, row[field])
+                          for field in self.visible]
+                self.table.insert("", "end", iid=row["id"], values=values,
                                   tags=("stripe",) if index % 2 else ())
             self.page_label.set(f"{self.offset + 1 if page['total'] else 0}–{self.offset + len(page['rows'])} de {page['total']}")
+            show_columns(self.table, self.visible, self.app.usage(self.kind), keep=("nombre", "titulo", "activo", "id"))
             if current and self.table.exists(current):
                 self.table.selection_set(current)
+            self._selection_changed()
+            self.previous.configure(state="normal" if self.offset else "disabled")
+            self.next.configure(state="normal" if self.offset + PAGE_SIZE < page["total"] else "disabled")
+            if page["total"]:
+                self.empty_state.place_forget()
+            else:
+                self.empty_state.place(relx=0.5, rely=0.45, anchor="center")
 
         def open_detail(self) -> None:
             key = self.selected()
-            row = self.app.repo.get(self.kind, key) if key else None
-            if not row:
-                return
-            dialog = tk.Toplevel(self)
-            dialog.title(f"{LABELS.get(self.kind, self.kind)} — {key}")
-            dialog.transient(self.winfo_toplevel())
-            dialog.geometry("760x560")
-            dialog.minsize(560, 420)
-            dialog.columnconfigure(0, weight=1)
-            dialog.rowconfigure(0, weight=1)
-            notebook = ttk.Notebook(dialog)
-            notebook.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
-
-            info_tab = ttk.Frame(notebook, padding=10)
-            notebook.add(info_tab, text="Información")
-            info = tk.Text(info_tab, wrap="word", state="disabled",
-                           font=("Segoe UI", 10), background=self.app.colors["surface"],
-                           foreground=self.app.colors["ink"],
-                           selectbackground=self.app.colors["text_select"],
-                           padx=10, pady=8, borderwidth=0,
-                           highlightthickness=1, highlightbackground=self.app.colors["line"])
-            info_y = ttk.Scrollbar(info_tab, orient="vertical", command=info.yview)
-            info.configure(yscrollcommand=info_y.set)
-            info.pack(side="left", fill="both", expand=True)
-            info_y.pack(side="right", fill="y")
-            text = "\n".join(f"{LABELS.get(field, field)}: {row[field]}" for field in ENTITY_FIELDS[self.kind])
-            if self.kind == "grupos":
-                members = self.app.repo.related_page("membresias", key, "left", limit=0, active_only=True)["total"]
-                products = self.app.repo.related_page("grupos_productos", key, "left", limit=0, active_only=True)["total"]
-                text += f"\n\nIntegrantes: {members} | Productos vinculados: {products}"
-            elif self.kind == "investigadores":
-                groups = self.app.repo.related_page("membresias", key, "right", limit=0, active_only=True)["total"]
-                products = self.app.repo.related_page("autorias", key, "right", limit=0, active_only=True)["total"]
-                text += f"\n\nGrupos: {groups} | Productos de autoría: {products}"
-            elif self.kind == "productos":
-                authors = self.app.repo.related_page("autorias", key, "left", limit=0, active_only=True)["total"]
-                groups = self.app.repo.related_page("grupos_productos", key, "right", limit=0, active_only=True)["total"]
-                text += f"\n\nAutores: {authors} | Grupos: {groups}"
-            info.configure(state="normal")
-            info.insert("1.0", text)
-            info.configure(state="disabled")
-
-            products_tab = ttk.Frame(notebook, padding=10)
-            notebook.add(products_tab, text="Productos")
-            products_frame = ttk.Frame(products_tab)
-            products_frame.pack(fill="both", expand=True)
-            products_frame.columnconfigure(0, weight=1)
-            products_frame.rowconfigure(0, weight=1)
-            columns = ("id", "titulo", "anio", "tipologia", "categoria", "validacion")
-            products_table = ttk.Treeview(products_frame, columns=columns, show="headings", selectmode="browse")
-            products_table.tag_configure("stripe", background=self.app.colors["stripe"])
-            for field in columns:
-                products_table.heading(field, text=LABELS[field])
-                products_table.column(field, width=150 if field in ("id", "anio") else 280, stretch=True)
-            products_scroll = ttk.Scrollbar(products_frame, orient="vertical", command=products_table.yview)
-            products_table.configure(yscrollcommand=products_scroll.set)
-            products_table.grid(row=0, column=0, sticky="nsew")
-            products_scroll.grid(row=0, column=1, sticky="ns")
-            products = self._related_products(key)
-            for index, product in enumerate(products):
-                products_table.insert("", "end", iid=product["id"],
-                                      values=tuple(product[field] for field in columns),
-                                      tags=("stripe",) if index % 2 else ())
-            if not products:
-                ttk.Label(products_tab, text="Sin productos asociados").pack(pady=20)
-
-            ttk.Button(dialog, text="Cerrar", command=dialog.destroy).grid(row=1, column=0, pady=(0, 10))
-            dialog.bind("<Escape>", lambda _event: dialog.destroy())
-            dialog.grab_set()
-
-        def _related_products(self, key: str) -> list[dict[str, str]]:
-            if self.kind == "grupos":
-                links = self.app.repo.related("grupos_productos", key, "left")
-            elif self.kind == "investigadores":
-                links = self.app.repo.related("autorias", key, "right")
-            elif self.kind == "productos":
-                product = self.app.repo.get("productos", key)
-                return [product] if product else []
-            else:
-                links = []
-            products = []
-            for link in links:
-                if link.get("activo") != "1":
-                    continue
-                product = self.app.repo.get("productos", link["producto_id"])
-                if product is not None:
-                    products.append(product)
-            return products
+            if key:
+                self.app.open_detail(self.kind, key, self)
 
         def create(self) -> None:
-            choices = {"grupo_id": [r["id"] for r in self.app.repo.page("grupos")["rows"]]}
-            dialog = RecordDialog(self, self.kind, choices=choices,
-                                  suggested_id=self.app.repo.suggest_id(self.kind))
-            if dialog.result:
-                self.app.mutate(lambda: self.app.repo.create(self.kind, dialog.result))
+            self.app.edit_record(self.kind, parent=self)
 
         def edit(self) -> None:
             key = self.selected()
             if not key:
                 return
-            dialog = RecordDialog(self, self.kind, self.app.repo.get(self.kind, key))
-            if dialog.result:
-                self.app.mutate(lambda: self.app.repo.update(self.kind, key, dialog.result))
+            self.app.edit_record(self.kind, key=key, parent=self)
 
         def open_source(self) -> None:
             key = self.selected()
@@ -2357,7 +2860,8 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
 
         def delete(self) -> None:
             key = self.selected()
-            if key and messagebox.askyesno("Eliminar", f"¿Eliminar {key} definitivamente?", parent=self):
+            row = self.app.record(self.kind, key) if key else None
+            if row and messagebox.askyesno("Eliminar", f"¿Eliminar {record_name(row)} definitivamente?\nPuede deshacer este cambio antes de vaciar el historial.", parent=self):
                 self.app.mutate(lambda: self.app.repo.delete(self.kind, key))
 
         def restyle(self) -> None:
@@ -2365,26 +2869,35 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
 
     class RelationTab(ttk.Frame):
         def __init__(self, parent: tk.Misc, app: "App", kind: str):
-            super().__init__(parent, padding=8)
+            super().__init__(parent, padding=(14, 14, 14, 10))
             self.app, self.kind = app, kind
             self.offset = 0
+            self.search = tk.StringVar()
+            self._search_timer: str | None = None
+            search_bar = ttk.Frame(self)
+            search_bar.pack(fill="x", pady=(0, 10))
+            ttk.Label(search_bar, text="Buscar nombres, IDs o datos del vínculo", style="Muted.TLabel").pack(side="left")
+            ttk.Entry(search_bar, textvariable=self.search, width=30).pack(side="left", padx=8, fill="x", expand=True)
+            ttk.Button(search_bar, text="Vincular", style="Accent.TButton", command=self.create).pack(side="right", padx=(8, 0))
+            self.search.trace_add("write", self._search_changed)
             actions = ttk.Frame(self)
             actions.pack(fill="x")
-            for label, action in (("Vincular", self.create), ("Editar", self.edit),
+            for label, action in (("Editar", self.edit),
                                   ("Activar/desactivar", self.toggle), ("Desvincular", self.delete)):
-                ttk.Button(actions, text=label, command=action).pack(side="left", padx=3)
+                ttk.Button(actions, text=label, command=action,
+                           style="Danger.TButton" if label == "Desvincular" else "TButton").pack(side="left", padx=(0, 6))
             self.fields = RELATION_FIELDS[kind]
             table_frame = ttk.Frame(self)
-            table_frame.pack(fill="both", expand=True, pady=7)
+            table_frame.pack(fill="both", expand=True, pady=10)
             table_frame.columnconfigure(0, weight=1)
             table_frame.rowconfigure(0, weight=1)
             self.table = ttk.Treeview(table_frame, columns=self.fields, show="headings", selectmode="browse")
             self.table.tag_configure("stripe", background=self.app.colors["stripe"])
             for field in self.fields:
-                self.table.heading(field, text=LABELS.get(field, field))
-                self.table.column(field, width=150)
-            table_y = ttk.Scrollbar(table_frame, orient="vertical", command=self.table.yview)
-            table_x = ttk.Scrollbar(table_frame, orient="horizontal", command=self.table.xview)
+                self.table.heading(field, anchor="w", text=LABELS.get(field, field).replace(" (ID)", ""))
+                self.table.column(field, width=260 if field.endswith("_id") else 130)
+            table_y = AutoScrollbar(table_frame, orient="vertical", command=self.table.yview)
+            table_x = AutoScrollbar(table_frame, orient="horizontal", command=self.table.xview)
             self.table.configure(yscrollcommand=table_y.set, xscrollcommand=table_x.set)
             self.table.grid(row=0, column=0, sticky="nsew")
             table_y.grid(row=0, column=1, sticky="ns")
@@ -2395,6 +2908,12 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
             self.page_label = tk.StringVar()
             ttk.Label(pager, textvariable=self.page_label).pack(side="left", padx=10)
             ttk.Button(pager, text="Siguiente", command=lambda: self._move(1)).pack(side="left")
+
+        def _search_changed(self, *_: Any) -> None:
+            self.offset = 0
+            if self._search_timer:
+                self.after_cancel(self._search_timer)
+            self._search_timer = self.after(250, self.refresh)
 
         def _move(self, direction: int) -> None:
             self.offset = max(0, self.offset + direction * PAGE_SIZE)
@@ -2407,36 +2926,36 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
             return tuple(json.loads(selection[0]))  # type: ignore[return-value]
 
         def refresh(self) -> None:
+            if self._search_timer:
+                self.after_cancel(self._search_timer)
+                self._search_timer = None
             current = self.table.selection()
             self.table.delete(*self.table.get_children())
             left, right = RELATION_ENDS[self.kind][:2]
-            page = self.app.repo.page(self.kind, self.offset, PAGE_SIZE)
+            page = self.app.relationship_page(self.kind, self.offset, self.search.get())
             if self.offset and self.offset >= page["total"]:
                 self.offset = max(0, (page["total"] - 1) // PAGE_SIZE * PAGE_SIZE)
-                page = self.app.repo.page(self.kind, self.offset, PAGE_SIZE)
+                page = self.app.relationship_page(self.kind, self.offset, self.search.get())
+            left_kind, right_kind = RELATION_ENDS[self.kind][2:]
             for index, row in enumerate(page["rows"]):
                 pair = json.dumps((row[left], row[right]))
-                self.table.insert("", "end", iid=pair, values=tuple(row[field] for field in self.fields),
+                values = [self.app.reference_label(left_kind if field == left else right_kind, row[field])
+                          if field in (left, right) else cell_value(field, row[field]) for field in self.fields]
+                self.table.insert("", "end", iid=pair, values=values,
                                   tags=("stripe",) if index % 2 else ())
             self.page_label.set(f"{self.offset + 1 if page['total'] else 0}–{self.offset + len(page['rows'])} de {page['total']}")
+            show_columns(self.table, self.fields, self.app.usage(self.kind), keep=(left, right, "activo"))
             if current and self.table.exists(current[0]):
                 self.table.selection_set(current[0])
 
         def create(self) -> None:
-            left, right, left_kind, right_kind = RELATION_ENDS[self.kind]
-            choices = {left: [r["id"] for r in self.app.repo.page(left_kind)["rows"]],
-                       right: [r["id"] for r in self.app.repo.page(right_kind)["rows"]]}
-            dialog = RecordDialog(self, self.kind, choices=choices)
-            if dialog.result:
-                self.app.mutate(lambda: self.app.repo.create(self.kind, dialog.result))
+            self.app.edit_record(self.kind, parent=self)
 
         def edit(self) -> None:
             key = self.selected()
             if not key:
                 return
-            dialog = RecordDialog(self, self.kind, self.app.repo.get(self.kind, key))
-            if dialog.result:
-                self.app.mutate(lambda: self.app.repo.update(self.kind, key, dialog.result))
+            self.app.edit_record(self.kind, key=key, parent=self)
 
         def toggle(self) -> None:
             key = self.selected()
@@ -2451,31 +2970,354 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
         def restyle(self) -> None:
             self.table.tag_configure("stripe", background=self.app.colors["stripe"])
 
+    class ContextTab(ttk.Frame):
+        def __init__(self, parent: tk.Misc, detail: "DetailDialog", source: str, side: str,
+                     target_kind: str, columns: tuple[str, ...]):
+            super().__init__(parent, padding=10)
+            self.detail, self.app = detail, detail.app
+            self.source, self.side, self.target_kind = source, side, target_kind
+            self.columns = columns
+            self.offset = 0
+            self.search = tk.StringVar()
+            self._timer: str | None = None
+            self.items: dict[str, tuple[dict[str, str], dict[str, str]]] = {}
+            toolbar = ttk.Frame(self)
+            toolbar.pack(fill="x", pady=(0, 5))
+            ttk.Label(toolbar, text="Buscar").pack(side="left")
+            ttk.Entry(toolbar, textvariable=self.search, width=25).pack(side="left", padx=6)
+            self.search.trace_add("write", self._search_changed)
+            ttk.Button(toolbar, text="Nuevo plan" if source == "planes" else "Vincular…",
+                       style="Accent.TButton", command=self.create).pack(side="right")
+            actions = ttk.Frame(self)
+            actions.pack(fill="x", pady=(0, 6))
+            self.selection_buttons = []
+            for label, command in (("Abrir ficha", self.open_record), ("Editar registro", self.edit_record),
+                                    ("Editar vínculo" if source != "planes" else "Editar plan", self.edit_link),
+                                    ("Activar/desactivar", self.toggle),
+                                    ("Desvincular" if source != "planes" else "Eliminar plan", self.delete)):
+                if source == "planes" and label == "Editar registro":
+                    continue
+                button = ttk.Button(actions, text=label, command=command,
+                                    style="Danger.TButton" if label in ("Desvincular", "Eliminar plan") else "TButton")
+                button.pack(side="left", padx=(0, 6))
+                self.selection_buttons.append(button)
+            frame = ttk.Frame(self)
+            frame.pack(fill="both", expand=True)
+            frame.columnconfigure(0, weight=1)
+            frame.rowconfigure(0, weight=1)
+            self.table = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse")
+            for field in columns:
+                label = {"_link_active": "Vínculo", "_record_active": "Registro"}.get(field, LABELS.get(field, field))
+                self.table.heading(field, anchor="w", text=label)
+                self.table.column(field, width=270 if field in ("nombre", "titulo") else 120, minwidth=70)
+            yscroll = AutoScrollbar(frame, command=self.table.yview)
+            xscroll = AutoScrollbar(frame, orient="horizontal", command=self.table.xview)
+            self.table.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+            self.table.grid(row=0, column=0, sticky="nsew")
+            yscroll.grid(row=0, column=1, sticky="ns")
+            xscroll.grid(row=1, column=0, sticky="ew")
+            self.table.bind("<<TreeviewSelect>>", lambda _e: self._selection_changed())
+            if target_kind == "productos":
+                self.table.bind("<ButtonRelease-1>", lambda event: self.open_record() if self.table.identify_row(event.y) else None)
+            else:
+                self.table.bind("<Double-1>", lambda _e: self.open_record())
+            self.table.bind("<Return>", lambda _e: self.open_record())
+            pager = ttk.Frame(self)
+            pager.pack(side="bottom", fill="x", pady=(5, 0), before=frame)
+            self.previous = ttk.Button(pager, text="Anterior", command=lambda: self.move(-1))
+            self.previous.pack(side="left")
+            self.count = tk.StringVar()
+            ttk.Label(pager, textvariable=self.count).pack(side="left", padx=8)
+            self.next = ttk.Button(pager, text="Siguiente", command=lambda: self.move(1))
+            self.next.pack(side="left")
+
+        def _search_changed(self, *_: Any) -> None:
+            if self._timer:
+                self.after_cancel(self._timer)
+            self.offset = 0
+            self._timer = self.after(250, self.refresh)
+
+        def move(self, direction: int) -> None:
+            self.offset = max(0, self.offset + direction * PAGE_SIZE)
+            self.refresh()
+
+        def selected(self) -> tuple[dict[str, str], dict[str, str]] | None:
+            selected = self.table.selection()
+            return self.items.get(selected[0]) if selected else None
+
+        def _selection_changed(self) -> None:
+            state = "normal" if self.selected() else "disabled"
+            for button in self.selection_buttons:
+                button.configure(state=state)
+
+        def refresh(self) -> None:
+            if self._timer:
+                self.after_cancel(self._timer)
+                self._timer = None
+            selected = self.table.selection()
+            page = self.detail.page_for(self, self.offset, self.search.get())
+            if self.offset and self.offset >= page["total"]:
+                self.offset = max(0, (page["total"] - 1) // PAGE_SIZE * PAGE_SIZE)
+                page = self.detail.page_for(self, self.offset, self.search.get())
+            self.items.clear()
+            self.table.delete(*self.table.get_children())
+            self.table.tag_configure("stripe", background=self.app.colors["stripe"])
+            for index, (row, link) in enumerate(page["rows"]):
+                self.items[row["id"]] = (row, link)
+                combined = {**row, **link, "_link_active": link["activo"], "_record_active": row["activo"]}
+                values = [cell_value("activo" if field.startswith("_") else field, combined.get(field, ""))
+                          for field in self.columns]
+                self.table.insert("", "end", iid=row["id"], values=values, tags=("stripe",) if index % 2 else ())
+            if selected and self.table.exists(selected[0]):
+                self.table.selection_set(selected[0])
+            self._selection_changed()
+            usage = {**self.app.usage(self.target_kind), **self.app.usage(self.source)}
+            show_columns(self.table, self.columns, usage, keep=("nombre", "titulo"))
+            first = self.offset + 1 if page["total"] else 0
+            self.count.set(f"{first}–{self.offset + len(page['rows'])} de {page['total']}" if page["total"] else "Sin datos asociados")
+            self.previous.configure(state="normal" if self.offset else "disabled")
+            self.next.configure(state="normal" if self.offset + PAGE_SIZE < page["total"] else "disabled")
+
+        def create(self) -> None:
+            field = "grupo_id" if self.source == "planes" else RELATION_ENDS[self.source][0 if self.side == "left" else 1]
+            self.app.edit_record(self.source, defaults={field: self.detail.key}, parent=self.detail, locked_fields=(field,))
+
+        def edit_link(self) -> None:
+            item = self.selected()
+            if item:
+                row, link = item
+                key = row["id"] if self.source == "planes" else tuple(link[field] for field in RELATION_ENDS[self.source][:2])
+                self.app.edit_record(self.source, key=key, parent=self.detail)
+
+        def edit_record(self) -> None:
+            item = self.selected()
+            if item:
+                self.app.edit_record(self.target_kind, key=item[0]["id"], parent=self.detail)
+
+        def open_record(self) -> None:
+            item = self.selected()
+            if item:
+                self.app.open_detail(self.target_kind, item[0]["id"], self.detail)
+
+        def toggle(self) -> None:
+            item = self.selected()
+            if item:
+                row, link = item
+                key = row["id"] if self.source == "planes" else tuple(link[field] for field in RELATION_ENDS[self.source][:2])
+                self.app.mutate(lambda: self.app.repo.toggle(self.source, key))
+
+        def delete(self) -> None:
+            item = self.selected()
+            if item and messagebox.askyesno("Eliminar asociación" if self.source != "planes" else "Eliminar plan",
+                                            f"¿Eliminar {record_name(item[0])} de esta ficha?", parent=self.detail):
+                row, link = item
+                key = row["id"] if self.source == "planes" else tuple(link[field] for field in RELATION_ENDS[self.source][:2])
+                self.app.mutate(lambda: self.app.repo.delete(self.source, key))
+
+        def destroy(self) -> None:
+            if self._timer:
+                self.after_cancel(self._timer)
+                self._timer = None
+            super().destroy()
+
+    class DetailDialog(tk.Toplevel):
+        def __init__(self, parent: tk.Misc, app: "App", kind: str, key: str):
+            super().__init__(parent)
+            self.app, self.kind, self.key = app, kind, key
+            self.title("Ficha · " + TITLES[kind])
+            place_dialog(self, parent, 1000, 670)
+            self.minsize(700, 480)
+            self.columnconfigure(0, weight=1)
+            self.rowconfigure(1, weight=1)
+            header = ttk.Frame(self, padding=(20, 16, 20, 12))
+            header.grid(row=0, column=0, sticky="ew")
+            header.columnconfigure(0, weight=1)
+            self.heading = tk.StringVar()
+            ttk.Label(header, textvariable=self.heading, style="Title.TLabel", wraplength=700).grid(row=0, column=0, sticky="w")
+            ttk.Button(header, text="Editar ficha", style="Accent.TButton", command=lambda: app.edit_record(
+                kind, key=key, parent=self)).grid(row=0, column=1, padx=(12, 0))
+            self.notebook = ttk.Notebook(self)
+            self.notebook.grid(row=1, column=0, sticky="nsew", padx=20)
+            information = ttk.Frame(self.notebook, padding=10)
+            self.notebook.add(information, text="Resumen")
+            self.info = tk.Text(information, wrap="word", font=font(10), state="disabled",
+                                padx=18, pady=10, borderwidth=0, relief="flat", highlightthickness=1)
+            scroll = ttk.Scrollbar(information, command=self.info.yview)
+            self.info.configure(yscrollcommand=scroll.set)
+            self.info.pack(side="left", fill="both", expand=True)
+            scroll.pack(side="right", fill="y")
+            # Categorías solo dentro de los grupos: la del grupo y la de sus integrantes.
+            specifications = {
+                "grupos": (("Integrantes", "membresias", "left", "investigadores", ("nombre", "categoria", "rol", "inicio", "fin", "_link_active", "_record_active")),
+                           ("Planes", "planes", "left", "planes", ("nombre", "inicio", "fin", "objetivo", "_record_active")),
+                           ("Productos", "grupos_productos", "left", "productos", ("titulo", "anio", "tipologia", "validacion", "_link_active", "_record_active"))),
+                "investigadores": (("Grupos", "membresias", "right", "grupos", ("nombre", "rol", "inicio", "fin", "_link_active", "_record_active")),
+                                    ("Productos", "autorias", "right", "productos", ("titulo", "anio", "tipologia", "validacion", "orden", "rol", "_link_active", "_record_active"))),
+                "productos": (("Autores", "autorias", "left", "investigadores", ("nombre", "orden", "rol", "_link_active", "_record_active")),
+                               ("Grupos", "grupos_productos", "right", "grupos", ("nombre", "origen", "_link_active", "_record_active"))),
+                "planes": (),
+            }
+            self.link_tabs = {}
+            for title, source, side, target, columns in specifications[kind]:
+                tab = ContextTab(self.notebook, self, source, side, target, columns)
+                self.link_tabs[source] = tab
+                self.notebook.add(tab, text=title)
+            self.stats_canvas = None
+            if kind != "planes":
+                stats = ttk.Frame(self.notebook, padding=10)
+                self.notebook.add(stats, text="Estadísticas")
+                self.stats_note = tk.StringVar()
+                ttk.Label(stats, textvariable=self.stats_note, wraplength=800).pack(fill="x", pady=(0, 6))
+                panel, self.stats_canvas = app._chart_panel(stats, 280)
+                panel.pack(fill="both", expand=True)
+                self.stats_canvas.bind("<Configure>", lambda _e: self._draw_statistics())
+                ttk.Button(stats, text="Explorar en Dashboard con filtros", command=self.show_statistics).pack(anchor="e", pady=6)
+            footer = ttk.Frame(self, padding=(20, 12))
+            footer.grid(row=2, column=0, sticky="ew")
+            if kind == "productos":
+                ttk.Button(footer, text="Enviar a revisión", command=lambda: app.enqueue(key, parent=self)).pack(side="left")
+            elif kind == "planes":
+                ttk.Button(footer, text="Abrir grupo", command=lambda: app.open_detail(
+                    "grupos", app.repo.get(kind, key)["grupo_id"], self)).pack(side="left")
+            self.source_button = ttk.Button(footer, text="Consultar fuente", command=self.open_source)
+            if kind != "planes":
+                self.source_button.pack(side="left", padx=6)
+            ttk.Button(footer, text="Cerrar", command=self.destroy).pack(side="right")
+            self.bind("<Escape>", lambda _e: self.destroy())
+            self._previous_grab = self.grab_current()
+            self.refresh()
+            app.details.add(self)
+            self.grab_set()
+
+        def page_for(self, tab: ContextTab, offset: int, query: str) -> dict[str, Any]:
+            needle = query.strip().casefold()
+            if tab.source != "planes" and not needle:
+                page = self.app.repo.related_page(tab.source, self.key, tab.side, offset, PAGE_SIZE)
+                field = RELATION_ENDS[tab.source][1 if tab.side == "left" else 0]
+                return {"total": page["total"], "rows": [(self.app.record(tab.target_kind, link[field]), link) for link in page["rows"]]}
+            total = 0
+            rows = []
+            position = 0
+            while True:
+                page = (self.app.repo.page("planes", position, PAGE_SIZE) if tab.source == "planes" else
+                        self.app.repo.related_page(tab.source, self.key, tab.side, position, PAGE_SIZE))
+                for link in page["rows"]:
+                    if tab.source == "planes":
+                        if link["grupo_id"] != self.key:
+                            continue
+                        row = link
+                    else:
+                        field = RELATION_ENDS[tab.source][1 if tab.side == "left" else 0]
+                        row = self.app.record(tab.target_kind, link[field])
+                    if needle and needle not in " ".join((*row.values(), *link.values())).casefold():
+                        continue
+                    if offset <= total < offset + PAGE_SIZE:
+                        rows.append((row, link))
+                    total += 1
+                position += len(page["rows"])
+                if not page["rows"] or position >= page["total"]:
+                    break
+            return {"total": total, "rows": rows}
+
+        def refresh(self) -> None:
+            row = self.app.repo.get(self.kind, self.key)
+            if row is None:
+                self.destroy()
+                return
+            self.heading.set(f"{record_name(row)} · {display_value('activo', row['activo'])}")
+            colors = self.app.colors
+            self.info.configure(state="normal", background=colors["surface"], foreground=colors["ink"],
+                                selectbackground=colors["primary_soft"], highlightbackground=colors["line"])
+            self.info.tag_configure("label", font=font(9, "strong"), foreground=colors["muted"], spacing1=12)
+            self.info.tag_configure("value", font=font(10), foreground=colors["ink"], spacing1=2, lmargin1=0)
+            self.info.tag_configure("missing", font=font(9), foreground=colors["muted"], spacing1=16)
+            self.info.tag_configure("issue", font=font(10), foreground=colors["rejected"], spacing1=2)
+            self.info.delete("1.0", "end")
+            # Solo campos con datos; los vacíos se resumen en una línea. La categoría de
+            # un investigador se consulta desde los integrantes de su grupo.
+            hidden = {"investigadores": {"categoria"}}.get(self.kind, set())
+            missing = []
+            first = True
+            for field in ENTITY_FIELDS[self.kind]:
+                if field in hidden:
+                    continue
+                if field != "validacion" and not row[field]:
+                    missing.append(LABELS[field])
+                    continue
+                self.info.insert("end", ("" if first else "\n") + LABELS[field] + "\n", "label")
+                first = False
+                if field == "validacion":
+                    issues = self.app.repo.product_issues(self.key)
+                    self.info.insert("end", "Validado: cumple todas las reglas" if not issues else "Rechazado", "value")
+                    for code in issues:
+                        self.info.insert("end", "\n• " + VALIDATION_RULES[code], "issue")
+                else:
+                    self.info.insert("end", display_value(field, row[field]), "value")
+            if missing:
+                self.info.insert("end", "\nSin registrar: " + ", ".join(missing), "missing")
+            self.info.configure(state="disabled")
+            self.source_button.configure(state="normal" if row.get("url") else "disabled")
+            for tab in self.link_tabs.values():
+                tab.refresh()
+            if self.stats_canvas is not None:
+                self.statistics = self.app.repo.statistics({"grupos": "Grupo", "investigadores": "Investigador", "productos": "Producto"}[self.kind], self.key, limit=0)
+                self.stats_note.set(f"{self.statistics['total']} productos activos únicos de esta ficha · Todos los años. Los vínculos inactivos se excluyen.")
+                self._draw_statistics()
+
+        def _draw_statistics(self) -> None:
+            if self.stats_canvas is not None and hasattr(self, "statistics"):
+                self.stats_canvas.configure(bg=self.app.colors["surface"])
+                self.app._draw_histogram(self.stats_canvas, self.statistics["por_anio"])
+
+        def show_statistics(self) -> None:
+            kind, key = self.kind, self.key
+            self.destroy()
+            self.app.view.set({"grupos": "Grupo", "investigadores": "Investigador", "productos": "Producto"}[kind])
+            self.app._scope_changed(key)
+            self.app._show_page("dashboard")
+
+        def open_source(self) -> None:
+            row = self.app.repo.get(self.kind, self.key)
+            self.destroy()
+            self.app.import_url(row["url"])
+
+        def destroy(self) -> None:
+            self.app.details.discard(self)
+            previous = getattr(self, "_previous_grab", None)
+            super().destroy()
+            if previous is not None and previous.winfo_exists():
+                previous.grab_set()
+
+    # «Sierra y sabana»: verde institucional UPC; el amarillo solo marca lo pendiente.
     LIGHT_THEME = {
-        "page": "#eef3f8", "surface": "#ffffff", "navy": "#13304d",
-        "ink": "#23384c", "muted": "#587086", "line": "#d4e0ea",
-        "teal": "#087f79", "hover": "#e1edf3", "strong": "#13304d",
-        "header_fg": "#ffffff", "status_fg": "#d7e8ef",
-        "accent_bg": "#087f79", "accent_fg": "#ffffff",
-        "accent_active": "#096b67", "accent_pressed": "#075a57",
-        "tab_bg": "#dce7ef", "heading_bg": "#e0eaf1", "heading_active": "#d1e2eb",
-        "stripe": "#f3f8fc", "select_bg": "#13304d", "text_select": "#dce7ef",
-        "chart_bg": "#ffffff", "chart_border": "#d4e0ea", "chart_title": "#18324f",
-        "chart_empty": "#66788a", "chart_axis": "#93a5b5",
+        "page": "#f3f6f3", "surface": "#ffffff", "field": "#ffffff",
+        "sidebar": "#163a2e", "sidebar_fg": "#e3ece7", "sidebar_muted": "#a9c2b6",
+        "sidebar_hover": "#1f4a3b", "ink": "#1c2a24", "muted": "#5b6c64",
+        "line": "#dce4df", "line_strong": "#c3cfc8", "hover": "#eaf0ec",
+        "primary": "#1e6b50", "primary_hover": "#185a43", "primary_pressed": "#124636",
+        "on_primary": "#ffffff", "primary_soft": "#dcefe5", "stripe": "#f7faf8",
+        "thumb": "#c3cfc8", "thumb_active": "#9fb0a7",
+        "chart_grid": "#e7ece9", "chart_track": "#eef3f0", "chart_older": "#8fb8a5",
+        "pending": "#bb7e0e", "rejected": "#b5472f", "unknown": "#87938d",
+        "error": "#b42318",
     }
 
     DARK_THEME = {
-        "page": "#13171d", "surface": "#1b2129", "navy": "#1d2c3f",
-        "ink": "#d8e0e8", "muted": "#8996a4", "line": "#2c3540",
-        "teal": "#46c7b8", "hover": "#242d37", "strong": "#edf3f8",
-        "header_fg": "#eef4f9", "status_fg": "#a9bccb",
-        "accent_bg": "#2c9c90", "accent_fg": "#ffffff",
-        "accent_active": "#36b1a3", "accent_pressed": "#247f74",
-        "tab_bg": "#1e252e", "heading_bg": "#242c36", "heading_active": "#303a46",
-        "stripe": "#171d25", "select_bg": "#2f5b7c", "text_select": "#35434f",
-        "chart_bg": "#1b2129", "chart_border": "#2c3540", "chart_title": "#d8e0e8",
-        "chart_empty": "#8996a4", "chart_axis": "#3f4c59",
+        "page": "#111714", "surface": "#18201c", "field": "#1d2621",
+        "sidebar": "#0b100e", "sidebar_fg": "#e3ece7", "sidebar_muted": "#8fa79b",
+        "sidebar_hover": "#16201b", "ink": "#e3ece7", "muted": "#94a69d",
+        "line": "#28332e", "line_strong": "#3a4842", "hover": "#222c27",
+        "primary": "#4db38c", "primary_hover": "#2f8a68", "primary_pressed": "#236b51",
+        "on_primary": "#ffffff", "primary_soft": "#1f3a30", "stripe": "#1b241f",
+        "thumb": "#34423b", "thumb_active": "#4a5b52",
+        "chart_grid": "#232d28", "chart_track": "#202a25", "chart_older": "#3f7d65",
+        "pending": "#e6b04a", "rejected": "#e07a62", "unknown": "#7d8c85",
+        "error": "#ffb4ab",
     }
+    # Botón primario: en oscuro el verde claro sirve para trazos, no como fondo de texto blanco.
+    DARK_THEME["button"] = "#2a7a5c"
+    LIGHT_THEME["button"] = LIGHT_THEME["primary"]
+    STATUS_COLORS = {"validado": "primary", "rechazado": "rejected", "Sin dato": "unknown"}
 
     class App:
         def __init__(self, root: tk.Tk, initial_dir: Path | None,
@@ -2487,33 +3329,67 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
             self.data_dir: Path | None = None
             self.initial_dir = initial_dir
             self._url_busy = False
+            self.details: set[DetailDialog] = set()
+            self._record_cache: dict[tuple[str, str], dict[str, str]] = {}
+            self._usage_cache: dict[str, dict[str, int]] = {}
+            self._year_timer: str | None = None
+            self.status = tk.StringVar(value="Iniciando PEA-i…")
+            self.workspace = tk.StringVar()
+            self.workspace_caption = "Espacio vacío"
             self.root.title("PEA-i UPC — Investigación")
             self.root.geometry("1280x850")
             self.root.minsize(900, 620)
             self._apply_theme("light")
             self._menu()
-            self.sidebar = ttk.Frame(root, style="Sidebar.TFrame")
+            # El lateral ocupa toda la altura; cabecera y estado pertenecen al contenido.
+            self.sidebar = ttk.Frame(root, style="Sidebar.TFrame", width=SIDEBAR_WIDTH)
             self.sidebar.pack(side="left", fill="y")
+            self.sidebar.pack_propagate(False)
+            main = ttk.Frame(root)
+            main.pack(side="left", fill="both", expand=True)
+            workspace_bar = ttk.Frame(main, style="Header.TFrame", padding=(24, 10, 16, 10))
+            workspace_bar.pack(side="top", fill="x")
+            workspace_bar.columnconfigure(0, weight=1)
+            self.workspace_label = ttk.Label(workspace_bar, textvariable=self.workspace, style="Header.TLabel")
+            self.workspace_label.grid(row=0, column=0, sticky="w")
+            self.save_button = ttk.Button(workspace_bar, text="Guardar copia", style="Accent.TButton", command=self.save)
+            self.save_button.grid(row=0, column=1, padx=(8, 0))
+            workspace_bar.bind("<Configure>", lambda event: self.workspace_label.configure(wraplength=max(200, event.width - 180)))
+            ttk.Frame(main, style="Rule.TFrame", height=1).pack(side="top", fill="x")
+            self.status_label = ttk.Label(main, textvariable=self.status, style="Status.TLabel",
+                                          padding=(24, 7), anchor="w", justify="left")
+            self.status_label.pack(side="bottom", fill="x")
+            ttk.Frame(main, style="Rule.TFrame", height=1).pack(side="bottom", fill="x")
+            main.bind("<Configure>", lambda event: self.status_label.configure(wraplength=max(200, event.width - 48)))
             self.menu_expanded = True
-            self.burger = ttk.Button(self.sidebar, text="☰", width=3,
+            brand_row = ttk.Frame(self.sidebar, style="Sidebar.TFrame")
+            brand_row.pack(fill="x", padx=10, pady=(14, 0))
+            self.burger = ttk.Button(brand_row, text="☰", width=2,
                                      style="Burger.TButton", command=self._toggle_menu)
-            self.burger.pack(fill="x", padx=6, pady=(10, 4))
+            self.burger.pack(side="left")
+            self.brand = ttk.Label(brand_row, text="PEA-i", style="Brand.TLabel")
+            self.brand.pack(side="left", padx=(4, 0))
             self.sidebar_items = ttk.Frame(self.sidebar, style="Sidebar.TFrame")
             self.sidebar_items.pack(fill="both", expand=True)
-            self.content = ttk.Frame(root)
-            self.content.pack(side="left", fill="both", expand=True)
+            ttk.Label(self.sidebar_items, text="Universidad Popular del Cesar", style="SidebarCaption.TLabel",
+                      padding=(22, 2, 12, 6), wraplength=SIDEBAR_WIDTH - 34).pack(anchor="w")
+            self.content = ttk.Frame(main)
+            self.content.pack(side="top", fill="both", expand=True)
             self.content.rowconfigure(0, weight=1)
             self.content.columnconfigure(0, weight=1)
 
             self.pages: dict[str, tk.Widget] = {}
-            self.dashboard = ttk.Frame(self.content, padding=10)
+            self.dashboard = ttk.Frame(self.content)
             self._build_dashboard()
-            self.graphs = ttk.Frame(self.content, padding=10)
+            self.graphs = ttk.Frame(self.content, padding=PAGE_PADDING)
             self._build_graphs()
             self.entity_tabs: dict[str, EntityTab] = {}
             for kind in ("grupos", "investigadores", "productos", "planes"):
                 self.entity_tabs[kind] = EntityTab(self.content, self, kind)
-            relations_host = ttk.Frame(self.content, padding=10)
+            relations_host = ttk.Frame(self.content, padding=PAGE_PADDING)
+            ttk.Label(relations_host, text="Relaciones", style="Heading.TLabel").pack(anchor="w")
+            ttk.Label(relations_host, text="Vínculos entre investigadores, grupos y productos.",
+                      style="Muted.TLabel").pack(anchor="w", pady=(2, 12))
             relations = ttk.Notebook(relations_host)
             relations.pack(fill="both", expand=True)
             self.relation_tabs: dict[str, RelationTab] = {}
@@ -2522,45 +3398,90 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
                 tab = RelationTab(relations, self, kind)
                 self.relation_tabs[kind] = tab
                 relations.add(tab, text=title)
-            self.queue_tab = ttk.Frame(self.content, padding=10)
+            self.queue_tab = ttk.Frame(self.content, padding=PAGE_PADDING)
             self._build_queue()
 
-            for page_id, title, page in (
-                    ("dashboard", "Dashboard", self.dashboard),
-                    ("graphs", "Gráficos", self.graphs),
-                    ("grupos", "Grupos", self.entity_tabs["grupos"]),
-                    ("investigadores", "Investigadores", self.entity_tabs["investigadores"]),
-                    ("productos", "Productos", self.entity_tabs["productos"]),
-                    ("planes", "Planes", self.entity_tabs["planes"]),
-                    ("relaciones", "Relaciones", relations_host),
-                    ("cola", "Cola de revisión", self.queue_tab)):
-                self.pages[page_id] = page
-                ttk.Button(self.sidebar_items, text=title, style="Nav.TButton",
-                           command=lambda p=page_id: self._show_page(p)).pack(fill="x", padx=6, pady=2)
-            self.theme_button = ttk.Button(self.sidebar_items, text="Modo oscuro", command=self._toggle_theme)
-            self.theme_button.pack(side="bottom", fill="x", padx=6, pady=(10, 6))
+            self.nav_buttons = {}
+            for group, items in (
+                    ("Análisis", (("dashboard", "Dashboard", self.dashboard),
+                                  ("graphs", "Gráficos", self.graphs))),
+                    ("Registros", (("grupos", "Grupos", self.entity_tabs["grupos"]),
+                                   ("investigadores", "Investigadores", self.entity_tabs["investigadores"]),
+                                   ("productos", "Productos", self.entity_tabs["productos"]),
+                                   ("planes", "Planes", self.entity_tabs["planes"]),
+                                   ("relaciones", "Relaciones", relations_host))),
+                    ("Seguimiento", (("cola", "Cola de revisión", self.queue_tab),))):
+                ttk.Label(self.sidebar_items, text=group, style="NavGroup.TLabel",
+                          padding=(22, 14, 0, 4)).pack(anchor="w")
+                for page_id, title, page in items:
+                    self.pages[page_id] = page
+                    # Sin margen derecho: el elemento activo se une al contenido como una pestaña.
+                    button = ttk.Button(self.sidebar_items, text=title, style="Nav.TButton",
+                                        command=lambda p=page_id: self._show_page(p))
+                    button.pack(fill="x", padx=(10, 0), pady=1)
+                    self.nav_buttons[page_id] = button
+            self.theme_button = ttk.Button(self.sidebar_items, text="Modo oscuro", style="SidebarGhost.TButton",
+                                           command=self._toggle_theme)
+            self.theme_button.pack(side="bottom", fill="x", padx=12, pady=14)
             for page in self.pages.values():
                 page.grid(row=0, column=0, sticky="nsew")
 
-            self.status = tk.StringVar(value="Iniciando PEA-i...")
             self.refresh()
             self._show_page("dashboard")
             self.root.protocol("WM_DELETE_WINDOW", self.close)
-            self.root.after(80, self.start_choice)
+            self._startup_timer = self.root.after(80, self.start_choice) if load_on_start else None
+            self.root.bind("<Destroy>", self._destroyed, add="+")
+            self.root.bind_all("<MouseWheel>", self._wheel)
+            self.root.bind_all("<Button-4>", self._wheel)
+            self.root.bind_all("<Button-5>", self._wheel)
+
+        def _destroyed(self, event: tk.Event) -> None:
+            if event.widget is self.root:
+                for timer in (self._year_timer, self._startup_timer):
+                    if timer:
+                        self.root.after_cancel(timer)
+                for tab in (*self.entity_tabs.values(), *self.relation_tabs.values()):
+                    if tab._search_timer:
+                        self.root.after_cancel(tab._search_timer)
 
         def _show_page(self, page_id: str) -> None:
+            self.active_page = page_id
+            for key, button in self.nav_buttons.items():
+                button.configure(style="Selected.Nav.TButton" if key == page_id else "Nav.TButton")
             self.pages[page_id].tkraise()
             if page_id == "graphs":
                 self._redraw_charts()
 
+        def _wheel(self, event: tk.Event) -> str | None:
+            widget = event.widget
+            if isinstance(widget, (tk.Text, ttk.Treeview, ttk.Combobox)):
+                return None
+            units = -1 if getattr(event, "num", None) == 4 else 1 if getattr(event, "num", None) == 5 else (
+                -int(event.delta / 120) if abs(event.delta) >= 120 else -1 if event.delta > 0 else 1)
+            while widget is not None:
+                if isinstance(widget, tk.Canvas) and widget.cget("yscrollcommand"):
+                    bbox = widget.bbox("all")
+                    if bbox and bbox[3] - bbox[1] > widget.winfo_height():
+                        widget.yview_scroll(units, "units")
+                        return "break"
+                canvas = getattr(widget, "scroll_canvas", None)
+                if canvas is not None:
+                    bbox = canvas.bbox("all")
+                    if bbox and bbox[3] - bbox[1] > canvas.winfo_height():
+                        canvas.yview_scroll(units, "units")
+                        return "break"
+                widget = getattr(widget, "master", None)
+            return None
+
         def _toggle_menu(self) -> None:
             if self.menu_expanded:
                 self.sidebar_items.pack_forget()
+                self.brand.pack_forget()
                 self.sidebar.configure(width=56)
-                self.sidebar.pack_propagate(False)
             else:
-                self.sidebar.pack_propagate(True)
+                self.brand.pack(side="left", padx=(4, 0))
                 self.sidebar_items.pack(fill="both", expand=True)
+                self.sidebar.configure(width=SIDEBAR_WIDTH)
             self.menu_expanded = not self.menu_expanded
 
         def _show_status(self) -> None:
@@ -2573,60 +3494,143 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
             colors = LIGHT_THEME if theme == "light" else DARK_THEME
             self.theme = theme
             self.colors = colors
-            self.root.configure(background=colors["page"])
-            style.configure(".", font=("Segoe UI", 10), background=colors["page"], foreground=colors["ink"])
-            style.configure("TFrame", background=colors["page"])
-            style.configure("TLabel", background=colors["page"], foreground=colors["ink"])
-            style.configure("Sidebar.TFrame", background=colors["navy"])
-            style.configure("Nav.TButton", background=colors["navy"], foreground=colors["header_fg"],
-                            bordercolor=colors["navy"], relief="flat", anchor="w",
-                            padding=(14, 9), font=("Segoe UI", 10))
-            style.map("Nav.TButton", background=[("active", colors["hover"]),
-                                                 ("pressed", colors["hover"])],
-                      foreground=[("active", colors["ink"] if theme == "light" else colors["header_fg"])])
-            style.configure("Burger.TButton", background=colors["navy"], foreground=colors["header_fg"],
-                            bordercolor=colors["navy"], relief="flat", anchor="w", padding=(12, 6),
-                            font=("Segoe UI", 16))
-            style.map("Burger.TButton", background=[("active", colors["hover"])],
-                      foreground=[("active", colors["ink"] if theme == "light" else colors["header_fg"])])
-            style.configure("Heading.TLabel", font=("Segoe UI", 19, "bold"), foreground=colors["strong"])
-            style.configure("Metric.TLabel", font=("Segoe UI", 17, "bold"), foreground=colors["teal"])
-            style.configure("TButton", padding=(11, 7), background=colors["surface"],
-                            foreground=colors["strong"], bordercolor=colors["line"], relief="flat")
-            style.map("TButton", background=[("active", colors["hover"]), ("pressed", colors["line"])])
-            style.configure("Accent.TButton", background=colors["accent_bg"], foreground=colors["accent_fg"],
-                            bordercolor=colors["accent_bg"], padding=(12, 8))
-            style.map("Accent.TButton", background=[("active", colors["accent_active"]),
-                                                    ("pressed", colors["accent_pressed"])],
-                      foreground=[("active", colors["accent_fg"])])
-            style.configure("TNotebook", background=colors["page"], borderwidth=0, tabmargins=(10, 8, 0, 0))
-            style.configure("TNotebook.Tab", background=colors["tab_bg"], foreground=colors["strong"],
-                            padding=(15, 9), borderwidth=0)
-            style.map("TNotebook.Tab", background=[("selected", colors["surface"]),
-                                                    ("active", colors["hover"])],
-                      foreground=[("selected", colors["teal"])])
-            style.configure("TLabelframe", background=colors["page"], bordercolor=colors["line"],
-                            relief="solid")
-            style.configure("TLabelframe.Label", background=colors["page"], foreground=colors["strong"],
-                            font=("Segoe UI", 10, "bold"))
-            style.configure("TEntry", fieldbackground=colors["surface"], foreground=colors["ink"],
-                            bordercolor=colors["line"], padding=5)
-            style.configure("TCombobox", fieldbackground=colors["surface"], foreground=colors["ink"],
-                            bordercolor=colors["line"], padding=5)
-            style.map("TCombobox", fieldbackground=[("readonly", colors["surface"])],
-                      foreground=[("readonly", colors["ink"])])
-            style.configure("Treeview", background=colors["surface"], fieldbackground=colors["surface"],
-                            foreground=colors["ink"], bordercolor=colors["line"], rowheight=30)
-            style.map("Treeview", background=[("selected", colors["select_bg"])],
-                      foreground=[("selected", colors["header_fg"])])
-            style.configure("Treeview.Heading", background=colors["heading_bg"], foreground=colors["strong"],
-                            bordercolor=colors["line"], relief="flat", padding=(7, 8),
-                            font=("Segoe UI", 10, "bold"))
-            style.map("Treeview.Heading", background=[("active", colors["heading_active"])])
+            c = colors
+
+            def flat(name: str, background: str, border: str | None = None, **options: Any) -> None:
+                """clam dibuja biseles con light/darkcolor; igualarlos al fondo deja el control plano."""
+                style.configure(name, background=background, bordercolor=border or background,
+                                lightcolor=background, darkcolor=background, **options)
+
+            self.root.configure(background=c["page"])
+            for pattern, value in (("*Toplevel.background", c["page"]),
+                                   ("*TCombobox*Listbox.background", c["surface"]),
+                                   ("*TCombobox*Listbox.foreground", c["ink"]),
+                                   ("*TCombobox*Listbox.selectBackground", c["primary_soft"]),
+                                   ("*TCombobox*Listbox.selectForeground", c["ink"]),
+                                   ("*TCombobox*Listbox.font", font(10))):
+                self.root.option_add(pattern, value)
+            style.configure(".", font=font(10), background=c["page"], foreground=c["ink"],
+                            troughcolor=c["page"], focuscolor=c["primary"], selectbackground=c["primary_soft"],
+                            selectforeground=c["ink"], insertcolor=c["ink"])
+            style.configure("TFrame", background=c["page"])
+            style.configure("TLabel", background=c["page"], foreground=c["ink"])
+            style.configure("Muted.TLabel", foreground=c["muted"])
+            style.configure("Error.TLabel", foreground=c["error"])
+            style.configure("Heading.TLabel", font=font(20, "strong"), foreground=c["ink"])
+            style.configure("Section.TLabel", font=font(12, "strong"), foreground=c["ink"])
+            style.configure("Title.TLabel", font=font(15, "strong"), foreground=c["ink"])
+            style.configure("Rule.TFrame", background=c["line"])
+            # Tarjetas: superficie blanca con borde fino; sus hijos usan *.Card.* para no mostrar el fondo de página.
+            flat("Card.TFrame", c["surface"], c["line"], borderwidth=1, relief="solid")
+            style.configure("CardBody.TFrame", background=c["surface"])
+            style.configure("Card.TLabel", background=c["surface"], foreground=c["ink"])
+            style.configure("Muted.Card.TLabel", background=c["surface"], foreground=c["muted"], font=font(9))
+            style.configure("Error.Card.TLabel", background=c["surface"], foreground=c["error"])
+            style.configure("Rejected.Card.TLabel", background=c["surface"], foreground=c["rejected"])
+            style.configure("CardValue.TLabel", background=c["surface"], foreground=c["ink"], font=font(24, "figure"))
+            style.configure("CardCaption.TLabel", background=c["surface"], foreground=c["muted"], font=font(9))
+            for tone in ("sidebar", "primary", "pending", "rejected", "unknown"):
+                style.configure(f"{tone}.Stripe.TFrame", background=c[tone] if tone != "sidebar" else c["ink"])
+            style.configure("Header.TFrame", background=c["surface"])
+            style.configure("Header.TLabel", background=c["surface"], foreground=c["muted"], font=font(9))
+            style.configure("Dirty.Header.TLabel", background=c["surface"], foreground=c["pending"], font=font(9, "strong"))
+            style.configure("Status.TLabel", background=c["page"], foreground=c["muted"], font=font(9))
+            # Lateral
+            style.configure("Sidebar.TFrame", background=c["sidebar"])
+            style.configure("Brand.TLabel", background=c["sidebar"], foreground=c["sidebar_fg"], font=font(16, "figure"))
+            style.configure("SidebarCaption.TLabel", background=c["sidebar"], foreground=c["sidebar_muted"], font=font(9))
+            style.configure("NavGroup.TLabel", background=c["sidebar"], foreground=c["sidebar_muted"], font=font(9))
+            flat("Nav.TButton", c["sidebar"], foreground=c["sidebar_fg"], anchor="w", padding=(12, 7),
+                 font=font(10), relief="flat", focuscolor=c["sidebar"])
+            style.map("Nav.TButton", background=[("pressed", c["sidebar_hover"]), ("active", c["sidebar_hover"])],
+                      lightcolor=[("active", c["sidebar_hover"])], darkcolor=[("active", c["sidebar_hover"])],
+                      bordercolor=[("active", c["sidebar_hover"])], foreground=[("active", c["sidebar_fg"])])
+            # Activo: toma el color de la página y se une al contenido.
+            flat("Selected.Nav.TButton", c["page"], foreground=c["primary"], font=font(10, "strong"),
+                 focuscolor=c["page"])
+            style.map("Selected.Nav.TButton", background=[("active", c["page"]), ("pressed", c["page"])],
+                      lightcolor=[("active", c["page"])], darkcolor=[("active", c["page"])],
+                      bordercolor=[("active", c["page"])], foreground=[("active", c["primary"])])
+            flat("Burger.TButton", c["sidebar"], foreground=c["sidebar_fg"], padding=(8, 2), font=font(15),
+                 relief="flat", focuscolor=c["sidebar"])
+            style.map("Burger.TButton", background=[("active", c["sidebar_hover"])],
+                      lightcolor=[("active", c["sidebar_hover"])], darkcolor=[("active", c["sidebar_hover"])],
+                      bordercolor=[("active", c["sidebar_hover"])], foreground=[("active", c["sidebar_fg"])])
+            flat("SidebarGhost.TButton", c["sidebar"], c["sidebar_hover"], foreground=c["sidebar_muted"],
+                 padding=(10, 6), font=font(9), focuscolor=c["sidebar"])
+            style.map("SidebarGhost.TButton", background=[("active", c["sidebar_hover"])],
+                      lightcolor=[("active", c["sidebar_hover"])], darkcolor=[("active", c["sidebar_hover"])],
+                      foreground=[("active", c["sidebar_fg"])])
+            # Botones: secundarios con borde visible en ambos temas.
+            flat("TButton", c["surface"], c["line_strong"], foreground=c["ink"], padding=(12, 6), relief="solid", width=-6)
+            style.map("TButton", background=[("disabled", c["page"]), ("pressed", c["line"]), ("active", c["hover"])],
+                      lightcolor=[("disabled", c["page"]), ("pressed", c["line"]), ("active", c["hover"])],
+                      darkcolor=[("disabled", c["page"]), ("pressed", c["line"]), ("active", c["hover"])],
+                      bordercolor=[("disabled", c["line"]), ("active", c["primary"])],
+                      foreground=[("disabled", c["unknown"])])
+            flat("Accent.TButton", c["button"], foreground=c["on_primary"], padding=(14, 7), font=font(10, "strong"))
+            style.map("Accent.TButton", background=[("disabled", c["line"]), ("pressed", c["primary_pressed"]), ("active", c["primary_hover"])],
+                      lightcolor=[("pressed", c["primary_pressed"]), ("active", c["primary_hover"])],
+                      darkcolor=[("pressed", c["primary_pressed"]), ("active", c["primary_hover"])],
+                      bordercolor=[("pressed", c["primary_pressed"]), ("active", c["primary_hover"])],
+                      foreground=[("disabled", c["muted"]), ("active", c["on_primary"])])
+            flat("Danger.TButton", c["surface"], c["line_strong"], foreground=c["rejected"], padding=(12, 6))
+            style.map("Danger.TButton", background=[("disabled", c["page"]), ("active", c["hover"])],
+                      lightcolor=[("disabled", c["page"]), ("active", c["hover"])],
+                      darkcolor=[("disabled", c["page"]), ("active", c["hover"])],
+                      bordercolor=[("disabled", c["line"]), ("active", c["rejected"])],
+                      foreground=[("disabled", c["unknown"])])
+            # Campos con anillo de foco.
+            for name in ("TEntry", "TCombobox"):
+                style.configure(name, fieldbackground=c["field"], foreground=c["ink"], bordercolor=c["line_strong"],
+                                lightcolor=c["field"], darkcolor=c["field"], padding=(7, 5), arrowcolor=c["muted"],
+                                background=c["field"], insertcolor=c["ink"])
+                # Una entrada de solo lectura se distingue de una editable; una lista desplegable no.
+                readonly = c["page"] if name == "TEntry" else c["field"]
+                style.map(name, bordercolor=[("focus", c["primary"])], lightcolor=[("focus", c["primary"])],
+                          fieldbackground=[("disabled", c["page"]), ("readonly", readonly)],
+                          foreground=[("disabled", c["muted"]), ("readonly", c["ink"])],
+                          background=[("active", c["hover"]), ("pressed", c["line"])],
+                          arrowcolor=[("disabled", c["line_strong"]), ("active", c["primary"])],
+                          selectbackground=[("readonly", c["field"]), ("!focus", c["field"])],
+                          selectforeground=[("readonly", c["ink"]), ("!focus", c["ink"])])
+            # Barras de desplazamiento finas, sin flechas.
+            for orient, sticky in (("Vertical", "ns"), ("Horizontal", "ew")):
+                style.layout(f"{orient}.TScrollbar", [(f"{orient}.Scrollbar.trough", {"sticky": sticky, "children": [
+                    (f"{orient}.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})]})])
+                # Casi todas viven en tablas y tarjetas; la de la página usa el fondo de página.
+                flat(f"{orient}.TScrollbar", c["thumb"], troughcolor=c["surface"], gripcount=0,
+                     arrowsize=9, width=9, relief="flat", borderwidth=0)
+                style.configure(f"{orient}.TScrollbar", troughcolor=c["surface"], bordercolor=c["surface"])
+                style.map(f"{orient}.TScrollbar", background=[("active", c["thumb_active"]), ("pressed", c["thumb_active"])],
+                          lightcolor=[("active", c["thumb_active"])], darkcolor=[("active", c["thumb_active"])])
+            style.configure("Page.Vertical.TScrollbar", troughcolor=c["page"], bordercolor=c["page"])
+            # Pestañas planas.
+            style.configure("TNotebook", background=c["page"], bordercolor=c["line"], lightcolor=c["page"],
+                            darkcolor=c["page"], borderwidth=0, tabmargins=(0, 0, 0, 0))
+            flat("TNotebook.Tab", c["page"], c["line"], foreground=c["muted"], padding=(16, 8))
+            style.map("TNotebook.Tab", background=[("selected", c["surface"]), ("active", c["hover"])],
+                      lightcolor=[("selected", c["surface"]), ("active", c["hover"])],
+                      darkcolor=[("selected", c["surface"]), ("active", c["hover"])],
+                      foreground=[("selected", c["primary"]), ("active", c["ink"])],
+                      font=[("selected", font(10, "strong"))], padding=[("selected", (16, 8))],
+                      expand=[("selected", (0, 0, 0, 0))])
+            style.configure("TLabelframe", background=c["page"], bordercolor=c["line"], relief="solid")
+            style.configure("TLabelframe.Label", background=c["page"], foreground=c["ink"], font=font(10, "strong"))
+            style.configure("TSeparator", background=c["line"])
+            # Tablas: encabezados alineados a la izquierda, selección tenue.
+            flat("Treeview", c["surface"], c["line"], fieldbackground=c["surface"], foreground=c["ink"],
+                 rowheight=30, borderwidth=1)
+            style.map("Treeview", background=[("selected", c["primary_soft"])],
+                      foreground=[("selected", c["ink"])])
+            flat("Treeview.Heading", c["surface"], c["line"], foreground=c["muted"], relief="flat",
+                 padding=(8, 7), font=font(9, "strong"))
+            style.map("Treeview.Heading", background=[("active", c["hover"])],
+                      lightcolor=[("active", c["hover"])], darkcolor=[("active", c["hover"])])
             for menu in getattr(self, "_menus", ()):
-                menu.configure(background=colors["surface"], foreground=colors["ink"],
-                               activebackground=colors["hover"], activeforeground=colors["teal"],
-                               borderwidth=0)
+                menu.configure(background=c["surface"], foreground=c["ink"],
+                               activebackground=c["primary_soft"], activeforeground=c["ink"],
+                               borderwidth=0, font=font(10))
             self._restyle_widgets()
 
         def _toggle_theme(self) -> None:
@@ -2635,10 +3639,11 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
 
         def _restyle_widgets(self) -> None:
             colors = self.colors
-            for name in ("year_canvas", "type_canvas", "category_canvas", "validation_canvas"):
+            for name in ("year_canvas", "type_canvas", "validation_canvas", "rules_canvas",
+                         "dashboard_year_canvas", "dashboard_type_canvas"):
                 canvas = getattr(self, name, None)
                 if canvas is not None:
-                    canvas.configure(bg=colors["chart_bg"], highlightbackground=colors["chart_border"])
+                    canvas.configure(bg=colors["surface"])
             for name in ("stats_table",):
                 table = getattr(self, name, None)
                 if table is not None:
@@ -2647,10 +3652,14 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
                 tab.restyle()
             for tab in getattr(self, "relation_tabs", {}).values():
                 tab.restyle()
+            if hasattr(self, "dashboard_page"):
+                self.dashboard_page.scroll_canvas.configure(bg=colors["page"])
             if hasattr(self, "queue_table"):
                 self.queue_table.tag_configure("stripe", background=colors["stripe"])
             if hasattr(self, "current_stats"):
                 self._redraw_charts()
+            for detail in tuple(getattr(self, "details", ())):
+                detail.refresh()
 
         def _menu(self) -> None:
             menu = tk.Menu(self.root)
@@ -2681,133 +3690,243 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
                 f"Universidad Popular del Cesar\nMotor de datos: {self.backend_name}", parent=self.root))
             menu.add_cascade(label="Ayuda", menu=help_menu)
             self._menus = (menu, files, imports, edit, help_menu)
-            self.root.bind_all("<Control-z>", lambda _event: self.undo())
+            def shortcut(action: Callable[[], Any]) -> Callable[[Any], str]:
+                def invoke(_event: Any) -> str:
+                    action()
+                    return "break"
+                return invoke
+            self.root.bind("<Control-z>", shortcut(self.undo))
+            self.root.bind("<Control-s>", shortcut(self.save))
+            self.root.bind("<Control-Shift-S>", shortcut(self.save_as))
+            self.root.bind("<Control-n>", shortcut(self.new_workspace))
             self.root.config(menu=menu)
 
         def _build_dashboard(self) -> None:
-            ttk.Label(self.dashboard, text="Panorama de investigación", style="Heading.TLabel").pack(anchor="w")
-            filters = ttk.LabelFrame(self.dashboard, text="Filtros", padding=8)
-            filters.pack(fill="x", pady=8)
+            self.dashboard_page = ScrolledPage(self.dashboard)
+            self.dashboard_page.pack(fill="both", expand=True)
+            body = self.dashboard_page.body
+            ttk.Label(body, text="Panorama de investigación", style="Heading.TLabel").pack(anchor="w")
+            self.context = tk.StringVar()
+            self.context_label = ttk.Label(body, textvariable=self.context, style="Muted.TLabel", wraplength=700)
+            self.context_label.pack(fill="x", pady=(2, 14))
+            filters = ttk.Frame(body, style="Card.TFrame", padding=(12, 10, 12, 12))
+            filters.pack(fill="x", pady=(0, 14))
+            for col in range(3):
+                filters.columnconfigure(col, weight=1, uniform="filter")
             self.view = tk.StringVar(value="Todos")
             self.scope_id = tk.StringVar()
             self._scope_kind: str | None = None
             self.period = tk.StringVar(value="Todos")
             self.start_year = tk.StringVar()
             self.end_year = tk.StringVar()
-            self.category = tk.StringVar(value="Todas")
             self.validation = tk.StringVar(value="Todos")
-            ttk.Label(filters, text="Vista").grid(row=0, column=0, padx=4, pady=3)
-            view_box = ttk.Combobox(filters, textvariable=self.view, state="readonly", width=11,
-                                    values=("Todos", "Grupo", "Investigador", "Producto"))
-            view_box.grid(row=0, column=1, padx=4)
-            view_box.bind("<<ComboboxSelected>>", lambda _event: self._scope_changed())
-            ttk.Label(filters, text="ID").grid(row=0, column=2, padx=4)
-            self.scope_box = ttk.Combobox(filters, textvariable=self.scope_id, state="readonly", width=15)
-            self.scope_box.grid(row=0, column=3, padx=4)
-            self.scope_box.bind("<<ComboboxSelected>>", lambda _event: self.refresh_dashboard())
-            ttk.Label(filters, text="Ventana").grid(row=0, column=4, padx=4)
-            period_box = ttk.Combobox(filters, textvariable=self.period, state="readonly", width=14,
+
+            def field_box(col: int, row: int, label: str) -> ttk.Frame:
+                frame = ttk.Frame(filters, style="CardBody.TFrame")
+                frame.grid(row=row, column=col, sticky="ew", padx=6, pady=4)
+                ttk.Label(frame, text=label, style="Muted.Card.TLabel").pack(anchor="w", pady=(0, 3))
+                return frame
+
+            view_box = ttk.Combobox(field_box(0, 0, "Vista"), textvariable=self.view, state="readonly",
+                                    width=10, values=("Todos", "Grupo", "Investigador", "Producto"))
+            view_box.pack(fill="x")
+            view_box.bind("<<ComboboxSelected>>", lambda _e: self._scope_changed())
+            self.scope_box = ReferenceInput(field_box(1, 0, "Nombre / título"), self.repo, "grupos",
+                                            variable=self.scope_id, command=self.refresh_dashboard,
+                                            style="CardBody.TFrame")
+            self.scope_box.entry.configure(width=12)
+            self.scope_box.pack(fill="x")
+            period_box = ttk.Combobox(field_box(2, 0, "Ventana de observación"), textvariable=self.period,
+                                      state="readonly", width=12,
                                       values=("Todos", "Últimos 2 años", "Últimos 5 años", "Personalizado"))
-            period_box.grid(row=0, column=5, padx=4)
-            period_box.bind("<<ComboboxSelected>>", lambda _event: self.refresh_dashboard())
-            ttk.Label(filters, text="Desde").grid(row=1, column=0, padx=4)
-            ttk.Entry(filters, textvariable=self.start_year, width=10).grid(row=1, column=1, sticky="w", padx=4)
-            ttk.Label(filters, text="Hasta").grid(row=1, column=2, padx=4)
-            ttk.Entry(filters, textvariable=self.end_year, width=10).grid(row=1, column=3, sticky="w", padx=4)
-            ttk.Label(filters, text="Categoría").grid(row=1, column=4, padx=4)
-            self.category_box = ttk.Combobox(filters, textvariable=self.category, state="readonly", width=14)
-            self.category_box.grid(row=1, column=5, padx=4)
-            self.category_box.bind("<<ComboboxSelected>>", lambda _event: self.refresh_dashboard())
-            ttk.Label(filters, text="Validación").grid(row=2, column=0, padx=4, pady=3)
-            status_box = ttk.Combobox(filters, textvariable=self.validation, state="readonly", width=13,
-                                      values=("Todos", "pendiente", "validado", "rechazado"))
-            status_box.grid(row=2, column=1, padx=4)
-            status_box.bind("<<ComboboxSelected>>", lambda _event: self.refresh_dashboard())
+            period_box.pack(fill="x")
+            period_box.bind("<<ComboboxSelected>>", lambda _e: self.refresh_dashboard())
+            status_box = ttk.Combobox(field_box(0, 1, "Validación automática"), textvariable=self.validation,
+                                      state="readonly", width=12, values=("Todos", "Validado", "Rechazado"))
+            status_box.pack(fill="x")
+            status_box.bind("<<ComboboxSelected>>", lambda _e: self.refresh_dashboard())
+            years = field_box(1, 1, "Años: desde / hasta")
+            self.start_entry = ttk.Entry(years, textvariable=self.start_year, width=7)
+            self.start_entry.pack(side="left", fill="x", expand=True)
+            ttk.Label(years, text="a", style="Muted.Card.TLabel").pack(side="left", padx=6)
+            self.end_entry = ttk.Entry(years, textvariable=self.end_year, width=7)
+            self.end_entry.pack(side="left", fill="x", expand=True)
+            for variable in (self.start_year, self.end_year):
+                variable.trace_add("write", self._year_changed)
+            for entry in (self.start_entry, self.end_entry):
+                entry.bind("<Return>", lambda _e: self.refresh_dashboard())
+            self.filter_error = tk.StringVar()
+            self.filter_error_label = ttk.Label(filters, textvariable=self.filter_error, style="Error.Card.TLabel", wraplength=650)
+
+            cards = ttk.Frame(body)
+            cards.pack(fill="x", pady=(0, 8))
+            self.card_values = {}
+            # La franja superior usa el color de estado que repiten los gráficos.
+            for index, (key, title, tone) in enumerate((("total", "Productos", "sidebar"),
+                                                       ("validated", "Validados", "primary"),
+                                                       ("rejected", "Rechazados", "rejected"),
+                                                       ("undated", "Sin año", "unknown"))):
+                cards.columnconfigure(index, weight=1, uniform="cards")
+                frame = ttk.Frame(cards, style="Card.TFrame")
+                frame.grid(row=0, column=index, sticky="nsew", padx=(0, 10) if index < 3 else 0)
+                ttk.Frame(frame, style=f"{tone}.Stripe.TFrame", height=3).pack(fill="x")
+                inner = ttk.Frame(frame, style="CardBody.TFrame", padding=(14, 8, 14, 12))
+                inner.pack(fill="both", expand=True)
+                value = tk.StringVar(value="0")
+                self.card_values[key] = value
+                ttk.Label(inner, textvariable=value, style="CardValue.TLabel").pack(anchor="w")
+                ttk.Label(inner, text=title, style="CardCaption.TLabel").pack(anchor="w")
             self.metric = tk.StringVar()
-            ttk.Label(self.dashboard, textvariable=self.metric, style="Metric.TLabel").pack(anchor="w", pady=5)
-            self.note = tk.StringVar(value="Cada producto se cuenta una vez dentro de la vista y el filtro.")
-            ttk.Label(self.dashboard, textvariable=self.note).pack(anchor="w")
-            ttk.Label(self.dashboard, text="Productos de la vista").pack(anchor="w")
-            columns = ("id", "titulo", "anio", "tipologia", "categoria", "validacion")
-            table_frame = ttk.Frame(self.dashboard)
-            table_frame.pack(fill="both", expand=True)
-            self.stats_table = ttk.Treeview(table_frame, columns=columns, show="headings", height=6)
+            self.note = tk.StringVar()
+            ttk.Label(body, textvariable=self.metric, style="Muted.TLabel", wraplength=700).pack(fill="x")
+            self.note_label = ttk.Label(body, textvariable=self.note, style="Muted.TLabel", wraplength=700)
+            self.note_label.pack(fill="x", pady=(2, 14))
+            charts = ttk.Frame(body)
+            charts.pack(fill="x", pady=(0, 18))
+            charts.columnconfigure(0, weight=1, uniform="preview")
+            charts.columnconfigure(1, weight=1, uniform="preview")
+            year_panel, self.dashboard_year_canvas = self._chart_panel(charts, 210)
+            type_panel, self.dashboard_type_canvas = self._chart_panel(charts, 210)
+            year_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+            type_panel.grid(row=0, column=1, sticky="nsew")
+            table_heading = ttk.Frame(body)
+            table_heading.pack(fill="x", pady=(0, 6))
+            ttk.Label(table_heading, text="Productos de la vista", style="Section.TLabel").pack(side="left")
+            ttk.Button(table_heading, text="Ver todas las distribuciones", command=lambda: self._show_page("graphs")).pack(side="right")
+            columns = ("titulo", "anio", "tipologia", "validacion")
+            table_frame = ttk.Frame(body)
+            table_frame.pack(fill="x")
+            self.stats_table = ttk.Treeview(table_frame, columns=columns, show="headings", height=5, selectmode="browse")
             self.stats_table.tag_configure("stripe", background=self.colors["stripe"])
-            column_widths = {"id": 155, "titulo": 430, "anio": 80, "tipologia": 230,
-                             "categoria": 130, "validacion": 125}
+            column_widths = {"titulo": 360, "anio": 65, "tipologia": 200, "validacion": 100}
             for field in columns:
-                self.stats_table.heading(field, text=LABELS[field])
-                self.stats_table.column(field, width=column_widths[field], stretch=False)
-            x_scroll = ttk.Scrollbar(table_frame, orient="horizontal", command=self.stats_table.xview)
-            y_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.stats_table.yview)
+                self.stats_table.heading(field, anchor="w", text=LABELS[field])
+                self.stats_table.column(field, width=column_widths[field], minwidth=55)
+            x_scroll = AutoScrollbar(table_frame, orient="horizontal", command=self.stats_table.xview)
+            y_scroll = AutoScrollbar(table_frame, orient="vertical", command=self.stats_table.yview)
             self.stats_table.configure(xscrollcommand=x_scroll.set, yscrollcommand=y_scroll.set)
             self.stats_table.grid(row=0, column=0, sticky="nsew")
             y_scroll.grid(row=0, column=1, sticky="ns")
             x_scroll.grid(row=1, column=0, sticky="ew")
-            table_frame.rowconfigure(0, weight=1)
             table_frame.columnconfigure(0, weight=1)
-            self.stats_table.bind("<Double-1>", self._open_product)
-            stats_pager = ttk.Frame(self.dashboard)
-            stats_pager.pack(fill="x")
-            ttk.Button(stats_pager, text="Anterior", command=lambda: self._stats_move(-1)).pack(side="left")
+            self.stats_table.bind("<ButtonRelease-1>", self._open_product)
+            self.stats_table.bind("<Return>", self._open_product)
+            stats_pager = ttk.Frame(body)
+            stats_pager.pack(fill="x", pady=(8, 0))
+            self.stats_previous = ttk.Button(stats_pager, text="Anterior", command=lambda: self._stats_move(-1))
+            self.stats_previous.pack(side="left")
             self.stats_page_label = tk.StringVar()
             ttk.Label(stats_pager, textvariable=self.stats_page_label).pack(side="left", padx=10)
-            ttk.Button(stats_pager, text="Siguiente", command=lambda: self._stats_move(1)).pack(side="left")
+            self.stats_next = ttk.Button(stats_pager, text="Siguiente", command=lambda: self._stats_move(1))
+            self.stats_next.pack(side="left")
             self.stats_offset = 0
             self._stats_filter: tuple[Any, ...] | None = None
             self.current_stats: dict[str, Any] = {"por_anio": {}, "por_tipologia": {},
-                                                  "por_categoria": {}, "por_validacion": {}}
+                                                  "por_validacion": {}, "por_regla": {}}
+            body.bind("<Configure>", lambda event: self._dashboard_width(event.width), add="+")
+
+        def _dashboard_width(self, width: int) -> None:
+            for label in (self.context_label, self.note_label):
+                label.configure(wraplength=max(260, width - 28))
+
+        def _chart_panel(self, parent: tk.Misc, height: int = 240) -> tuple[ttk.Frame, tk.Canvas]:
+            panel = ttk.Frame(parent, style="Card.TFrame", padding=(6, 8, 4, 4))
+            panel.columnconfigure(0, weight=1)
+            panel.rowconfigure(0, weight=1)
+            canvas = tk.Canvas(panel, width=280, height=height, bg=self.colors["surface"],
+                               highlightthickness=0, borderwidth=0)
+            xscroll = AutoScrollbar(panel, orient="horizontal", command=canvas.xview)
+            yscroll = AutoScrollbar(panel, orient="vertical", command=canvas.yview)
+            canvas.configure(xscrollcommand=xscroll.set, yscrollcommand=yscroll.set)
+            canvas.grid(row=0, column=0, sticky="nsew")
+            yscroll.grid(row=0, column=1, sticky="ns")
+            xscroll.grid(row=1, column=0, sticky="ew")
+            canvas.bind("<Configure>", lambda _e: self._redraw_charts())
+            return panel, canvas
 
         def _build_graphs(self) -> None:
-            ttk.Label(self.graphs, text="Visualización de productos", style="Heading.TLabel").pack(anchor="w")
+            heading = ttk.Frame(self.graphs)
+            heading.pack(fill="x")
+            ttk.Label(heading, text="Distribuciones de productos", style="Heading.TLabel").pack(side="left")
+            ttk.Button(heading, text="Cambiar filtros en Dashboard", command=lambda: self._show_page("dashboard")).pack(side="right")
+            ttk.Label(self.graphs, textvariable=self.context, style="Muted.TLabel", wraplength=700).pack(
+                fill="x", pady=(2, 14))
             charts = ttk.Notebook(self.graphs)
-            charts.pack(fill="both", expand=True, pady=8)
-            self.year_canvas = tk.Canvas(charts, height=200, bg=self.colors["chart_bg"],
-                                         highlightthickness=1, highlightbackground=self.colors["chart_border"])
-            self.type_canvas = tk.Canvas(charts, height=240, bg=self.colors["chart_bg"],
-                                         highlightthickness=1, highlightbackground=self.colors["chart_border"])
-            self.category_canvas = tk.Canvas(charts, height=240, bg=self.colors["chart_bg"],
-                                             highlightthickness=1, highlightbackground=self.colors["chart_border"])
-            self.validation_canvas = tk.Canvas(charts, height=240, bg=self.colors["chart_bg"],
-                                               highlightthickness=1, highlightbackground=self.colors["chart_border"])
-            charts.add(self.year_canvas, text="Por año")
-            charts.add(self.type_canvas, text="Por tipología")
-            charts.add(self.category_canvas, text="Por categoría")
-            charts.add(self.validation_canvas, text="Por validación")
-            for canvas in (self.year_canvas, self.type_canvas, self.category_canvas, self.validation_canvas):
-                canvas.bind("<Configure>", lambda _event: self._redraw_charts())
+            charts.pack(fill="both", expand=True)
+            for name, title in (("year_canvas", "Por año · histograma"), ("type_canvas", "Por tipología"),
+                                ("validation_canvas", "Por validación"), ("rules_canvas", "Reglas incumplidas")):
+                panel, canvas = self._chart_panel(charts)
+                setattr(self, name, canvas)
+                charts.add(panel, text=title)
 
         def _build_queue(self) -> None:
-            controls = ttk.Frame(self.queue_tab)
-            controls.pack(fill="x")
-            for label, command in (("Encolar producto", self.enqueue), ("Procesar frente", self.process_queue),
-                                   ("Descartar frente", self.discard_queue)):
-                ttk.Button(controls, text=label, command=command).pack(side="left", padx=4)
+            heading = ttk.Frame(self.queue_tab)
+            heading.pack(fill="x")
+            ttk.Label(heading, text="Revisión de productos", style="Heading.TLabel").pack(side="left")
+            ttk.Button(heading, text="Añadir producto…", style="Accent.TButton", command=self.enqueue).pack(side="right")
+            ttk.Button(heading, text="Enviar rechazados", command=self.enqueue_rejected).pack(side="right", padx=6)
+            ttk.Label(self.queue_tab, text="La validación es automática. Los productos rechazados se revisan aquí en orden de llegada: "
+                      "corrija el producto o deje una nota que explique por qué no es posible.",
+                      style="Muted.TLabel", wraplength=680).pack(fill="x", pady=(2, 14))
+            # La siguiente revisión, destacada en una tarjeta con la franja de «pendiente».
+            front = ttk.Frame(self.queue_tab, style="Card.TFrame")
+            front.pack(fill="x")
+            ttk.Frame(front, style="pending.Stripe.TFrame", height=3).pack(fill="x")
+            front_body = ttk.Frame(front, style="CardBody.TFrame", padding=(14, 10, 14, 12))
+            front_body.pack(fill="x")
+            front_body.columnconfigure(0, weight=1)
             self.queue_count = tk.StringVar()
-            ttk.Label(controls, textvariable=self.queue_count).pack(side="right")
+            ttk.Label(front_body, textvariable=self.queue_count, style="Muted.Card.TLabel").grid(row=0, column=0, sticky="w")
+            self.queue_front_label = tk.StringVar()
+            self.queue_front_widget = ttk.Label(front_body, textvariable=self.queue_front_label, style="Card.TLabel",
+                                                font=font(11, "strong"), wraplength=560)
+            self.queue_front_widget.grid(row=1, column=0, sticky="ew", pady=(2, 10))
+            controls = ttk.Frame(front_body, style="CardBody.TFrame")
+            controls.grid(row=2, column=0, sticky="w")
+            self.review_button = ttk.Button(controls, text="Revisar siguiente", command=self.process_queue)
+            self.review_button.pack(side="left")
+            self.discard_button = ttk.Button(controls, text="Descartar siguiente", style="Danger.TButton",
+                                             command=self.discard_queue)
+            self.discard_button.pack(side="left", padx=6)
+            front_body.bind("<Configure>", lambda event: self.queue_front_widget.configure(wraplength=max(240, event.width - 30)))
+            ttk.Label(self.queue_tab, text="En cola", style="Section.TLabel").pack(anchor="w", pady=(18, 0))
             columns = ("id", "producto_id", "motivo", "creado")
             table_frame = ttk.Frame(self.queue_tab)
-            table_frame.pack(fill="both", expand=True, pady=8)
+            table_frame.pack(fill="both", expand=True, pady=(6, 0))
             table_frame.columnconfigure(0, weight=1)
             table_frame.rowconfigure(0, weight=1)
-            self.queue_table = ttk.Treeview(table_frame, columns=columns, show="headings")
+            # El ID del trabajo es interno (identifica la fila); no se muestra.
+            self.queue_table = ttk.Treeview(table_frame, columns=columns, show="headings",
+                                            displaycolumns=("producto_id", "motivo", "creado"))
             self.queue_table.tag_configure("stripe", background=self.colors["stripe"])
             for field in columns:
-                self.queue_table.heading(field, text=LABELS.get(field, field))
-                self.queue_table.column(field, width=160)
-            table_y = ttk.Scrollbar(table_frame, orient="vertical", command=self.queue_table.yview)
-            table_x = ttk.Scrollbar(table_frame, orient="horizontal", command=self.queue_table.xview)
+                self.queue_table.heading(field, anchor="w", text={"producto_id": "Producto", "creado": "Recibido", "motivo": "Motivo"}.get(field, LABELS.get(field, field)))
+                self.queue_table.column(field, width=340 if field == "producto_id" else 260 if field == "motivo" else 150)
+            table_y = AutoScrollbar(table_frame, orient="vertical", command=self.queue_table.yview)
+            table_x = AutoScrollbar(table_frame, orient="horizontal", command=self.queue_table.xview)
             self.queue_table.configure(yscrollcommand=table_y.set, xscrollcommand=table_x.set)
             self.queue_table.grid(row=0, column=0, sticky="nsew")
             table_y.grid(row=0, column=1, sticky="ns")
             table_x.grid(row=1, column=0, sticky="ew")
-            queue_pager = ttk.Frame(self.queue_tab)
-            queue_pager.pack(fill="x")
-            ttk.Button(queue_pager, text="Anterior", command=lambda: self._queue_move(-1)).pack(side="left")
+            self.queue_empty = ttk.Label(table_frame, text="No hay productos pendientes de revisión.", style="Muted.TLabel")
+            self.queue_table.bind("<Double-1>", lambda _e: self._open_queued_product())
+            self.queue_table.bind("<Return>", lambda _e: self._open_queued_product())
+            queue_pager = ttk.Frame(self.queue_tab, padding=(0, 10, 0, 0))
+            queue_pager.pack(side="bottom", fill="x", before=table_frame)
+            self.queue_previous = ttk.Button(queue_pager, text="Anterior", command=lambda: self._queue_move(-1))
+            self.queue_previous.pack(side="left")
             self.queue_page_label = tk.StringVar()
             ttk.Label(queue_pager, textvariable=self.queue_page_label).pack(side="left", padx=10)
-            ttk.Button(queue_pager, text="Siguiente", command=lambda: self._queue_move(1)).pack(side="left")
+            self.queue_next = ttk.Button(queue_pager, text="Siguiente", command=lambda: self._queue_move(1))
+            self.queue_next.pack(side="left")
             self.queue_offset = 0
+
+        def _open_queued_product(self) -> None:
+            selection = self.queue_table.selection()
+            if selection:
+                job = next((job for job in self.repo.queue_page(self.queue_offset, PAGE_SIZE)["rows"] if job["id"] == selection[0]), None)
+                if job:
+                    self.open_detail("productos", job["producto_id"])
 
         def _queue_move(self, direction: int) -> None:
             self.queue_offset = max(0, self.queue_offset + direction * PAGE_SIZE)
@@ -2821,40 +3940,56 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
             self.queue_table.delete(*self.queue_table.get_children())
             for index, job in enumerate(page["rows"]):
                 self.queue_table.insert("", "end", iid=job["id"],
-                                        values=tuple(job[name] for name in ("id", "producto_id", "motivo", "creado")),
+                                        values=(job["id"], self.reference_label("productos", job["producto_id"]), reason_text(job["motivo"], short=True), job["creado"].replace("T", " ")),
                                         tags=("stripe",) if index % 2 else ())
             self.queue_count.set(f"Pendientes: {page['total']}")
             self.queue_page_label.set(f"{self.queue_offset + 1 if page['total'] else 0}–{self.queue_offset + len(page['rows'])} de {page['total']}")
+            front = self.repo.queue_front()
+            self.queue_front_label.set("Siguiente: " + self.reference_label("productos", front["producto_id"]) if front
+                                       else "Cola vacía. Añada un producto para revisarlo.")
+            state = "normal" if front else "disabled"
+            self.review_button.configure(state=state)
+            self.discard_button.configure(state=state)
+            self.queue_previous.configure(state="normal" if self.queue_offset else "disabled")
+            self.queue_next.configure(state="normal" if self.queue_offset + PAGE_SIZE < page["total"] else "disabled")
+            if front:
+                self.queue_empty.place_forget()
+            else:
+                self.queue_empty.place(relx=0.5, rely=0.45, anchor="center")
 
-        def enqueue(self) -> None:
-            ids = [p["id"] for p in self.repo.page("productos", limit=20)["rows"]]
-            if not ids:
+        def enqueue(self, product_id: str | None = None, *, parent: tk.Misc | None = None) -> None:
+            parent = parent or self.root
+            if not self.repo.page("productos", limit=0)["total"]:
                 messagebox.showinfo("Sin productos", "Cree un producto primero", parent=self.root)
                 return
-            product_id = simpledialog.askstring("Encolar revisión", "ID de producto:\n" + ", ".join(ids[:20]), parent=self.root)
+            product_id = product_id or self.pick_record("productos", parent=parent)
             if not product_id:
                 return
-            reason = simpledialog.askstring("Motivo", "Motivo de la revisión:", parent=self.root)
+            reason = simpledialog.askstring("Motivo", "Motivo de la revisión:", parent=parent)
             if reason is None:
                 return
             self.mutate(lambda: self.repo.enqueue_review(product_id.strip(), reason))
+
+        def enqueue_rejected(self) -> None:
+            count = self.mutate(self.repo.enqueue_rejected)
+            if count == 0:
+                self.status.set("No hay productos rechazados fuera de la cola")
+            elif count:
+                self.status.set(f"{count} productos rechazados enviados a revisión. Guarde para conservarlos.")
 
         def process_queue(self) -> None:
             job = self.repo.queue_front()
             if not job:
                 messagebox.showinfo("Cola", "No hay revisiones pendientes", parent=self.root)
                 return
-            status = simpledialog.askstring("Procesar frente", f"Producto {job['producto_id']}\nEstado: validado, rechazado o pendiente", parent=self.root)
-            if status is None:
-                return
-            observation = simpledialog.askstring("Observación", "Razón o evidencia del resultado:", parent=self.root)
-            if observation is None:
-                return
-            self.mutate(lambda: self.repo.process_review(status.strip().lower(), observation))
+            dialog = ReviewDialog(self.root, self, job)
+            self.refresh()
+            if dialog.result:
+                self.status.set(f"Revisión cerrada; el producto quedó {dialog.result['validacion']}. Guarde para conservarlo.")
 
         def discard_queue(self) -> None:
             job = self.repo.queue_front()
-            if job and messagebox.askyesno("Descartar frente", f"¿Descartar revisión de {job['producto_id']}?", parent=self.root):
+            if job and messagebox.askyesno("Descartar siguiente", f"¿Descartar revisión de {self.reference_label('productos', job['producto_id'])}?", parent=self.root):
                 self.mutate(self.repo.discard_review)
 
         def _stats_move(self, direction: int) -> None:
@@ -2862,100 +3997,170 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
             self.refresh_dashboard()
 
         def _redraw_charts(self) -> None:
-            self._draw_bars(self.year_canvas, chart_values(self.current_stats.get("por_anio", {})),
-                            "Productos por año", "#2585a2")
-            self._draw_donut(self.type_canvas, chart_values(self.current_stats.get("por_tipologia", {})),
-                             "Productos por tipología")
-            self._draw_donut(self.category_canvas, chart_values(self.current_stats.get("por_categoria", {})),
-                             "Productos por categoría")
-            self._draw_donut(self.validation_canvas, chart_values(self.current_stats.get("por_validacion", {})),
-                             "Productos por validación")
+            stats = getattr(self, "current_stats", {})
+            filters = getattr(self, "_stats_filter", None)
+            bounds = (filters[2], filters[3]) if filters else (None, None)
+            for name in ("year_canvas", "dashboard_year_canvas"):
+                canvas = getattr(self, name, None)
+                if canvas is not None:
+                    self._draw_histogram(canvas, stats.get("por_anio", {}), bounds)
+            for name, field, title, limit in (
+                    ("type_canvas", "por_tipologia", "Productos por tipología", None),
+                    ("dashboard_type_canvas", "por_tipologia", "Tipologías más frecuentes", 5),
+                    ("validation_canvas", "por_validacion", "Validación automática", None)):
+                canvas = getattr(self, name, None)
+                if canvas is not None:
+                    self._draw_distribution(canvas, stats.get(field, {}), title, limit)
+            canvas = getattr(self, "rules_canvas", None)
+            if canvas is not None:
+                rules = {VALIDATION_RULES[code]: count for code, count in stats.get("por_regla", {}).items()}
+                self._draw_distribution(canvas, rules, "Reglas incumplidas",
+                                        base=stats.get("por_validacion", {}).get("rechazado", 0),
+                                        tone="rejected", empty="Todos los productos de la consulta cumplen las reglas")
 
-        def _draw_bars(self, canvas: tk.Canvas, values: dict[str, int], title: str, color: str) -> None:
+        def _draw_histogram(self, canvas: tk.Canvas, values: dict[str, int],
+                            bounds: tuple[int | None, int | None] = (None, None)) -> None:
+            c = self.colors
             canvas.delete("all")
-            width = max(canvas.winfo_width(), 300)
-            height = max(canvas.winfo_height(), 190)
-            canvas.create_text(12, 13, anchor="w", text=title, font=("TkDefaultFont", 10, "bold"),
-                               fill=self.colors["chart_title"])
-            if not values:
-                canvas.create_text(width / 2, height / 2, text="Sin valores registrados",
-                                   fill=self.colors["chart_empty"])
+            numeric = {int(key): value for key, value in values.items() if key.isdigit()}
+            missing = values.get("Sin dato", 0)
+            total = sum(values.values())
+            canvas.create_text(12, 14, anchor="w", text="Productos por año · histograma",
+                               font=font(10, "strong"), fill=c["ink"])
+            canvas.create_text(12, 34, anchor="w", text=f"{total} productos · {missing} sin año",
+                               font=font(9), fill=c["muted"])
+            height = max(170, canvas.winfo_height())
+            if not numeric:
+                canvas.create_text(12, 80, anchor="w", text="Sin años registrados" if total else "Sin productos para estos filtros",
+                                   font=font(10), fill=c["muted"])
+                canvas.configure(scrollregion=(0, 0, max(canvas.winfo_width(), 280), height))
                 return
-            if title == "Productos por año":
-                items = sorted(values.items(), key=lambda pair: pair[0])
-                if len(items) > 12:
-                    items = [("Antes", sum(value for _, value in items[:-11]))] + items[-11:]
-            else:
-                items = sorted(values.items(), key=lambda pair: (-pair[1], pair[0]))
-                if len(items) > 12:
-                    items = items[:11] + [("Otros", sum(value for _, value in items[11:]))]
-            maximum = max(value for _, value in items)
-            left, right, top, bottom = 38, width - 15, 35, height - 45
-            bar_space = (right - left) / len(items)
-            for index, (name, value) in enumerate(items):
-                x0 = left + index * bar_space + 4
-                x1 = left + (index + 1) * bar_space - 4
-                bar_height = (bottom - top) * value / maximum
-                canvas.create_rectangle(x0, bottom - bar_height, x1, bottom, fill=color, outline="")
-                canvas.create_text((x0 + x1) / 2, bottom - bar_height - 10, text=str(value),
-                                   fill=self.colors["chart_title"])
-                short_name = name if len(name) <= 11 else name[:10] + "…"
-                canvas.create_text((x0 + x1) / 2, bottom + 12, text=short_name, width=bar_space - 4,
-                                   font=("TkDefaultFont", 8), fill=self.colors["chart_title"])
-            canvas.create_line(left, bottom, right, bottom, fill=self.colors["chart_axis"])
+            first = bounds[0] if bounds[0] is not None else min(numeric)
+            last = bounds[1] if bounds[1] is not None else max(numeric)
+            cutoff = date.today().year - 20
+            bins = []
+            if first <= cutoff:
+                count = sum(value for year, value in numeric.items() if first <= year <= min(cutoff, last))
+                bins.append(("20 años\no más", count, f"older:{cutoff}"))
+            bins.extend((str(year), numeric.get(year, 0), f"year:{year}") for year in range(max(first, cutoff + 1), last + 1))
+            width = max(canvas.winfo_width(), 320)
+            left, right, top, bottom = 46, width - 14, 74, height - 40
+            canvas.create_text(12, 52, anchor="w", text=f"Columna clara: 20 años o más ({cutoff} y anteriores)"
+                               if bins[0][2].startswith("older:") else "Un año por columna",
+                               font=font(8), fill=c["muted"])
+            maximum = max(1, max(count for _, count, _ in bins))
+            for value in sorted({round(maximum * tick / 4) for tick in range(5)}):
+                y = bottom - (bottom - top) * value / maximum
+                if value:
+                    canvas.create_line(left, y, right, y, fill=c["chart_grid"])
+                canvas.create_text(left - 8, y, anchor="e", text=str(value),
+                                   font=font(8), fill=c["muted"])
+            step = (right - left) / len(bins)
+            # Con pocas columnas la barra no ocupa todo el ancho.
+            gap = max(min(3.0, step * 0.12), (step - 64) / 2)
+            label_every = max(1, math.ceil(34 / step))
+            for index, (label, count, tag) in enumerate(bins):
+                x0, x1 = left + index * step, left + (index + 1) * step
+                y = bottom - (bottom - top) * count / maximum
+                fill = c["chart_older"] if tag.startswith("older:") else c["primary"]
+                canvas.create_rectangle(x0 + gap, y, x1 - gap, bottom, fill=fill, outline="",
+                                        tags=("bin", tag, f"count:{count}"))
+                if count and (step >= 28 or tag.startswith("older:")):
+                    canvas.create_text((x0 + x1) / 2, y - 8, text=str(count),
+                                       font=font(8), fill=c["ink"])
+                if (index % label_every == 0 and (index == 0 or len(bins) - 1 - index >= label_every)) or index == len(bins) - 1:
+                    canvas.create_text((x0 + x1) / 2, bottom + 16, text=label,
+                                       font=font(8), fill=c["muted"])
+            canvas.create_line(left, bottom, right, bottom, fill=c["line_strong"])
+            canvas.configure(scrollregion=(0, 0, width, height))
+            signature = (tuple(sorted(numeric.items())), first, last)
+            if signature != getattr(canvas, "_hist_signature", None):
+                canvas.xview_moveto(0.0)
+                canvas._hist_signature = signature
 
-        def _draw_donut(self, canvas: tk.Canvas, values: dict[str, int], title: str) -> None:
+        def _draw_distribution(self, canvas: tk.Canvas, values: dict[str, int], title: str,
+                               limit: int | None = None, base: int | None = None, tone: str | None = None,
+                               empty: str = "Sin productos para estos filtros") -> None:
+            """Barras horizontales; base fija el denominador cuando las categorías se solapan."""
+            c = self.colors
             canvas.delete("all")
-            width = max(canvas.winfo_width(), 360)
-            height = max(canvas.winfo_height(), 240)
-            canvas.create_text(12, 13, anchor="w", text=title, font=("TkDefaultFont", 10, "bold"),
-                               fill=self.colors["chart_title"])
-            if not values:
-                canvas.create_text(width / 2, height / 2, text="Sin valores registrados",
-                                   fill=self.colors["chart_empty"])
+            width = max(canvas.winfo_width(), 320)
+            total = sum(values.values()) if base is None else base
+            canvas.create_text(12, 14, anchor="w", text=title, font=font(10, "strong"), fill=c["ink"])
+            canvas.create_text(12, 34, anchor="w", text=f"Base: {total} productos (incluye «Sin dato»)" if base is None
+                               else f"Base: {total} productos rechazados; un producto puede incumplir varias reglas",
+                               font=font(9), fill=c["muted"])
+            if not total or not any(values.values()):
+                canvas.create_text(12, 80, anchor="w", text=empty if base is not None or total else "Sin productos para estos filtros",
+                                   font=font(10), fill=c["muted"])
+                canvas.configure(scrollregion=(0, 0, width, max(160, canvas.winfo_height())))
                 return
-            items = sorted(values.items(), key=lambda pair: -pair[1])
-            if len(items) > 8:
-                items = items[:7] + [("Otros", sum(value for _, value in items[7:]))]
-            palette = ("#2585a2", "#087f79", "#d49544", "#b4556d", "#7a68b0",
-                       "#5b8f5a", "#c77d3c", "#8a9096")
-            total = sum(value for _, value in items)
-            cx = width * 0.28
-            cy = height / 2
-            radius = min(height * 0.40, width * 0.20)
-            thickness = radius * 0.46
-            start = 90.0
-            for index, (_, value) in enumerate(items):
-                extent = -360.0 * value / total
-                canvas.create_arc(cx - radius, cy - radius, cx + radius, cy + radius,
-                                  start=start, extent=extent, style="arc",
-                                  outline=palette[index % len(palette)], width=thickness)
-                start += extent
-            canvas.create_text(cx, cy - 10, text=str(total), font=("TkDefaultFont", 17, "bold"),
-                               fill=self.colors["chart_title"])
-            canvas.create_text(cx, cy + 11, text="productos", font=("TkDefaultFont", 9),
-                               fill=self.colors["chart_empty"])
-            legend_x = width * 0.52
-            legend_y = max(28, height / 2 - (len(items) - 1) * 13)
-            for index, (label, value) in enumerate(items):
-                y = legend_y + index * 27
-                pct = round(100 * value / total)
-                canvas.create_rectangle(legend_x, y - 6, legend_x + 13, y + 6,
-                                        fill=palette[index % len(palette)], outline="")
-                short = label if len(label) <= 24 else label[:23] + "…"
-                canvas.create_text(legend_x + 20, y, anchor="w", text=f"{short} · {pct}% ({value})",
-                                   font=("TkDefaultFont", 9), fill=self.colors["chart_title"])
+            items = sorted(((name, count) for name, count in values.items() if count),
+                           key=lambda item: (-item[1], item[0]))
+            if limit is not None and len(items) > limit:
+                known = [item for item in items if item[0] != "Sin dato"]
+                shown = known[:limit]
+                if len(known) > limit:
+                    shown.append(("Otras tipologías (agrupadas)", sum(count for _, count in known[limit:])))
+                if values.get("Sin dato"):
+                    shown.append(("Sin dato", values["Sin dato"]))
+                items = shown
+            max_count = max(count for _, count in items)
+            label_width = min(230, max(120, width * 0.38))
+            left, right = label_width + 26, width - 100
+            y = 58
+            for name, count in items:
+                label = canvas.create_text(12, y, anchor="nw", text=name[:1].upper() + name[1:], width=label_width,
+                                           font=font(9), fill=c["ink"])
+                bbox = canvas.bbox(label)
+                row_height = max(30, (bbox[3] - bbox[1]) + 12) if bbox else 30
+                bar_y = y + row_height / 2 - 8
+                # Los estados de validación conservan su color en todo el programa.
+                color = c[tone or STATUS_COLORS.get(name, "primary")]
+                canvas.create_rectangle(left, bar_y, right, bar_y + 10, fill=c["chart_track"], outline="")
+                canvas.create_rectangle(left, bar_y, left + max(2, (right - left) * count / max_count), bar_y + 10,
+                                        fill=color, outline="", tags=("bar", f"count:{count}"))
+                canvas.create_text(right + 10, bar_y + 5, anchor="w", text=f"{count} · {count / total:.1%}",
+                                   font=font(8), fill=c["muted"])
+                y += row_height
+            canvas.configure(scrollregion=(0, 0, width, max(y + 10, canvas.winfo_height())))
 
-        def _scope_changed(self) -> None:
+        def _scope_changed(self, selected: str | None = None) -> None:
             kind = {"Grupo": "grupos", "Investigador": "investigadores", "Producto": "productos"}.get(self.view.get())
-            choices = [row["id"] for row in self.repo.page(kind)["rows"]] if kind else []
-            self.scope_box.configure(values=choices, state="normal" if kind else "disabled")
-            if kind != self._scope_kind or (kind and not self.scope_id.get()):
-                self.scope_id.set(choices[0] if kind and choices else "")
+            self.scope_box.repo = self.repo
+            self.scope_box.kind = kind or "grupos"
+            self.scope_box.set_enabled(bool(kind))
+            if selected is not None and kind and self.repo.get(kind, selected):
+                self.scope_id.set(selected)
+            elif kind != self._scope_kind or (kind and not self.repo.get(kind, self.scope_id.get())):
+                rows = self.repo.page(kind, limit=1)["rows"] if kind else []
+                self.scope_id.set(rows[0]["id"] if rows else "")
+            else:
+                self.scope_box._update_label()
             self._scope_kind = kind
             self.refresh_dashboard()
 
+        def _year_changed(self, *_: Any) -> None:
+            if self._year_timer:
+                self.root.after_cancel(self._year_timer)
+            if self.period.get() == "Personalizado":
+                self._year_timer = self.root.after(350, self.refresh_dashboard)
+
+        def clear_filters(self) -> None:
+            self.period.set("Todos")
+            self.start_year.set("")
+            self.end_year.set("")
+            self.validation.set("Todos")
+            self.view.set("Todos")
+            self._scope_changed()
+
         def refresh_dashboard(self) -> None:
+            if self._year_timer:
+                self.root.after_cancel(self._year_timer)
+                self._year_timer = None
+            custom = self.period.get() == "Personalizado"
+            for entry in (self.start_entry, self.end_entry):
+                entry.configure(state="normal" if custom else "disabled")
             try:
                 start = end = None
                 period = self.period.get()
@@ -2969,9 +4174,8 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
                         raise DataError("El año inicial supera al final")
                     if any(value is not None and not 1900 <= value <= date.today().year + 1 for value in (start, end)):
                         raise DataError("Año fuera de rango")
-                category = "" if self.category.get() == "Todas" else self.category.get()
-                status = "" if self.validation.get() == "Todos" else self.validation.get()
-                filters = (self.view.get(), self.scope_id.get(), start, end, category, status)
+                status = "" if self.validation.get() == "Todos" else self.validation.get().lower()
+                filters = (self.view.get(), self.scope_id.get(), start, end, status)
                 if filters != self._stats_filter:
                     self.stats_offset = 0
                     self._stats_filter = filters
@@ -2980,52 +4184,75 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
                     self.stats_offset = max(0, (result["total"] - 1) // PAGE_SIZE * PAGE_SIZE)
                     result = self.repo.statistics(*filters, offset=self.stats_offset, limit=PAGE_SIZE)
             except (ValueError, DataError) as exc:
+                self.filter_error.set(f"Filtro inválido: {exc}. Se conservan los últimos resultados válidos.")
+                self.filter_error_label.grid(row=2, column=0, columnspan=3, sticky="ew", padx=5)
                 self.status.set(f"Filtro inválido: {exc}")
                 return
+            self.filter_error.set("")
+            self.filter_error_label.grid_remove()
             self.current_stats = result
             active_groups = self.overview["active_groups"]
             active_people = self.overview["active_people"]
-            self.metric.set(f"{result['total']} productos únicos  •  {active_groups} grupos habilitados  •  {active_people} perfiles habilitados")
+            scope = self.scope_box.label.get() if self.view.get() != "Todos" else "Toda la institución"
+            window = f"{start or 'sin inicio'}–{end or 'sin fin'}" if start is not None or end is not None else "Todos los años"
+            self.context.set(f"{self.view.get()}: {scope} · {window} · Validación: {status or 'todas'}")
+            self.card_values["total"].set(f"{result['total']:,}".replace(",", "."))
+            for key, field, value in (("validated", "por_validacion", "validado"),
+                                       ("rejected", "por_validacion", "rechazado"),
+                                       ("undated", "por_anio", "Sin dato")):
+                self.card_values[key].set(f"{result[field].get(value, 0):,}".replace(",", "."))
+            self.metric.set(f"Institución: {active_groups} grupos activos · {active_people} investigadores activos. Cada producto se cuenta una vez.")
             if result["total"]:
                 missing = [f"{label}: {result[field].get('Sin dato', 0)} sin dato"
-                           for label, field in (("Año", "por_anio"), ("Tipología", "por_tipologia"),
-                                                ("Categoría", "por_categoria"))
+                           for label, field in (("Año", "por_anio"), ("Tipología", "por_tipologia"))
                            if result[field].get("Sin dato", 0)]
-                states = ", ".join(f"{key} {value}" for key, value in result["por_validacion"].items())
-                self.note.set("Estados: " + states + ("   •   " + "   •   ".join(missing) if missing else ""))
+                rules = sorted(result["por_regla"].items(), key=lambda item: -item[1])
+                causes = ", ".join(f"{VALIDATION_RULES[code].lower()} ({count})" for code, count in rules)
+                self.note.set("Rechazos por: " + causes + (" · " + " · ".join(missing) if missing else "")
+                              if causes else "Todos los productos cumplen las reglas de validación"
+                              + (" · " + " · ".join(missing) if missing else ""))
             else:
                 self.note.set("Sin productos para estos filtros")
             self.stats_table.delete(*self.stats_table.get_children())
             for index, row in enumerate(result["productos"]):
                 self.stats_table.insert("", "end", iid=row["id"],
-                                        values=tuple(row[field] for field in ("id", "titulo", "anio", "tipologia", "categoria", "validacion")),
+                                        values=tuple(display_value(field, row[field]) for field in self.stats_table["columns"]),
                                         tags=("stripe",) if index % 2 else ())
             self.stats_page_label.set(f"{self.stats_offset + 1 if result['total'] else 0}–{self.stats_offset + len(result['productos'])} de {result['total']}")
+            self.stats_previous.configure(state="normal" if self.stats_offset else "disabled")
+            self.stats_next.configure(state="normal" if self.stats_offset + PAGE_SIZE < result["total"] else "disabled")
             self._redraw_charts()
 
         def _open_product(self, _event: tk.Event) -> None:
+            if getattr(_event, "num", None) == 1 and not self.stats_table.identify_row(_event.y):
+                return
             selection = self.stats_table.selection()
             if selection:
-                self._show_page("productos")
-                self.entity_tabs["productos"].search.set(selection[0])
-                self.entity_tabs["productos"].refresh()
-                self.entity_tabs["productos"].table.selection_set(selection[0])
-                self.entity_tabs["productos"].table.see(selection[0])
-                self.entity_tabs["productos"].open_detail()
+                self.open_detail("productos", selection[0])
+
+        def usage(self, kind: str) -> dict[str, int]:
+            if kind not in self._usage_cache:
+                self._usage_cache[kind] = self.repo.field_usage(kind)
+            return self._usage_cache[kind]
 
         def refresh(self) -> None:
+            self._record_cache.clear()
+            self._usage_cache.clear()
             for tab in self.entity_tabs.values():
                 tab.refresh()
             for tab in self.relation_tabs.values():
                 tab.refresh()
             self.refresh_queue()
             self.overview = self.repo.summary()
-            categories = ["Todas"] + sorted(name for name in self.overview["categories"] if name != "Sin dato")
-            self.category_box.configure(values=categories)
-            if self.category.get() not in categories:
-                self.category.set("Todas")
             self._scope_changed()
             self.root.title("PEA-i UPC — Investigación" + (" *" if self.repo.dirty else ""))
+            self.workspace.set(f"{self.workspace_caption} · "
+                               + ("Cambios sin guardar" if self.repo.dirty else "Sin cambios pendientes"))
+            self.workspace_label.configure(style="Dirty.Header.TLabel" if self.repo.dirty else "Header.TLabel")
+            self.save_button.configure(text="Guardar copia" if self.data_dir is None else "Guardar")
+            for detail in tuple(self.details):
+                if detail.winfo_exists():
+                    detail.refresh()
 
         def mutate(self, action: Callable[[], Any]) -> Any:
             try:
@@ -3036,6 +4263,96 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
             self.refresh()
             self.status.set("Cambio en memoria. Guarde para conservarlo al cerrar.")
             return result
+
+        def pick_record(self, kind: str, current: str = "", parent: tk.Misc | None = None) -> str | None:
+            return RecordPicker(parent or self.root, self.repo, kind, current).result
+
+        def record(self, kind: str, key: str) -> dict[str, str]:
+            cache_key = (kind, key)
+            if cache_key not in self._record_cache:
+                self._record_cache[cache_key] = self.repo.get(kind, key) or {"id": key, "activo": "0"}
+            return self._record_cache[cache_key]
+
+        def open_detail(self, kind: str, key: str, parent: tk.Misc | None = None) -> DetailDialog | None:
+            if self.repo.get(kind, key) is None:
+                self.status.set("Este registro ya no existe")
+                return None
+            return DetailDialog(parent or self.root, self, kind, key)
+
+        def reference_label(self, kind: str, key: str) -> str:
+            row = self.record(kind, key)
+            return f"{record_name(row)} · {key}"
+
+        def entity_page(self, kind: str, offset: int, query: str, state: str) -> dict[str, Any]:
+            if state == "Todos":
+                return self.repo.page(kind, offset, PAGE_SIZE, query)
+            active = "1" if state == "Activos" else "0"
+            total = position = 0
+            rows = []
+            while True:
+                page = self.repo.page(kind, position, PAGE_SIZE, query)
+                for row in page["rows"]:
+                    if row["activo"] != active:
+                        continue
+                    if offset <= total < offset + PAGE_SIZE:
+                        rows.append(row)
+                    total += 1
+                position += len(page["rows"])
+                if not page["rows"] or position >= page["total"]:
+                    break
+            return {"total": total, "rows": rows}
+
+        def relationship_page(self, kind: str, offset: int, query: str) -> dict[str, Any]:
+            needle = query.strip().casefold()
+            if not needle:
+                return self.repo.page(kind, offset, PAGE_SIZE)
+            ends = RELATION_ENDS[kind]
+            matching_ids = []
+            for entity_kind in ends[2:]:
+                ids = set()
+                position = 0
+                while True:
+                    page = self.repo.page(entity_kind, position, PAGE_SIZE, query)
+                    for row in page["rows"]:
+                        ids.add(row["id"])
+                        self._record_cache[(entity_kind, row["id"])] = row
+                    position += len(page["rows"])
+                    if not page["rows"] or position >= page["total"]:
+                        break
+                matching_ids.append(ids)
+            total = 0
+            rows = []
+            position = 0
+            while True:
+                page = self.repo.page(kind, position, PAGE_SIZE)
+                for row in page["rows"]:
+                    if (row[ends[0]] not in matching_ids[0] and row[ends[1]] not in matching_ids[1]
+                            and needle not in " ".join(row.values()).casefold()):
+                        continue
+                    if offset <= total < offset + PAGE_SIZE:
+                        rows.append(row)
+                    total += 1
+                position += len(page["rows"])
+                if not page["rows"] or position >= page["total"]:
+                    break
+            return {"total": total, "rows": rows}
+
+        def edit_record(self, kind: str, key: str | tuple[str, str] | None = None,
+                        defaults: dict[str, str] | None = None, parent: tk.Misc | None = None,
+                        external: bool = False, locked_fields: tuple[str, ...] = ()) -> bool:
+            initial = self.repo.get(kind, key) if key is not None else defaults
+            if key is not None and defaults:
+                initial = {**(initial or {}), **defaults}
+            on_save = (lambda row: self.repo.update(kind, key, row)) if key is not None else (
+                lambda row: self.repo.create(kind, row))
+            dialog = RecordDialog(parent or self.root, kind, initial, repo=self.repo, on_save=on_save,
+                                  suggested_id=self.repo.suggest_id(kind) if kind in ENTITY_FIELDS else "",
+                                  external=external, is_new=key is None, locked_fields=locked_fields)
+            if dialog.result is None:
+                return False
+            self.refresh()
+            self.status.set("Cambio en memoria. Guarde para conservarlo al cerrar.")
+            return True
 
         def _may_discard(self) -> bool:
             if not self.repo.dirty:
@@ -3060,6 +4377,7 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
                 else:
                     self.repo = Repository()
                 self.data_dir = None
+                self.workspace_caption = "Espacio vacío"
                 self.refresh()
                 self.status.set("Espacio vacío. Guarde en una carpeta antes de salir.")
 
@@ -3091,6 +4409,7 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
             data_root = Path(__file__).resolve().parents[2] / "data"
             demo = demo or directory.resolve() == (data_root / "real").resolve()
             self.data_dir = None if demo or recovered else directory
+            self.workspace_caption = "Muestra pública UPC" if demo else "Copia recuperada" if recovered else directory.name
             self.refresh()
             self.status.set(f"Datos cargados de {directory}" + (" (guardar como copia)" if demo or recovered else ""))
 
@@ -3133,9 +4452,12 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
                 if not messagebox.askyesno("Reemplazar datos", "La carpeta ya contiene datos PEA-i. ¿Reemplazarlos?", parent=self.root):
                     return False
             previous = self.data_dir
+            previous_caption = self.workspace_caption
             self.data_dir = chosen
+            self.workspace_caption = chosen.name
             if not self.save():
                 self.data_dir = previous
+                self.workspace_caption = previous_caption
                 return False
             return True
 
@@ -3187,14 +4509,17 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
             self.import_csv_path(path)
 
         def import_csv_path(self, path: Path) -> None:
-            kinds = ", ".join(ALL_FIELDS)
-            kind = simpledialog.askstring("Tipo de datos", f"Nombre del tipo CSV:\n{kinds}",
-                                          initialvalue=path.stem, parent=self.root)
-            if not kind:
+            try:
+                with path.open(encoding="utf-8-sig", newline="") as stream:
+                    header = next(csv.reader(stream), [])
+            except (OSError, UnicodeError, csv.Error) as exc:
+                messagebox.showerror("CSV inválido", str(exc), parent=self.root)
                 return
-            kind = kind.strip()
-            if kind not in ALL_FIELDS:
-                messagebox.showerror("Tipo desconocido", kinds, parent=self.root)
+            default = next((kind for kind, fields in ALL_FIELDS.items() if tuple(header) == fields), path.stem)
+            options = {TITLES[kind]: kind for kind in ALL_FIELDS}
+            dialog = ChoiceDialog(self.root, "Importar datos", f"Archivo: {path.name}\nSeleccione el contenido. Los encabezados deben coincidir con el esquema PEA-i.", options, default)
+            kind = dialog.result
+            if not kind:
                 return
             try:
                 if isinstance(self.repo, CppRepository):
@@ -3218,6 +4543,7 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
                 messagebox.showerror("No se pudo importar", str(exc), parent=self.root)
                 return
             self.refresh()
+            self.status.set(f"Importación: {accepted} filas aceptadas; {total - accepted} rechazadas. Guarde para conservarlas.")
             messagebox.showinfo("Resultado de importación", f"Aceptadas: {accepted}\nRechazadas: {total - accepted}\n\n" + "\n".join(errors[:20]), parent=self.root)
 
         def _accept_external(self, kind: str, row: dict[str, str]) -> None:
@@ -3225,12 +4551,8 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
             initial = {**existing, **{key: value for key, value in row.items() if value}} if existing else row
             if existing and existing.get("fuente") and row.get("fuente") and row["fuente"] not in existing["fuente"]:
                 initial["fuente"] = existing["fuente"] + "; " + row["fuente"]
-            dialog = RecordDialog(self.root, kind, initial, external=existing is None)
-            if dialog.result:
-                if existing:
-                    self.mutate(lambda: self.repo.update(kind, existing["id"], dialog.result))
-                else:
-                    self.mutate(lambda: self.repo.create(kind, dialog.result))
+            self.edit_record(kind, key=existing["id"] if existing else None, defaults=initial,
+                             external=existing is None)
 
         def import_url(self, initial_url: str | None = None) -> None:
             if self._url_busy:
@@ -3294,14 +4616,14 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
                          f" y {len(preview.related_authorships)} autorías coincidentes con el censo")
                 if preview.related_plan:
                     note += "; plan estratégico"
-            note += ". Los gráficos usan productos guardados y solo campos con valores."
+            note += ". Los gráficos usan productos guardados e incluyen los campos desconocidos como «Sin dato»."
             ttk.Label(dialog, text=note, wraplength=780, padding=(12, 4)).grid(row=3, column=0, sticky="w")
             body = ttk.Frame(dialog, padding=(12, 4))
             body.grid(row=4, column=0, sticky="nsew")
             body.columnconfigure(0, weight=1)
             body.rowconfigure(0, weight=1)
             shown = tk.Text(body, wrap="word", state="normal")
-            scroll = ttk.Scrollbar(body, orient="vertical", command=shown.yview)
+            scroll = AutoScrollbar(body, orient="vertical", command=shown.yview)
             shown.configure(yscrollcommand=scroll.set)
             shown.grid(row=0, column=0, sticky="nsew")
             scroll.grid(row=0, column=1, sticky="ns")
@@ -3339,7 +4661,7 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
                     return
                 reviewed = None
                 if self.repo.get("grupos", proposed["id"]) is None:
-                    review = RecordDialog(self.root, "grupos", proposed, external=True)
+                    review = RecordDialog(self.root, "grupos", proposed, external=True, repo=self.repo)
                     if not review.result:
                         return
                     reviewed = review.result
@@ -3409,12 +4731,20 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
             preview = parse_web_page(html, path.resolve().as_uri(), "HTML")
             self._show_web_preview(preview, source=f"DOCX {path.name}, consultado {date.today().isoformat()}")
 
+    return App(root, data_dir, repository)
+
+
+def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
+            cpp_binary: Path | None = None) -> None:
+    import tkinter as tk
+    from tkinter import messagebox
+
     root = tk.Tk()
     repository: Repository | CppRepository | None = None
     try:
         repository, fallback_reason = open_gui_repository(
             python_backend=python_backend, cpp_binary=cpp_binary)
-        app = App(root, data_dir, repository)
+        app = build_gui(root, repository, data_dir)
         if fallback_reason:
             app.status.set(f"Motor Python activo: {fallback_reason}")
         root.mainloop()
