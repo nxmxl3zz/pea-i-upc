@@ -1,4 +1,4 @@
-"""Rebuild data/real from the two public Scienti URLs in the assignment.
+"""Build a one-group sample file from the two public Scienti URLs in the assignment.
 
 For repeatable offline review, pass --group-html and --researcher-html with
 previously downloaded HTML files from those exact URLs.
@@ -31,7 +31,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Crear muestra UPC desde fichas públicas de Scienti")
     parser.add_argument("--group-html", type=Path, help="HTML GrupLAC ya descargado")
     parser.add_argument("--researcher-html", type=Path, help="HTML CvLAC ya descargado")
-    parser.add_argument("--output", type=Path, default=ROOT / "data" / "sample_scienti", help="Carpeta CSV de salida")
+    parser.add_argument("--output", type=Path, default=ROOT / "data" / "sample_scienti.csv", help="Archivo de datos de salida")
     args = parser.parse_args()
     group_page = preview(GROUP_URL, args.group_html)
     researcher_page = preview(RESEARCHER_URL, args.researcher_html)

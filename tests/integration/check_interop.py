@@ -21,11 +21,11 @@ def main() -> None:
     if not binary.is_file():
         raise SystemExit(f"No existe el ejecutable: {binary}")
     with tempfile.TemporaryDirectory(prefix="pea-interop-") as folder:
-        path = Path(folder)
+        path = Path(folder) / "datos.csv"
         subprocess.run([sys.executable, str(ROOT / "scripts/build_demo.py"),
                         "--output", str(path)], check=True, capture_output=True, text=True)
         first = subprocess.run(
-            [str(binary), "--data-dir", str(path)],
+            [str(binary), "--data", str(path)],
             input="8\n3\nVerificado por C++\n0\n11\n0\n",
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             cwd=ROOT, timeout=20, check=True,
@@ -44,7 +44,7 @@ def main() -> None:
         python_repo.update("productos", "P-DEMO-1", {"observacion": "Nueva razón en Python"})
         pea.save_repository(python_repo, path)
         second = subprocess.run(
-            [str(binary), "--data-dir", str(path)],
+            [str(binary), "--data", str(path)],
             input="9\n11\n0\n",
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             cwd=ROOT, timeout=20, check=True,
@@ -56,7 +56,7 @@ def main() -> None:
         assert after.history.length == 1
 
         third = subprocess.run(
-            [str(binary), "--data-dir", str(path)],
+            [str(binary), "--data", str(path)],
             input="9\n11\n0\n",
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             cwd=ROOT, timeout=20, check=True,
@@ -67,7 +67,7 @@ def main() -> None:
         assert restored.queue.peek()["producto_id"] == "P-DEMO-2"
         assert restored.queue.length == 2
         fourth = subprocess.run(
-            [str(binary), "--data-dir", str(path)],
+            [str(binary), "--data", str(path)],
             input="8\n5\n0\n11\n0\n",
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             cwd=ROOT, timeout=20, check=True,
@@ -75,7 +75,7 @@ def main() -> None:
         assert "Encolados: 1" in fourth.stdout
         queued = pea.load_repository(path)
         assert [job["motivo"] for job in queued.queue][-1] == "reglas:fuente"
-    print("Interoperabilidad C++/Python correcta: CSV, validación, cola e historial.")
+    print("Interoperabilidad C++/Python correcta: archivo único, validación, cola e historial.")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
-"""Regresiones de flujos Tkinter. Requieren DISPLAY; no alteran data/real."""
+"""Regresiones de flujos Tkinter. Requieren DISPLAY; no alteran data/."""
 
+import csv
 import importlib.util
 import os
 from pathlib import Path
@@ -14,6 +15,17 @@ SOURCE = Path(__file__).resolve().parents[2] / "src/python/Taller2_REMR.py"
 SPEC = importlib.util.spec_from_file_location("pea_gui_tests", SOURCE)
 pea = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(pea)
+
+
+def write_legacy_folder(path: Path, groups: list[dict[str, str]]) -> None:
+    """Carpeta de la versión 3 (un CSV por tabla), anterior al archivo único."""
+    path.mkdir()
+    for name, fields in pea.DATA_SECTIONS.items():
+        rows = {"manifest": [{"version": "3", "guardado": "2026-09-24T00:00:00"}], "grupos": groups}.get(name, [])
+        with (path / f"{name}.csv").open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fields, lineterminator="\n")
+            writer.writeheader()
+            writer.writerows(rows)
 
 
 class GuiTest(unittest.TestCase):
@@ -251,11 +263,16 @@ class GuiTest(unittest.TestCase):
         self.context_sample()
         self.repo.enqueue_review("P-old", "Verificar fuente")
         with tempfile.TemporaryDirectory() as folder:
-            with patch("tkinter.filedialog.askdirectory", return_value=folder):
+            path = Path(folder) / "datos.csv"
+            with patch("tkinter.filedialog.asksaveasfilename", return_value=str(path)):
                 self.assertTrue(self.app.save())
             self.assertFalse(self.app.repo.dirty)
+            self.assertEqual(self.app.data_file, path)
+            self.assertEqual(self.app.save_button.cget("text"), "Guardar")
             self.app.repo.update("productos", "P-old", {"titulo": "Cambio sin guardar"})
-            self.app._load(Path(folder))
+            self.app._load(path)
+            self.assertEqual(self.app.data_file, path)
+            self.assertIn("datos.csv", self.app.workspace.get())
             self.assertEqual(self.app.repo.get("productos", "P-old")["titulo"], "Antes")
             self.assertIsNotNone(self.app.repo.get("autorias", ("P-old", "I1")))
             self.assertEqual(self.app.repo.queue_front()["producto_id"], "P-old")
@@ -303,6 +320,59 @@ class GuiTest(unittest.TestCase):
                 self.app.import_csv_path(path)
             self.assertEqual(selected, ["Grupos"])
             self.assertEqual(self.repo.get("grupos", "G-import")["nombre"], "Grupo importado")
+
+    def test_csv_import_is_saved_to_open_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            data = Path(folder) / "datos.csv"
+            with patch("tkinter.filedialog.asksaveasfilename", return_value=str(data)):
+                self.assertTrue(self.app.save())
+            source = Path(folder) / "archivo.csv"
+            row = pea.clean_row("grupos", {"id": "G-import", "nombre": "Grupo importado"})
+            pea._csv_write(source, pea.ENTITY_FIELDS["grupos"], [row])
+            self.root.after(30, lambda: self.dialog().accept())
+            with patch("tkinter.messagebox.askyesno", return_value=True), patch("tkinter.messagebox.showinfo"):
+                self.app.import_csv_path(source)
+            self.assertFalse(self.app.repo.dirty)
+            self.assertIn("datos.csv", self.app.status.get())
+            self.assertEqual(pea.load_repository(data).get("grupos", "G-import")["nombre"], "Grupo importado")
+
+    def test_import_without_file_stays_pending(self):
+        self.assertIsNone(self.app.data_file)
+        self.repo.create("grupos", {"id": "G-import", "nombre": "Grupo importado"})
+        with patch("tkinter.filedialog.asksaveasfilename") as dialog:
+            self.app._keep_import("Importación lista.")
+        dialog.assert_not_called()
+        self.assertTrue(self.app.repo.dirty)
+        self.assertIn("Guarde", self.app.status.get())
+
+    def test_legacy_folder_save_asks_for_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp) / "anterior"
+            write_legacy_folder(folder, [{"id": "G-OLD", "nombre": "Grupo anterior"}])
+            self.app._load(folder / "manifest.csv")
+            self.assertIsNone(self.app.data_file)
+            self.assertEqual(self.app.repo.get("grupos", "G-OLD")["nombre"], "Grupo anterior")
+            before = sorted(item.name for item in folder.iterdir())
+            target = Path(temp) / "convertido.csv"
+            with patch("tkinter.filedialog.asksaveasfilename", return_value=str(target)) as dialog:
+                self.assertTrue(self.app.save())
+            dialog.assert_called_once()
+            self.assertEqual(sorted(item.name for item in folder.iterdir()), before)
+            self.assertEqual(self.app.data_file, target)
+            self.assertIsNotNone(pea.load_repository(target).get("grupos", "G-OLD"))
+
+    def test_corrupt_file_offers_previous_save(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "datos.csv"
+            with patch("tkinter.filedialog.asksaveasfilename", return_value=str(path)):
+                self.assertTrue(self.app.save())
+            self.repo.update("productos", "P-old", {"titulo": "Segunda versión"})
+            self.assertTrue(self.app.save())
+            path.write_text("archivo dañado", encoding="utf-8")
+            with patch("tkinter.messagebox.askyesno", return_value=True):
+                self.app._load(path)
+            self.assertIsNone(self.app.data_file)
+            self.assertEqual(self.app.repo.get("productos", "P-old")["titulo"], "Antes")
 
     def test_active_filter_finds_records_and_shows_readable_state(self):
         self.repo.toggle("productos", "P-old")

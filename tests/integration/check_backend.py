@@ -14,6 +14,20 @@ pea = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(pea)
 
 
+def write_folder(repo, path: Path, version: str) -> None:
+    """Carpeta anterior al archivo único, con un CSV por tabla como en las versiones 1 a 3."""
+    path.mkdir(parents=True, exist_ok=True)
+    tables = {"manifest": [{"version": version, "guardado": "2026-09-24T00:00:00"}],
+              **{kind: repo.rows(kind) for kind in pea.ALL_FIELDS},
+              "cola_validacion": list(repo.queue), "historial": []}
+    for name, rows in tables.items():
+        fields = pea.DATA_SECTIONS[name]
+        with (path / f"{name}.csv").open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.writer(stream, lineterminator="\n")
+            writer.writerow(fields)
+            writer.writerows([pea._storage_cell(row.get(field, "")) for field in fields] for row in rows)
+
+
 def main() -> None:
     if len(sys.argv) != 2:
         raise SystemExit("Uso: python3 tests/integration/check_backend.py build/pea_cpp")
@@ -21,9 +35,10 @@ def main() -> None:
     backend = pea.CppRepository(binary)
     fixture = tempfile.TemporaryDirectory(prefix="pea-backend-fixture-")
     try:
+        demo = Path(fixture.name) / "demo.csv"
         subprocess.run([sys.executable, str(ROOT / "scripts/build_demo.py"),
-                        "--output", fixture.name], check=True, capture_output=True, text=True)
-        backend.load(Path(fixture.name))
+                        "--output", str(demo)], check=True, capture_output=True, text=True)
+        backend.load(demo)
         assert backend.statistics()["total"] == 4
         assert backend.page("productos", limit=2)["total"] == 4
         assert len(backend.page("productos", limit=2)["rows"]) == 2
@@ -103,34 +118,38 @@ def main() -> None:
                 raise AssertionError("C++ permitió un CSV sin UTF-8 válido")
             except pea.DataError:
                 pass
-            backend.save(path)
+            data = path / "datos.csv"
+            backend.save(data)
             assert not backend.dirty
-            loaded = pea.load_repository(path)
+            assert sorted(item.name for item in path.iterdir()) == ["codificacion.csv", "datos.csv",
+                                                                     "importar.csv", "malformado.csv"]
+            loaded = pea.load_repository(data)
             assert loaded.statistics(view="Grupo", selected_id="G-B")["total"] == 1
             assert loaded.get("productos", "P-B")["titulo"] == "Acción, línea\nsegunda"
             backend.update("productos", "P-B", {"observacion": "Revisada"})
             assert backend.history_size() > 0
-            backend.save(path)
+            backend.save(data)
+            assert (path / ".backup" / "datos.csv").is_file()
             reopened = pea.CppRepository(binary)
-            python_with_cpp_history = pea.load_repository(path)
+            python_with_cpp_history = pea.load_repository(data)
             assert python_with_cpp_history.undo()
             assert python_with_cpp_history.get("productos", "P-B")["observacion"] == ""
             try:
-                reopened.load(path)
+                reopened.load(data)
                 assert reopened.get("productos", "P-B")["observacion"] == "Revisada"
                 assert reopened.undo()
                 assert reopened.get("productos", "P-B")["observacion"] == ""
             finally:
                 reopened.close()
             backend.create("productos", {"id": "P-FORMULA", "titulo": "=1+1"})
-            backend.save(path)
-            with (path / "productos.csv").open(encoding="utf-8", newline="") as stream:
-                saved_rows = list(csv.DictReader(stream))
-            assert next(row for row in saved_rows if row["id"] == "P-FORMULA")["titulo"] == "'=1+1"
-            python_repo = pea.load_repository(path)
+            backend.save(data)
+            with data.open(encoding="utf-8", newline="") as stream:
+                stored = {record[0]: record for record in csv.reader(stream)}
+            assert stored["P-FORMULA"][1] == "'=1+1"
+            python_repo = pea.load_repository(data)
             assert python_repo.get("productos", "P-FORMULA")["titulo"] == "=1+1"
-            pea.save_repository(python_repo, path)
-            backend.load(path)
+            pea.save_repository(python_repo, data)
+            backend.load(data)
             assert backend.get("productos", "P-FORMULA")["titulo"] == "=1+1"
     finally:
         backend.close()
@@ -141,11 +160,7 @@ def main() -> None:
         old = pea.Repository()
         old.create("grupos", {"id": "G-OLD", "nombre": "Grupo anterior"}, remember=False)
         old.create("productos", {"id": "P-OLD", "titulo": "Producto anterior"}, remember=False)
-        pea.save_repository(old, path)
-        with (path / "manifest.csv").open("w", encoding="utf-8", newline="") as stream:
-            writer = csv.writer(stream)
-            writer.writerow(("version", "guardado"))
-            writer.writerow(("1", "2026-09-24T00:00:00"))
+        write_folder(old, path, "1")
         groups = pea._csv_read(path / "grupos.csv", pea.ENTITY_FIELDS["grupos"], encoded=True)
         with (path / "grupos.csv").open("w", encoding="utf-8", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=("id", "nombre", "sigla", *pea.ENTITY_FIELDS["grupos"][2:]))
@@ -163,17 +178,18 @@ def main() -> None:
             legacy.load(path)
             assert legacy.get("productos", "P-OLD")["validacion"] == "rechazado"
             assert legacy.product_issues("P-OLD") == ["anio", "tipologia", "autor", "grupo", "fuente"]
-            legacy.save(path)
-            assert pea.load_repository(path).get("grupos", "G-OLD")["nombre"] == "Grupo anterior"
+            converted = path / "datos.csv"
+            legacy.save(converted)
+            assert pea.load_repository(converted).get("grupos", "G-OLD")["nombre"] == "Grupo anterior"
+            legacy.load(path / "manifest.csv")
+            assert legacy.get("productos", "P-OLD")["validacion"] == "rechazado"
         finally:
             legacy.close()
     with tempfile.TemporaryDirectory(prefix="pea-v2-") as folder:
         path = Path(folder)
         old = pea.Repository()
         old.create("productos", {"id": "P-V2", "titulo": "Producto v2"}, remember=False)
-        pea.save_repository(old, path)
-        with (path / "manifest.csv").open("w", encoding="utf-8", newline="") as stream:
-            csv.writer(stream).writerows((("version", "guardado"), ("2", "2026-09-24T00:00:00")))
+        write_folder(old, path, "2")
         products = pea._csv_read(path / "productos.csv", pea.ENTITY_FIELDS["productos"], encoded=True)
         products[0].update(categoria="B", validacion="pendiente")
         with (path / "productos.csv").open("w", encoding="utf-8", newline="") as stream:

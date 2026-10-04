@@ -1,5 +1,5 @@
 // PEA-i UPC: consola y backend JSON para Tkinter en C++17.
-// Fuente unica para la entrega; los CSV compartidos se documentan en docs/esquema_datos.md.
+// Fuente unica para la entrega; el archivo de datos compartido se documenta en docs/esquema_datos.md.
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -11,6 +11,7 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <optional>
@@ -84,7 +85,10 @@ const std::map<std::string, std::string> LABELS = {
     {"objetivo", "Objetivo"}, {"indicador", "Indicador"}, {"meta", "Meta"},
     {"actividad", "Actividad"}, {"rol", "Rol"}, {"orden", "Orden"}, {"origen", "Origen"}
 };
-const std::string SCHEMA_VERSION = "3";
+// Version 4: un solo archivo con todas las tablas. Las versiones 1 a 3 eran carpetas
+// con un CSV por tabla; se pueden abrir y se guardan como archivo unico.
+const std::string SCHEMA_VERSION = "4";
+const std::string LAST_FOLDER_VERSION = "3";
 // Validacion automatica de productos. Codigos y orden compartidos con Python.
 const std::array<std::string, 6> RULE_CODES = {"anio", "tipologia", "autor", "grupo", "doi", "fuente"};
 const std::map<std::string, std::string> RULE_LABELS = {
@@ -739,9 +743,9 @@ std::string storageCell(const std::string& value) {
 }
 
 // Lee registros uno a uno; admite BOM, comillas, CRLF y saltos de linea dentro de celdas.
-std::size_t readCsvEach(const fs::path& path, const std::vector<std::string>& requiredFields,
-                        const std::function<void(Row, std::size_t)>& visit,
-                        bool encoded = false) {
+// Entrega cada registro con la linea del archivo donde empieza.
+void readCsvRecords(const fs::path& path,
+                    const std::function<void(std::vector<std::string>&, std::size_t)>& visit) {
     std::ifstream input(path, std::ios::binary);
     if (!input) throw DataError("No se pudo abrir " + path.string());
     char bom[3]{};
@@ -750,39 +754,18 @@ std::size_t readCsvEach(const fs::path& path, const std::vector<std::string>& re
         input.clear();
         input.seekg(0);
     }
-    std::vector<std::string> header;
     std::vector<std::string> record;
     std::string cell;
-    bool quoted = false, closedQuote = false, touched = false, hasHeader = false;
-    std::size_t number = 0;
+    bool quoted = false, closedQuote = false, touched = false;
+    std::size_t line = 1, start = 1;
     auto finish = [&] {
         record.push_back(std::move(cell));
         cell.clear();
-        ++number;
         for (const auto& value : record)
             if (!validUtf8(value))
-                throw DataError(path.filename().string() + ", fila " + std::to_string(number) +
+                throw DataError(path.filename().string() + ", linea " + std::to_string(start) +
                                 ": texto no es UTF-8 valido");
-        if (!hasHeader) {
-            header = std::move(record);
-            const std::set<std::string> expected(requiredFields.begin(), requiredFields.end());
-            const std::set<std::string> actual(header.begin(), header.end());
-            if (header.size() != requiredFields.size() || actual != expected)
-                throw DataError("Encabezados incorrectos en " + path.filename().string());
-            hasHeader = true;
-        } else {
-            if (number - 1 > MAX_CSV_ROWS)
-                throw DataError(path.filename().string() + ": demasiadas filas");
-            if (record.size() != header.size())
-                throw DataError(path.filename().string() + ", fila " + std::to_string(number) + " malformada");
-            Row row;
-            for (std::size_t i = 0; i < header.size(); ++i) {
-                std::string value = std::move(record[i]);
-                if (encoded && !value.empty() && value.front() == '\'') value.erase(0, 1);
-                row[header[i]] = std::move(value);
-            }
-            visit(std::move(row), number);
-        }
+        visit(record, start);
         record.clear();
         touched = false;
         closedQuote = false;
@@ -793,7 +776,10 @@ std::size_t readCsvEach(const fs::path& path, const std::vector<std::string>& re
             if (ch == '"') {
                 if (input.peek() == '"') { cell.push_back('"'); input.get(); }
                 else { quoted = false; closedQuote = true; }
-            } else cell.push_back(ch);
+            } else {
+                if (ch == '\n') ++line;
+                cell.push_back(ch);
+            }
             touched = true;
         } else if (ch == '"') {
             if (!cell.empty() || closedQuote) throw DataError("Comilla CSV mal ubicada");
@@ -807,6 +793,7 @@ std::size_t readCsvEach(const fs::path& path, const std::vector<std::string>& re
         } else if (ch == '\r' || ch == '\n') {
             finish();
             if (ch == '\r' && input.peek() == '\n') input.get();
+            start = ++line;
         } else {
             if (closedQuote) throw DataError("Texto despues de una comilla CSV de cierre");
             cell.push_back(ch);
@@ -816,7 +803,38 @@ std::size_t readCsvEach(const fs::path& path, const std::vector<std::string>& re
     if (!input.eof()) throw DataError("Error al leer " + path.string());
     if (quoted) throw DataError("Comillas CSV sin cerrar");
     if (touched || !record.empty() || !cell.empty()) finish();
-    if (!hasHeader) throw DataError("CSV sin encabezados: " + path.string());
+}
+Row csvRow(const std::vector<std::string>& header, std::vector<std::string>& record, bool encoded) {
+    Row row;
+    for (std::size_t i = 0; i < header.size(); ++i) {
+        std::string value = std::move(record[i]);
+        if (encoded && !value.empty() && value.front() == '\'') value.erase(0, 1);
+        row[header[i]] = std::move(value);
+    }
+    return row;
+}
+// CSV de una sola tabla: encabezado y filas.
+std::size_t readCsvEach(const fs::path& path, const std::vector<std::string>& requiredFields,
+                        const std::function<void(Row, std::size_t)>& visit,
+                        bool encoded = false) {
+    std::vector<std::string> header;
+    std::size_t number = 0;
+    readCsvRecords(path, [&](std::vector<std::string>& record, std::size_t) {
+        if (++number == 1) {
+            header = std::move(record);
+            const std::set<std::string> expected(requiredFields.begin(), requiredFields.end());
+            const std::set<std::string> actual(header.begin(), header.end());
+            if (header.size() != requiredFields.size() || actual != expected)
+                throw DataError("Encabezados incorrectos en " + path.filename().string());
+            return;
+        }
+        if (number - 1 > MAX_CSV_ROWS)
+            throw DataError(path.filename().string() + ": demasiadas filas");
+        if (record.size() != header.size())
+            throw DataError(path.filename().string() + ", fila " + std::to_string(number) + " malformada");
+        visit(csvRow(header, record, encoded), number);
+    });
+    if (number == 0) throw DataError("CSV sin encabezados: " + path.string());
     return number - 1;
 }
 std::string csvCell(const std::string& value) {
@@ -842,23 +860,6 @@ void writeCsv(const fs::path& path, const std::vector<std::string>& header, cons
     output.flush();
     if (!output) throw DataError("No se pudo completar " + path.string());
 }
-void writeCsvEach(const fs::path& path, const std::vector<std::string>& header,
-                  const std::function<void(const std::function<void(const Row&)>&)>& produce,
-                  bool encoded = false) {
-    std::ofstream output(path, std::ios::binary | std::ios::trunc);
-    if (!output) throw DataError("No se pudo escribir " + path.string());
-    for (std::size_t i = 0; i < header.size(); ++i)
-        output << (i ? "," : "") << csvCell(header[i]);
-    output << '\n';
-    produce([&](const Row& row) {
-        for (std::size_t i = 0; i < header.size(); ++i)
-            output << (i ? "," : "") << csvCell(encoded ? storageCell(field(row, header[i])) : field(row, header[i]));
-        output << '\n';
-    });
-    output.flush();
-    if (!output) throw DataError("No se pudo completar " + path.string());
-}
-
 std::string jsonString(const std::string& value) {
     const char* hex = "0123456789abcdef";
     std::string result = "\"";
@@ -1620,12 +1621,26 @@ public:
 const std::vector<std::string> MANIFEST_FIELDS = {"version", "guardado"};
 const std::vector<std::string> QUEUE_FIELDS = {"id", "producto_id", "motivo", "creado"};
 const std::vector<std::string> HISTORY_FIELDS = {"orden", "snapshot"};
-std::vector<std::string> dataFiles() {
-    std::vector<std::string> result = {"manifest.csv"};
-    for (const auto& kind : ALL_KINDS) result.push_back(kind + ".csv");
-    result.push_back("cola_validacion.csv");
-    result.push_back("historial.csv");
-    return result;
+// Secciones del archivo unico en orden de lectura: cada relacion aparece despues de las
+// entidades que enlaza, asi que puede crearse en cuanto se lee.
+const std::vector<std::pair<std::string, std::vector<std::string>>>& dataSections() {
+    static const auto sections = [] {
+        std::vector<std::pair<std::string, std::vector<std::string>>> result = {{"manifest", MANIFEST_FIELDS}};
+        for (const auto& kind : ALL_KINDS) result.emplace_back(kind, FIELDS.at(kind));
+        result.emplace_back("cola_validacion", QUEUE_FIELDS);
+        result.emplace_back("historial", HISTORY_FIELDS);
+        return result;
+    }();
+    return sections;
+}
+// Carpeta de las versiones 1 a 3, indicada por la carpeta o por su manifest.csv.
+bool isFolderData(const fs::path& path) {
+    return fs::is_directory(path) || path.filename() == "manifest.csv";
+}
+// Copia del guardado anterior: .backup junto al archivo (o dentro de una carpeta anterior).
+fs::path backupOf(const fs::path& path) {
+    if (isFolderData(path)) return (fs::is_directory(path) ? path : path.parent_path()) / ".backup";
+    return path.parent_path() / ".backup" / path.filename();
 }
 // Compara el conjunto de encabezados (sin importar el orden) para detectar formatos anteriores.
 bool headerMatches(const fs::path& path, const std::vector<std::string>& fields) {
@@ -1640,7 +1655,8 @@ bool headerMatches(const fs::path& path, const std::vector<std::string>& fields)
     for (std::string name; std::getline(names, name, ',');) actual.insert(name);
     return actual == std::set<std::string>(fields.begin(), fields.end());
 }
-Repository loadRepository(const fs::path& directory) {
+// Carpeta de las versiones 1 a 3 (un CSV por tabla); se guarda luego como archivo unico.
+Repository loadFolder(const fs::path& directory) {
     std::string version;
     std::size_t manifestRows = 0;
     readCsvEach(directory / "manifest.csv", MANIFEST_FIELDS,
@@ -1648,10 +1664,10 @@ Repository loadRepository(const fs::path& directory) {
         if (++manifestRows > 1) throw DataError("Manifest con mas de una fila");
         version = field(row, "version");
     });
-    if (manifestRows != 1 || (version != "1" && version != "2" && version != SCHEMA_VERSION))
+    if (manifestRows != 1 || (version != "1" && version != "2" && version != LAST_FOLDER_VERSION))
         throw DataError("Version de datos incompatible");
     const bool legacy = version == "1";
-    const bool upgrade = version != SCHEMA_VERSION;
+    const bool upgrade = version != LAST_FOLDER_VERSION;
     Repository repo;
     for (const auto& kind : ENTITY_KINDS) {
         auto columns = FIELDS.at(kind);
@@ -1713,6 +1729,80 @@ Repository loadRepository(const fs::path& directory) {
     repo.markSaved();
     return repo;
 }
+// Recorre el archivo unico en orden. Cada seccion empieza con una fila de una sola celda
+// "#nombre", sigue su encabezado y luego sus filas hasta la siguiente marca. Ninguna tabla
+// tiene una sola columna, asi que una fila de datos nunca se confunde con una marca.
+void readDataFile(const fs::path& path,
+                  const std::function<void(const std::string&, Row, std::size_t)>& visit) {
+    const auto& sections = dataSections();
+    const std::string name = path.filename().string();
+    std::size_t next = 0, rows = 0;
+    std::string section;
+    std::vector<std::string> header;
+    auto where = [&](std::size_t line) { return name + ", linea " + std::to_string(line) + ": "; };
+    readCsvRecords(path, [&](std::vector<std::string>& record, std::size_t line) {
+        if (record.size() == 1 && record[0].empty()) return;
+        if (record.size() == 1 && startsWith(record[0], "#")) {
+            if (!section.empty() && header.empty())
+                throw DataError(where(line) + "falta el encabezado de la seccion #" + section);
+            if (next == sections.size()) throw DataError(where(line) + "seccion sobrante " + record[0]);
+            if (record[0] != "#" + sections[next].first)
+                throw DataError(where(line) + "se esperaba la seccion #" + sections[next].first);
+            section = sections[next++].first;
+            header.clear();
+            rows = 0;
+            return;
+        }
+        if (section.empty()) throw DataError(where(line) + "el archivo debe comenzar con #manifest");
+        if (header.empty()) {
+            const auto& fields = sections[next - 1].second;
+            const std::set<std::string> expected(fields.begin(), fields.end());
+            const std::set<std::string> actual(record.begin(), record.end());
+            if (record.size() != fields.size() || actual != expected)
+                throw DataError(where(line) + "encabezados incorrectos en #" + section);
+            header = std::move(record);
+            return;
+        }
+        if (record.size() != header.size()) throw DataError(where(line) + "fila malformada en #" + section);
+        if (++rows > MAX_CSV_ROWS) throw DataError(where(line) + "demasiadas filas en #" + section);
+        visit(section, csvRow(header, record, true), line);
+    });
+    if (next < sections.size()) throw DataError(name + ": falta la seccion #" + sections[next].first);
+    if (header.empty()) throw DataError(name + ": falta el encabezado de la seccion #" + section);
+}
+// Crea los registros a medida que los lee: las entidades llegan antes que sus relaciones.
+Repository loadFile(const fs::path& path) {
+    Repository repo;
+    Rows history;
+    std::size_t manifests = 0;
+    const std::string name = path.filename().string();
+    readDataFile(path, [&](const std::string& section, Row row, std::size_t line) {
+        try {
+            if (section == "manifest") {
+                if (++manifests > 1) throw DataError("Manifest con mas de una fila");
+                if (field(row, "version") != SCHEMA_VERSION) throw DataError("Version de datos incompatible");
+            } else if (FIELDS.count(section)) {
+                repo.create(section, std::move(row), false);
+            } else if (section == "cola_validacion") {
+                repo.loadJob(row);
+            } else {
+                if (history.size() >= 30) throw DataError("Historial supera 30 acciones");
+                history.push_back(std::move(row));
+            }
+        } catch (const DataError& error) {
+            throw DataError(name + ", linea " + std::to_string(line) + " (#" + section + "): " + error.what());
+        }
+    });
+    if (manifests != 1) throw DataError(name + ": falta la fila de #manifest");
+    repo.loadHistory(history);
+    repo.markSaved();
+    return repo;
+}
+// Abre el archivo unico o, para convertirla, una carpeta anterior (o su manifest.csv).
+Repository loadRepository(const fs::path& path) {
+    if (isFolderData(path)) return loadFolder(fs::is_directory(path) ? path : path.parent_path());
+    return loadFile(path);
+}
 struct StagingFolder {
     fs::path path;
     explicit StagingFolder(fs::path location) : path(std::move(location)) {
@@ -1723,37 +1813,65 @@ struct StagingFolder {
         fs::remove_all(path, ignored);
     }
 };
-void saveRepository(Repository& repo, const fs::path& directory) {
-    fs::create_directories(directory);
+void writeSection(std::ostream& output, const std::string& name, const std::vector<std::string>& header,
+                  const std::function<void(const std::function<void(const Row&)>&)>& produce) {
+    output << '#' << name << '\n';
+    for (std::size_t i = 0; i < header.size(); ++i)
+        output << (i ? "," : "") << csvCell(header[i]);
+    output << '\n';
+    produce([&](const Row& row) {
+        for (std::size_t i = 0; i < header.size(); ++i)
+            output << (i ? "," : "") << csvCell(storageCell(field(row, header[i])));
+        output << '\n';
+    });
+}
+// Sustituye el archivo de una vez: rename en POSIX; en Windows MoveFileExW permite reemplazar.
+void replaceFile(const fs::path& from, const fs::path& to) {
+#ifdef _WIN32
+    if (!MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        throw DataError("No se pudo reemplazar " + to.string());
+#else
+    fs::rename(from, to);
+#endif
+}
+// Escribe el archivo unico en un temporal y lo sustituye de una vez; conserva la copia anterior.
+void saveRepository(Repository& repo, const fs::path& path) {
+    if (fs::is_directory(path)) throw DataError("Indique un archivo .csv, no una carpeta");
+    if (path.has_parent_path()) fs::create_directories(path.parent_path());
     const auto tick = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-    StagingFolder stage(directory / (".pea-stage-" + std::to_string(tick)));
-    writeCsv(stage.path / "manifest.csv", MANIFEST_FIELDS,
-             {{{"version", SCHEMA_VERSION}, {"guardado", nowIso()}}});
-    for (const auto& kind : ALL_KINDS)
-        writeCsvEach(stage.path / (kind + ".csv"), FIELDS.at(kind),
-                     [&](const auto& visit) { repo.forEachRow(kind, visit); }, true);
-    writeCsvEach(stage.path / "cola_validacion.csv", QUEUE_FIELDS,
-                 [&](const auto& visit) { repo.forEachQueue(visit); }, true);
-    std::size_t order = 0;
-    writeCsvEach(stage.path / "historial.csv", HISTORY_FIELDS,
-                 [&](const auto& visit) {
-        repo.forEachHistory([&](const std::string& state) {
-            visit({{"orden", std::to_string(order++)}, {"snapshot", state}});
-        });
-    }, true);
-    const fs::path backup = directory / ".backup";
-    fs::create_directories(backup);
-    const auto files = dataFiles();
-    for (const auto& name : files) {
-        if (fs::exists(directory / name))
-            fs::copy_file(directory / name, backup / name, fs::copy_options::overwrite_existing);
-    }
-    for (const auto& name : files) {
-        const fs::path target = directory / name;
-        // Windows no permite rename sobre un archivo existente. La copia anterior
-        // ya esta en .backup si el proceso se interrumpe entre archivos.
-        if (fs::exists(target)) fs::remove(target);
-        fs::rename(stage.path / name, target);
+    fs::path temporary = path;
+    temporary += "." + std::to_string(tick) + ".tmp";
+    try {
+        {
+            std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+            if (!output) throw DataError("No se pudo escribir " + temporary.string());
+            writeSection(output, "manifest", MANIFEST_FIELDS, [&](const auto& visit) {
+                visit({{"version", SCHEMA_VERSION}, {"guardado", nowIso()}});
+            });
+            for (const auto& kind : ALL_KINDS)
+                writeSection(output, kind, FIELDS.at(kind),
+                             [&](const auto& visit) { repo.forEachRow(kind, visit); });
+            writeSection(output, "cola_validacion", QUEUE_FIELDS,
+                         [&](const auto& visit) { repo.forEachQueue(visit); });
+            std::size_t order = 0;
+            writeSection(output, "historial", HISTORY_FIELDS, [&](const auto& visit) {
+                repo.forEachHistory([&](const std::string& state) {
+                    visit({{"orden", std::to_string(order++)}, {"snapshot", state}});
+                });
+            });
+            output.flush();
+            if (!output) throw DataError("No se pudo completar " + temporary.string());
+        }
+        if (fs::exists(path)) {
+            const fs::path backup = backupOf(path);
+            fs::create_directories(backup.parent_path());
+            fs::copy_file(path, backup, fs::copy_options::overwrite_existing);
+        }
+        replaceFile(temporary, path);
+    } catch (...) {
+        std::error_code ignored;
+        fs::remove(temporary, ignored);
+        throw;
     }
     repo.markSaved();
 }
@@ -2147,15 +2265,15 @@ bool samePath(const fs::path& a, const fs::path& b) {
 }
 class ConsoleApp {
     Repository repo_;
-    fs::path directory_;
+    fs::path file_;
 
     bool saveTo(const fs::path& path) {
         if (path.empty()) return false;
-        if (fs::exists(path / "manifest.csv") && !samePath(path, directory_) &&
-            !confirm("La carpeta ya contiene datos PEA-i. Reemplazarlos?")) return false;
+        if (fs::exists(path) && !samePath(path, file_) &&
+            !confirm("El archivo ya existe. Reemplazarlo?")) return false;
         try {
             saveRepository(repo_, path);
-            directory_ = path;
+            file_ = path;
             std::cout << "Guardado en " << path.string() << '\n';
             return true;
         } catch (const std::exception& error) {
@@ -2164,12 +2282,12 @@ class ConsoleApp {
         }
     }
     bool save(bool askPath = false) {
-        if (askPath || directory_.empty()) {
-            const std::string text = ask("Carpeta de destino (vacio = cancelar): ");
+        if (askPath || file_.empty()) {
+            const std::string text = ask("Archivo de destino (.csv, vacio = cancelar): ");
             if (text.empty()) return false;
             return saveTo(pathFromUtf8(text));
         }
-        return saveTo(directory_);
+        return saveTo(file_);
     }
     bool mayReplace() {
         if (!repo_.dirty()) return true;
@@ -2184,16 +2302,22 @@ class ConsoleApp {
         try {
             Repository fresh = loadRepository(path);
             repo_ = std::move(fresh);
-            directory_ = path;
-            std::cout << "Cargado: " << path.string() << '\n';
+            if (isFolderData(path)) {
+                file_.clear();
+                std::cout << "Carpeta anterior cargada: " << path.string()
+                          << "\nUse Guardar para convertirla en un archivo unico.\n";
+            } else {
+                file_ = path;
+                std::cout << "Cargado: " << path.string() << '\n';
+            }
         } catch (const std::exception& error) {
             std::cout << "No se pudo cargar: " << error.what() << '\n';
-            const fs::path backup = path / ".backup";
-            if (fs::exists(backup / "manifest.csv") && confirm("Abrir la copia anterior .backup?")) {
+            const fs::path backup = backupOf(path);
+            if (fs::exists(backup) && confirm("Abrir la copia anterior .backup?")) {
                 try {
                     Repository recovered = loadRepository(backup);
                     repo_ = std::move(recovered);
-                    directory_.clear();
+                    file_.clear();
                     std::cout << "Copia abierta; use Guardar como para recuperarla.\n";
                 } catch (const std::exception& backupError) {
                     std::cout << "La copia anterior tampoco se pudo abrir: "
@@ -2205,8 +2329,8 @@ class ConsoleApp {
     void filesMenu() {
         while (true) {
             std::cout << "\n=== Datos ===\n"
-                      << "Carpeta: " << (directory_.empty() ? "(sin guardar)" : directory_.string()) << '\n'
-                      << "1. Iniciar vacio  2. Abrir carpeta\n"
+                      << "Archivo: " << (file_.empty() ? "(sin guardar)" : file_.string()) << '\n'
+                      << "1. Iniciar vacio  2. Abrir archivo\n"
                       << "3. Guardar  4. Guardar como  0. Volver\n";
             const int option = askNumber("Opcion: ", 0, 4);
             if (option == 0) return;
@@ -2216,10 +2340,10 @@ class ConsoleApp {
                 else if (mayReplace()) {
                     if (option == 1) {
                         repo_ = Repository();
-                        directory_.clear();
+                        file_.clear();
                         std::cout << "Espacio vacio creado.\n";
                     } else if (option == 2) {
-                        const std::string text = ask("Carpeta con manifest.csv: ");
+                        const std::string text = ask("Archivo de datos (.csv) o carpeta anterior: ");
                         if (!text.empty()) load(pathFromUtf8(text));
                     }
                 }
@@ -2251,13 +2375,13 @@ class ConsoleApp {
     }
 public:
     void startup(const std::optional<fs::path>& initial) {
-        if (initial && fs::exists(*initial / "manifest.csv")) { load(*initial); return; }
+        if (initial && fs::exists(*initial)) { load(*initial); return; }
         std::cout << "PEA-i UPC - inicio\n"
-                  << "1. Iniciar vacio  2. Abrir carpeta  0. Salir\n";
+                  << "1. Iniciar vacio  2. Abrir archivo  0. Salir\n";
         const int option = askNumber("Opcion: ", 0, 2);
         if (option == 0) throw EndInput{};
         if (option == 2) {
-            const std::string text = ask("Carpeta con manifest.csv: ");
+            const std::string text = ask("Archivo de datos (.csv) o carpeta anterior: ");
             if (!text.empty()) load(pathFromUtf8(text));
         } else std::cout << "Espacio vacio.\n";
     }
@@ -2385,7 +2509,7 @@ class ApiApp {
         const std::string kind = field(request, "kind");
         const std::string key = field(request, "key");
         const std::string second = field(request, "second");
-        if (action == "ping") return "{\"backend\":\"cpp\",\"protocol\":\"2\"}";
+        if (action == "ping") return "{\"backend\":\"cpp\",\"protocol\":\"3\"}";
         if (action == "state") return state();
         if (action == "new_id") {
             if (entityIndex(kind) < 0) throw DataError("Tipo de entidad desconocido");
@@ -2395,14 +2519,14 @@ class ApiApp {
         if (action == "reset") { repo_ = Repository(); return "null"; }
         if (action == "load") {
             const fs::path path = pathFromUtf8(field(request, "path"));
-            if (path.empty()) throw DataError("Falta carpeta de datos");
+            if (path.empty()) throw DataError("Falta archivo de datos");
             Repository fresh = loadRepository(path);
             repo_ = std::move(fresh);
             return "null";
         }
         if (action == "save") {
             const fs::path path = pathFromUtf8(field(request, "path"));
-            if (path.empty()) throw DataError("Falta carpeta de destino");
+            if (path.empty()) throw DataError("Falta archivo de destino");
             saveRepository(repo_, path);
             return "null";
         }
@@ -2615,9 +2739,46 @@ void selfTest() {
     const Row processed = repo.processReview("Revision de prueba");
     require(field(processed, "producto_id") == "P-DEMO-2" && field(processed, "validacion") == "validado",
             "procesar revision");
-    saveRepository(repo, temp.path);
-    Repository loaded = loadRepository(temp.path);
+    const fs::path dataFile = temp.path / "datos.csv";
+    saveRepository(repo, dataFile);
+    saveRepository(repo, dataFile);  // reemplaza un archivo existente (MoveFileExW en Windows)
+    require(fs::exists(temp.path / ".backup" / "datos.csv"), "copia del guardado anterior");
+    std::string text;
+    {
+        std::ifstream saved(dataFile, std::ios::binary);
+        text.assign(std::istreambuf_iterator<char>(saved), std::istreambuf_iterator<char>());
+    }
+    require(startsWith(text, "#manifest\nversion,guardado\n4,"), "archivo unico empieza con #manifest");
+    Repository loaded = loadRepository(dataFile);
     require(loaded.snapshot() == repo.snapshot(), "CSV y JSON de historial ida y vuelta");
+    const fs::path edited = temp.path / "editado.csv";
+    auto writeText = [&](const std::string& content) {
+        std::ofstream output(edited, std::ios::binary | std::ios::trunc);
+        output << content;
+    };
+    std::string crlf = "\xEF\xBB\xBF";
+    for (char ch : text) crlf += ch == '\n' ? std::string("\r\n") : std::string(1, ch);
+    writeText(crlf + "\r\n\r\n");
+    require(loadRepository(edited).queueSize() == loaded.queueSize(), "archivo con BOM, CRLF y lineas en blanco");
+    auto rejects = [&](const std::string& content, const std::string& label) {
+        writeText(content);
+        try {
+            loadRepository(edited);
+        } catch (const DataError&) {
+            return;
+        }
+        throw std::runtime_error("Autoprueba: no se rechazo " + label);
+    };
+    rejects(text.substr(0, text.find("#grupos_productos\n")), "archivo truncado");
+    std::string swapped = text;
+    swapped.replace(swapped.find("\n#grupos\n"), 9, "\n#investigadores\n");
+    rejects(swapped, "secciones fuera de orden");
+    rejects("G1,Grupo\n" + text, "fila antes de #manifest");
+    rejects(text + "#extra\n", "seccion sobrante");
+    try {
+        saveRepository(repo, temp.path);
+        throw std::runtime_error("Autoprueba: se guardo sobre una carpeta");
+    } catch (const DataError&) {}
     require(loaded.undo(), "historial cargado");
     require(field(*loaded.get("productos", "P-DEMO-2"), "observacion").empty() && loaded.queueSize() == 2,
             "deshacer tras reinicio");
@@ -2625,8 +2786,8 @@ void selfTest() {
     Repository extra;
     extra.create("productos", {{"id", "P-TEXTO"}, {"titulo", "Tildes: acción, comas\nsegunda linea"},
                                {"anio", "2025"}}, false);
-    saveRepository(extra, temp.path / "especial");
-    Repository again = loadRepository(temp.path / "especial");
+    saveRepository(extra, temp.path / "especial.csv");
+    Repository again = loadRepository(temp.path / "especial.csv");
     require(field(*again.get("productos", "P-TEXTO"), "titulo") ==
             "Tildes: acción, comas\nsegunda linea", "CSV UTF-8 multilinea");
     Rows imported = {
@@ -2655,19 +2816,20 @@ int main(int argc, char* argv[]) {
     SetConsoleCP(CP_UTF8);
 #endif
     try {
-        std::optional<pea::fs::path> directory;
+        std::optional<pea::fs::path> dataFile;
         bool check = false;
         bool api = false;
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
             if (arg == "--help" || arg == "-h") {
                 std::cout << "PEA-i UPC C++17\n"
-                          << "Uso: pea_cpp [--data-dir CARPETA] [--api]\n"
+                          << "Uso: pea_cpp [--data ARCHIVO] [--api]\n"
                           << "     pea_cpp --self-test\n"
-                          << "El programa gestiona datos CSV con menus de consola o protocolo JSON.\n";
+                          << "ARCHIVO es el CSV unico de datos; tambien acepta una carpeta anterior.\n"
+                          << "El programa gestiona los datos con menus de consola o protocolo JSON.\n";
                 return 0;
             }
-            if (arg == "--data-dir" && i + 1 < argc) directory = pea::pathFromUtf8(argv[++i]);
+            if (arg == "--data" && i + 1 < argc) dataFile = pea::pathFromUtf8(argv[++i]);
             else if (arg == "--api") api = true;
             else if (arg == "--self-test") check = true;
             else {
@@ -2681,12 +2843,12 @@ int main(int argc, char* argv[]) {
         }
         if (api) {
             pea::ApiApp app;
-            app.startup(directory);
+            app.startup(dataFile);
             app.run();
             return 0;
         }
         pea::ConsoleApp app;
-        app.startup(directory);
+        app.startup(dataFile);
         app.run();
         return 0;
     } catch (const pea::EndInput&) {

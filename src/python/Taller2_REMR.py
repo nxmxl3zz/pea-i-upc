@@ -1,6 +1,7 @@
 """PEA-i UPC: interfaz Tkinter conectada al backend C++.
 
-Ejecutar: python src/python/Taller2_REMR.py [--data-dir CARPETA]
+Ejecutar: python src/python/Taller2_REMR.py [--data ARCHIVO]
+Sin --data se abre data/pea_upc.csv, el archivo único con todos los datos.
 Con --python-backend se usa la implementación Python independiente de estructuras enlazadas.
 La lógica de datos puede probarse sin un servidor gráfico.
 """
@@ -35,7 +36,10 @@ import uuid
 import zipfile
 
 
-SCHEMA_VERSION = "3"
+# Versión 4: un solo archivo con todas las tablas. Las versiones 1 a 3 eran carpetas con
+# un CSV por tabla; se pueden abrir y se guardan como archivo único.
+SCHEMA_VERSION = "4"
+FOLDER_VERSIONS = ("1", "2", "3")
 ENTITY_FIELDS = {
     "grupos": ("id", "nombre", "codigo_gruplac", "fecha_creacion", "unidad", "responsable", "categoria", "descripcion", "objetivos", "mision", "vision", "lineas", "url", "fuente", "activo"),
     "investigadores": ("id", "nombre", "codigo_cvlac", "afiliacion", "categoria", "contacto", "url", "fuente", "activo"),
@@ -53,6 +57,13 @@ RELATION_ENDS = {
     "grupos_productos": ("grupo_id", "producto_id", "grupos", "productos"),
 }
 ALL_FIELDS = {**ENTITY_FIELDS, **RELATION_FIELDS}
+MANIFEST_FIELDS = ("version", "guardado")
+QUEUE_FIELDS = ("id", "producto_id", "motivo", "creado")
+HISTORY_FIELDS = ("orden", "snapshot")
+# Secciones del archivo único en el orden de lectura: cada relación aparece después de
+# las entidades que enlaza, así que puede crearse en cuanto se lee.
+DATA_SECTIONS = {"manifest": MANIFEST_FIELDS, **ALL_FIELDS,
+                 "cola_validacion": QUEUE_FIELDS, "historial": HISTORY_FIELDS}
 PAGE_SIZE = 100
 REQUIRED = {
     "grupos": ("id", "nombre"), "investigadores": ("id", "nombre"),
@@ -94,6 +105,7 @@ MAX_PDF_MEMORY = 512 * 1024 * 1024
 PDF_TIMEOUT = 25
 MAX_LOCAL_FILE = 32 * 1024 * 1024
 MAX_ARCHIVE_UNPACKED = 128 * 1024 * 1024
+DEFAULT_DATA_FILE = Path(__file__).resolve().parents[2] / "data" / "pea_upc.csv"
 
 
 class DataError(ValueError):
@@ -640,7 +652,7 @@ class Repository:
             if op == "queue_remove":
                 self.queue.remove(change["id"])
             elif op == "queue_prepend":
-                job = {name: change[name] for name in ("id", "producto_id", "motivo", "creado")}
+                job = {name: change[name] for name in QUEUE_FIELDS}
                 self._validate_job(job)
                 self.queue.prepend(job)
             else:
@@ -879,7 +891,8 @@ def _storage_cell(value: str) -> str:
 
 def _csv_read(path: Path, fields: tuple[str, ...], *, version: str = SCHEMA_VERSION,
               encoded: bool = False) -> list[dict[str, str]]:
-    legacy = version != SCHEMA_VERSION
+    # La versión 3 ya tiene los campos actuales; solo 1 y 2 necesitan adaptarse.
+    legacy = version in ("1", "2")
     with path.open("r", encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
         actual = set(reader.fieldnames or ())
@@ -1006,40 +1019,154 @@ def export_repository_spreadsheet(repo: Repository | CppRepository, directory: P
     """Exporta los datos neutralizados para abrirlos en hojas de cálculo sin fórmulas."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    _csv_write_safe(directory / "manifest.csv", ("version", "guardado"),
+    _csv_write_safe(directory / "manifest.csv", MANIFEST_FIELDS,
                     [{"version": SCHEMA_VERSION, "guardado": datetime.now().isoformat(timespec="seconds")}])
     for kind, fields in ALL_FIELDS.items():
         _csv_write_safe(directory / f"{kind}.csv", fields, repo.rows(kind))
 
 
-def save_repository(repo: Repository, directory: Path) -> None:
-    """Prepara todos los CSV antes de sustituir archivos; conserva copia anterior."""
-    directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".pea-save-", dir=directory) as temp_name:
-        staged = Path(temp_name)
-        _csv_write(staged / "manifest.csv", ("version", "guardado"),
-                   [{"version": SCHEMA_VERSION, "guardado": datetime.now().isoformat(timespec="seconds")}])
-        for kind, fields in ALL_FIELDS.items():
-            _csv_write(staged / f"{kind}.csv", fields, repo.rows(kind))
-        _csv_write(staged / "cola_validacion.csv", ("id", "producto_id", "motivo", "creado"), list(repo.queue))
-        _csv_write(staged / "historial.csv", ("orden", "snapshot"),
-                   [{"orden": str(index), "snapshot": state} for index, state in enumerate(repo.history)])
-        files = ["manifest.csv", *(f"{kind}.csv" for kind in ALL_FIELDS), "cola_validacion.csv", "historial.csv"]
-        backup = directory / ".backup"
-        backup.mkdir(exist_ok=True)
-        for name in files:
-            if (directory / name).exists():
-                shutil.copy2(directory / name, backup / name)
-        for name in files:
-            os.replace(staged / name, directory / name)
+def is_folder_data(path: Path) -> bool:
+    """Carpeta de las versiones 1 a 3, indicada por la carpeta o por su manifest.csv."""
+    path = Path(path)
+    return path.is_dir() or path.name == "manifest.csv"
+
+
+def backup_of(path: Path) -> Path:
+    """Copia del guardado anterior: .backup junto al archivo (o dentro de una carpeta anterior)."""
+    path = Path(path)
+    if is_folder_data(path):
+        return (path if path.is_dir() else path.parent) / ".backup"
+    return path.parent / ".backup" / path.name
+
+
+def save_repository(repo: Repository, path: Path) -> None:
+    """Escribe el archivo único en un temporal y lo sustituye de una vez; conserva la copia anterior."""
+    path = Path(path)
+    if path.is_dir():
+        raise DataError("Indique un archivo .csv, no una carpeta")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tables = {"manifest": [{"version": SCHEMA_VERSION, "guardado": datetime.now().isoformat(timespec="seconds")}],
+              **{kind: repo.rows(kind) for kind in ALL_FIELDS},
+              "cola_validacion": list(repo.queue),
+              "historial": [{"orden": str(index), "snapshot": state} for index, state in enumerate(repo.history)]}
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.writer(stream, lineterminator="\n")
+            for section, fields in DATA_SECTIONS.items():
+                writer.writerow([f"#{section}"])
+                writer.writerow(fields)
+                writer.writerows([_storage_cell(row.get(field, "")) for field in fields] for row in tables[section])
+            stream.flush()
+            os.fsync(stream.fileno())
+        if path.exists():
+            backup = backup_of(path)
+            backup.parent.mkdir(exist_ok=True)
+            shutil.copy2(path, backup)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
     repo.dirty = False
 
 
-def load_repository(directory: Path) -> Repository:
-    directory = Path(directory)
-    manifest = _csv_read(directory / "manifest.csv", ("version", "guardado"), encoded=True)
-    if len(manifest) != 1 or manifest[0]["version"] not in ("1", "2", SCHEMA_VERSION):
+def read_data_sections(path: Path) -> Iterator[tuple[str, int, dict[str, str]]]:
+    """Recorre el archivo único en orden y entrega (sección, línea, fila).
+
+    Cada sección empieza con una fila de una sola celda «#nombre», sigue su encabezado y
+    luego sus filas hasta la siguiente marca. Ninguna tabla tiene una sola columna, así que
+    una fila de datos nunca se confunde con una marca.
+    """
+    path = Path(path)
+    expected = iter(DATA_SECTIONS)
+    section, header, count, previous = "", None, 0, 0
+    with path.open("r", encoding="utf-8-sig", newline="") as stream:
+        reader = csv.reader(stream)
+        for record in reader:
+            line, previous = previous + 1, reader.line_num
+            where = f"{path.name}, línea {line}"
+            if not record or record == [""]:
+                continue
+            if len(record) == 1 and record[0].startswith("#"):
+                if section and header is None:
+                    raise DataError(f"{where}: falta el encabezado de la sección #{section}")
+                wanted = next(expected, None)
+                if wanted is None:
+                    raise DataError(f"{where}: sección sobrante {record[0]}")
+                if record[0] != f"#{wanted}":
+                    raise DataError(f"{where}: se esperaba la sección #{wanted}")
+                section, header, count = wanted, None, 0
+                continue
+            if not section:
+                raise DataError(f"{where}: el archivo debe comenzar con #manifest")
+            if header is None:
+                fields = DATA_SECTIONS[section]
+                if len(record) != len(fields) or set(record) != set(fields):
+                    raise DataError(f"{where}: encabezados incorrectos en #{section}; se esperan: {', '.join(fields)}")
+                header = record
+                continue
+            if len(record) != len(header):
+                raise DataError(f"{where}: fila malformada en #{section}")
+            count += 1
+            if count > MAX_CSV_ROWS:
+                raise DataError(f"{where}: demasiadas filas en #{section}")
+            yield section, line, {name: value[1:] if value.startswith("'") else value
+                                  for name, value in zip(header, record)}
+    missing = next(expected, None)
+    if missing is not None:
+        raise DataError(f"{path.name}: falta la sección #{missing}")
+    if header is None:
+        raise DataError(f"{path.name}: falta el encabezado de la sección #{section}")
+
+
+def _load_history(repo: Repository, entries: list[dict[str, str]]) -> None:
+    for entry in reversed(entries):
+        # Cada snapshot se verifica antes de incorporarlo al historial.
+        validator = Repository()
+        try:
+            if validator._decode_delta(entry["snapshot"]) is None:
+                validator._restore(entry["snapshot"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise DataError("Historial dañado") from exc
+        repo.history.push(entry["snapshot"])
+
+
+def _load_file(path: Path) -> Repository:
+    """Crea los registros a medida que los lee: las entidades llegan antes que sus relaciones."""
+    repo = Repository()
+    manifests = 0
+    job_ids: set[str] = set()
+    history: list[dict[str, str]] = []
+    for section, line, row in read_data_sections(path):
+        try:
+            if section == "manifest":
+                manifests += 1
+                if manifests > 1:
+                    raise DataError("Manifest con más de una fila")
+                if row["version"] != SCHEMA_VERSION:
+                    raise DataError("Versión de datos incompatible")
+            elif section in ALL_FIELDS:
+                repo.create(section, row, remember=False)
+            elif section == "cola_validacion":
+                repo._validate_job(row)
+                if row["id"] in job_ids:
+                    raise DataError(f"Trabajo de cola duplicado: {row['id']}")
+                job_ids.add(row["id"])
+                repo.queue.enqueue(row)
+            else:
+                history.append(row)
+        except DataError as exc:
+            raise DataError(f"{path.name}, línea {line} (#{section}): {exc}") from exc
+    if manifests != 1:
+        raise DataError(f"{path.name}: falta la fila de #manifest")
+    _load_history(repo, history)
+    repo.dirty = False
+    return repo
+
+
+def _load_folder(directory: Path) -> Repository:
+    """Carpeta de las versiones 1 a 3 (un CSV por tabla); se guarda luego como archivo único."""
+    manifest = _csv_read(directory / "manifest.csv", MANIFEST_FIELDS, encoded=True)
+    if len(manifest) != 1 or manifest[0]["version"] not in FOLDER_VERSIONS:
         raise DataError("Versión de datos incompatible")
     version = manifest[0]["version"]
     legacy = version == "1"
@@ -1062,26 +1189,24 @@ def load_repository(directory: Path) -> Repository:
     queue_path = directory / "cola_validacion.csv"
     if not queue_path.exists() and not legacy:
         raise DataError("Falta cola_validacion.csv")
-    jobs = (_csv_read(queue_path, ("id", "producto_id", "motivo", "creado"), encoded=not legacy)
-            if queue_path.exists() else [])
+    jobs = _csv_read(queue_path, QUEUE_FIELDS, encoded=not legacy) if queue_path.exists() else []
     for job in jobs:
         repo._validate_job(job)
         if job["id"] in job_ids:
             raise DataError(f"Trabajo de cola duplicado: {job['id']}")
         job_ids.add(job["id"])
         repo.queue.enqueue(job)
-    history = _csv_read(directory / "historial.csv", ("orden", "snapshot"), encoded=not legacy)
-    for entry in reversed(history):
-        # Cada snapshot se verifica antes de incorporarlo al historial.
-        validator = Repository()
-        try:
-            if validator._decode_delta(entry["snapshot"]) is None:
-                validator._restore(entry["snapshot"])
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise DataError("Historial dañado") from exc
-        repo.history.push(entry["snapshot"])
+    _load_history(repo, _csv_read(directory / "historial.csv", HISTORY_FIELDS, encoded=not legacy))
     repo.dirty = False
     return repo
+
+
+def load_repository(path: Path) -> Repository:
+    """Abre el archivo único o, para convertirla, una carpeta anterior (o su manifest.csv)."""
+    path = Path(path)
+    if is_folder_data(path):
+        return _load_folder(path if path.is_dir() else path.parent)
+    return _load_file(path)
 
 
 def merge_csv(repo: Repository, path: Path, kind: str) -> tuple[int, list[str]]:
@@ -1192,7 +1317,7 @@ def cpp_executable(explicit: Path | None = None) -> Path:
     return binary
 
 
-CPP_PROTOCOL = "2"
+CPP_PROTOCOL = "3"
 
 
 class CppRepository:
@@ -1314,11 +1439,11 @@ class CppRepository:
     def reset(self) -> None:
         self._request("reset")
 
-    def load(self, directory: Path) -> None:
-        self._request("load", path=str(Path(directory).resolve()))
+    def load(self, path: Path) -> None:
+        self._request("load", path=str(Path(path).resolve()))
 
-    def save(self, directory: Path) -> None:
-        self._request("save", path=str(Path(directory).resolve()))
+    def save(self, path: Path) -> None:
+        self._request("save", path=str(Path(path).resolve()))
 
     def preview_csv(self, path: Path, kind: str) -> tuple[int, int, list[str]]:
         result = self._request("preview_csv", path=str(Path(path).resolve()), kind=kind)
@@ -2036,9 +2161,25 @@ def match_gruplac_authors(products: list[GrupLACProduct],
     return relations
 
 
+# Campos que una ficha GrupLAC vuelve a traer al importarla de nuevo; solo esos se actualizan,
+# y solo con valores no vacíos. Las claves, la validación calculada, la observación de revisión
+# y la URL de un producto (cambia según el grupo consultado) nunca se reemplazan.
+REFRESH_FIELDS = {
+    "grupos": ("nombre", "responsable", "categoria", "descripcion", "objetivos", "vision", "lineas", "url"),
+    "investigadores": ("nombre", "categoria", "url"),
+    "planes": ("nombre", "objetivo", "actividad"),
+    "productos": ("familia", "tipologia"),
+    "membresias": ("rol", "activo"),
+}
+
+
 def import_gruplac_preview(repository: Repository | CppRepository, preview: WebPreview,
-                           reviewed_group: dict[str, str] | None = None) -> dict[str, Any]:
-    """Incorpora datos respaldados por una ficha, respetando registros ya existentes."""
+                           reviewed_group: dict[str, str] | None = None, *,
+                           remember: bool = True) -> dict[str, Any]:
+    """Incorpora una ficha: crea lo nuevo y actualiza lo existente con lo que diga la fuente.
+
+    remember=False (solo con Repository) omite el historial de deshacer en cargas masivas.
+    """
     if preview.suggested_kind != "grupos" or not preview.suggested_row:
         raise DataError("La vista previa no contiene una ficha de grupo")
     source_group = preview.suggested_row
@@ -2048,8 +2189,9 @@ def import_gruplac_preview(repository: Repository | CppRepository, preview: WebP
     group_id = group["id"]
     counts: dict[str, Any] = {kind: 0 for kind in (
         "grupos", "investigadores", "membresias", "planes", "productos", "grupos_productos", "autorias")}
-    counts["existentes"] = 0
+    counts["existentes"] = counts["actualizados"] = 0
     counts["errors"] = []
+    extra: dict[str, Any] = {} if remember else {"remember": False}
 
     def add(kind: str, row: dict[str, str], key: str | tuple[str, str]) -> bool:
         existing = repository.get(kind, key)
@@ -2063,10 +2205,23 @@ def import_gruplac_preview(repository: Repository | CppRepository, preview: WebP
             if kind == "productos" and (existing["titulo"] != row["titulo"] or existing["anio"] != row["anio"]):
                 counts["errors"].append(f"{kind} {key}: ID ocupado por otro producto")
                 return False
-            counts["existentes"] += 1
+            changes = {name: row[name] for name in REFRESH_FIELDS.get(kind, ())
+                       if row.get(name) and row[name] != existing.get(name, "")}
+            if not changes:
+                counts["existentes"] += 1
+                return True
+            # La fecha de consulta cambia en cada descarga: la fuente solo se renueva con el contenido.
+            if row.get("fuente"):
+                changes["fuente"] = row["fuente"]
+            try:
+                repository.update(kind, key, changes, **extra)
+            except (DataError, OSError, ValueError) as exc:
+                counts["errors"].append(f"{kind} {key}: {exc}")
+                return True
+            counts["actualizados"] += 1
             return True
         try:
-            repository.create(kind, row)
+            repository.create(kind, row, **extra)
         except (DataError, OSError, ValueError) as exc:
             counts["errors"].append(f"{kind} {key}: {exc}")
             return False
@@ -2215,7 +2370,7 @@ def open_gui_repository(*, python_backend: bool = False,
 
 
 def build_gui(root: Any, repository: Repository | CppRepository,
-              data_dir: Path | None = None, *, load_on_start: bool = True) -> Any:
+              data_file: Path | None = None, *, load_on_start: bool = True) -> Any:
     """Construye la ventana; permite verificar sus flujos con un repositorio aislado."""
     import tkinter as tk
     import tkinter.font as tkfont
@@ -3320,14 +3475,15 @@ def build_gui(root: Any, repository: Repository | CppRepository,
     STATUS_COLORS = {"validado": "primary", "rechazado": "rejected", "Sin dato": "unknown"}
 
     class App:
-        def __init__(self, root: tk.Tk, initial_dir: Path | None,
+        def __init__(self, root: tk.Tk, initial_file: Path | None,
                      repository: Repository | CppRepository):
             self.root = root
             self.repo = repository
             self.backend_name = "C++" if isinstance(repository, CppRepository) else "Python"
             self.theme = "light"
-            self.data_dir: Path | None = None
-            self.initial_dir = initial_dir
+            # Archivo donde se guarda; None si los datos aún no tienen uno (vacío, carpeta anterior o copia).
+            self.data_file: Path | None = None
+            self.initial_file = initial_file
             self._url_busy = False
             self.details: set[DetailDialog] = set()
             self._record_cache: dict[tuple[str, str], dict[str, str]] = {}
@@ -3352,7 +3508,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             workspace_bar.columnconfigure(0, weight=1)
             self.workspace_label = ttk.Label(workspace_bar, textvariable=self.workspace, style="Header.TLabel")
             self.workspace_label.grid(row=0, column=0, sticky="w")
-            self.save_button = ttk.Button(workspace_bar, text="Guardar copia", style="Accent.TButton", command=self.save)
+            self.save_button = ttk.Button(workspace_bar, text="Guardar como…", style="Accent.TButton", command=self.save)
             self.save_button.grid(row=0, column=1, padx=(8, 0))
             workspace_bar.bind("<Configure>", lambda event: self.workspace_label.configure(wraplength=max(200, event.width - 180)))
             ttk.Frame(main, style="Rule.TFrame", height=1).pack(side="top", fill="x")
@@ -3665,8 +3821,8 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             menu = tk.Menu(self.root)
             files = tk.Menu(menu, tearoff=False)
             for label, command in (("Iniciar vacío", self.new_workspace),
-                                   ("Abrir carpeta de datos...", self.open_folder),
-                                   ("Cargar datos reales", self.load_real),
+                                   ("Abrir archivo de datos...", self.open_file),
+                                   ("Abrir datos UPC", self.open_default),
                                    ("Guardar", self.save), ("Guardar como...", self.save_as),
                                    ("Exportar para hoja de cálculo...", self.export_spreadsheet),
                                    ("Salir", self.close)):
@@ -4249,7 +4405,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             self.workspace.set(f"{self.workspace_caption} · "
                                + ("Cambios sin guardar" if self.repo.dirty else "Sin cambios pendientes"))
             self.workspace_label.configure(style="Dirty.Header.TLabel" if self.repo.dirty else "Header.TLabel")
-            self.save_button.configure(text="Guardar copia" if self.data_dir is None else "Guardar")
+            self.save_button.configure(text="Guardar como…" if self.data_file is None else "Guardar")
             for detail in tuple(self.details):
                 if detail.winfo_exists():
                     detail.refresh()
@@ -4365,10 +4521,12 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             return True
 
         def start_choice(self) -> None:
-            if self.initial_dir and (self.initial_dir / "manifest.csv").exists():
-                self._load(self.initial_dir)
-                return
-            self.load_real()
+            if self.initial_file is not None:
+                self._load(self.initial_file)
+            elif DEFAULT_DATA_FILE.exists():
+                self._load(DEFAULT_DATA_FILE)
+            else:
+                self.status.set(f"No se encontró {DEFAULT_DATA_FILE.name}; espacio vacío.")
 
         def new_workspace(self) -> None:
             if self._may_discard():
@@ -4376,21 +4534,22 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                     self.repo.reset()
                 else:
                     self.repo = Repository()
-                self.data_dir = None
+                self.data_file = None
                 self.workspace_caption = "Espacio vacío"
                 self.refresh()
-                self.status.set("Espacio vacío. Guarde en una carpeta antes de salir.")
+                self.status.set("Espacio vacío. Guarde en un archivo antes de salir.")
 
-        def _load(self, directory: Path, demo: bool = False) -> None:
+        def _load(self, path: Path) -> None:
+            path = Path(path)
             recovered = False
             try:
                 if isinstance(self.repo, CppRepository):
-                    self.repo.load(directory)
+                    self.repo.load(path)
                 else:
-                    new_repo = load_repository(directory)
+                    new_repo = load_repository(path)
             except (DataError, OSError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
-                backup = directory / ".backup"
-                if backup.is_dir() and messagebox.askyesno("Datos dañados", f"{exc}\n\n¿Abrir la copia anterior de .backup?", parent=self.root):
+                backup = backup_of(path)
+                if backup.exists() and messagebox.askyesno("Datos dañados", f"{exc}\n\n¿Abrir la copia anterior de .backup?", parent=self.root):
                     try:
                         if isinstance(self.repo, CppRepository):
                             self.repo.load(backup)
@@ -4399,67 +4558,74 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                     except (DataError, OSError, ValueError, UnicodeError, json.JSONDecodeError) as backup_exc:
                         messagebox.showerror("Copia inválida", str(backup_exc), parent=self.root)
                         return
-                    directory = backup
+                    path = backup
                     recovered = True
                 else:
                     messagebox.showerror("No se pudo cargar", str(exc), parent=self.root)
                     return
             if not isinstance(self.repo, CppRepository):
                 self.repo = new_repo
-            data_root = Path(__file__).resolve().parents[2] / "data"
-            demo = demo or directory.resolve() == (data_root / "real").resolve()
-            self.data_dir = None if demo or recovered else directory
-            self.workspace_caption = "Muestra pública UPC" if demo else "Copia recuperada" if recovered else directory.name
+            # Una carpeta anterior o una copia recuperada se guardan en un archivo nuevo.
+            folder = is_folder_data(path)
+            self.data_file = None if folder or recovered else path
+            self.workspace_caption = ("Copia recuperada" if recovered else
+                                      "Carpeta anterior" if folder else path.name)
             self.refresh()
-            self.status.set(f"Datos cargados de {directory}" + (" (guardar como copia)" if demo or recovered else ""))
+            self.status.set(f"Datos cargados de {path}" + (" (Guardar como crea el archivo único)"
+                                                          if self.data_file is None else ""))
 
-        def open_folder(self) -> None:
+        def open_file(self) -> None:
             if not self._may_discard():
                 return
-            folder = filedialog.askdirectory(parent=self.root, title="Carpeta con manifest.csv")
-            if folder:
-                self._load(Path(folder))
+            chosen = filedialog.askopenfilename(
+                parent=self.root, title="Archivo de datos PEA-i (o manifest.csv de una carpeta anterior)",
+                filetypes=[("Datos PEA-i", "*.csv"), ("Todos los archivos", "*")])
+            if chosen:
+                self._load(Path(chosen))
 
-        def load_real(self) -> None:
+        def open_default(self) -> None:
             if self._may_discard():
-                self._load(Path(__file__).resolve().parents[2] / "data" / "real", demo=True)
+                self._load(DEFAULT_DATA_FILE)
 
         def save(self) -> bool:
-            if self.data_dir is None:
+            if self.data_file is None:
                 return self.save_as()
             try:
                 if isinstance(self.repo, CppRepository):
-                    self.repo.save(self.data_dir)
+                    self.repo.save(self.data_file)
                 else:
-                    save_repository(self.repo, self.data_dir)
+                    save_repository(self.repo, self.data_file)
             except (OSError, DataError) as exc:
                 messagebox.showerror("No se pudo guardar", str(exc), parent=self.root)
                 return False
             self.refresh()
-            self.status.set(f"Guardado en {self.data_dir}")
+            self.status.set(f"Guardado en {self.data_file}")
             return True
 
         def save_as(self) -> bool:
-            folder = filedialog.askdirectory(parent=self.root, title="Carpeta de trabajo para guardar")
-            if not folder:
+            chosen = filedialog.asksaveasfilename(
+                parent=self.root, title="Guardar datos en un archivo", defaultextension=".csv",
+                initialfile=DEFAULT_DATA_FILE.name, filetypes=[("Datos PEA-i", "*.csv")])
+            if not chosen:
                 return False
-            chosen = Path(folder)
-            data_root = Path(__file__).resolve().parents[2] / "data"
-            if chosen.resolve() == (data_root / "real").resolve():
-                messagebox.showerror("Muestra protegida", "Guarde una copia en otra carpeta", parent=self.root)
-                return False
-            if (chosen / "manifest.csv").exists() and chosen != self.data_dir:
-                if not messagebox.askyesno("Reemplazar datos", "La carpeta ya contiene datos PEA-i. ¿Reemplazarlos?", parent=self.root):
-                    return False
-            previous = self.data_dir
+            previous = self.data_file
             previous_caption = self.workspace_caption
-            self.data_dir = chosen
-            self.workspace_caption = chosen.name
+            self.data_file = Path(chosen)
+            self.workspace_caption = self.data_file.name
             if not self.save():
-                self.data_dir = previous
+                self.data_file = previous
                 self.workspace_caption = previous_caption
                 return False
             return True
+
+        def _keep_import(self, summary: str) -> None:
+            """Lo importado se guarda de inmediato en el archivo abierto: los datos crecen con cada fuente."""
+            if self.data_file is not None and self.repo.dirty:
+                saved = self.save()
+                self.status.set(f"{summary} " + (f"Guardado en {self.data_file.name}." if saved
+                                                 else "No se pudo guardar; use Guardar como."))
+                return
+            self.status.set(f"{summary} Guarde para conservarlo." if self.repo.dirty else summary)
 
         def export_spreadsheet(self) -> None:
             folder = filedialog.askdirectory(parent=self.root, title="Carpeta para exportar a hoja de cálculo")
@@ -4543,7 +4709,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                 messagebox.showerror("No se pudo importar", str(exc), parent=self.root)
                 return
             self.refresh()
-            self.status.set(f"Importación: {accepted} filas aceptadas; {total - accepted} rechazadas. Guarde para conservarlas.")
+            self._keep_import(f"Importación: {accepted} filas aceptadas; {total - accepted} rechazadas.")
             messagebox.showinfo("Resultado de importación", f"Aceptadas: {accepted}\nRechazadas: {total - accepted}\n\n" + "\n".join(errors[:20]), parent=self.root)
 
         def _accept_external(self, kind: str, row: dict[str, str]) -> None:
@@ -4551,8 +4717,9 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             initial = {**existing, **{key: value for key, value in row.items() if value}} if existing else row
             if existing and existing.get("fuente") and row.get("fuente") and row["fuente"] not in existing["fuente"]:
                 initial["fuente"] = existing["fuente"] + "; " + row["fuente"]
-            self.edit_record(kind, key=existing["id"] if existing else None, defaults=initial,
-                             external=existing is None)
+            if self.edit_record(kind, key=existing["id"] if existing else None, defaults=initial,
+                                external=existing is None):
+                self._keep_import("Registro importado.")
 
         def import_url(self, initial_url: str | None = None) -> None:
             if self._url_busy:
@@ -4673,13 +4840,13 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                     messagebox.showerror("Ficha GrupLAC", str(exc), parent=self.root)
                     return
                 self.refresh()
-                self.status.set("Ficha incorporada en memoria. Guarde una copia para conservarla."
-                                if self.data_dir is None else "Ficha incorporada en memoria. Use Guardar para conservarla.")
+                self._keep_import(f"Ficha incorporada: {counts['actualizados']} registros actualizados.")
                 summary = "\n".join(f"{label}: {counts[key]}" for key, label in (
                     ("grupos", "Grupos"), ("investigadores", "Investigadores"),
                     ("membresias", "Membresías"), ("planes", "Planes"),
                     ("productos", "Productos"), ("grupos_productos", "Vínculos grupo-producto"),
-                    ("autorias", "Autorías"), ("existentes", "Ya existentes")))
+                    ("autorias", "Autorías"), ("actualizados", "Actualizados con la fuente"),
+                    ("existentes", "Sin cambios")))
                 if counts["errors"]:
                     summary += f"\nErrores: {len(counts['errors'])}\n" + "\n".join(counts["errors"][:5])
                 messagebox.showinfo("Ficha GrupLAC", summary, parent=self.root)
@@ -4731,10 +4898,10 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             preview = parse_web_page(html, path.resolve().as_uri(), "HTML")
             self._show_web_preview(preview, source=f"DOCX {path.name}, consultado {date.today().isoformat()}")
 
-    return App(root, data_dir, repository)
+    return App(root, data_file, repository)
 
 
-def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
+def run_gui(data_file: Path | None = None, *, python_backend: bool = False,
             cpp_binary: Path | None = None) -> None:
     import tkinter as tk
     from tkinter import messagebox
@@ -4744,7 +4911,7 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
     try:
         repository, fallback_reason = open_gui_repository(
             python_backend=python_backend, cpp_binary=cpp_binary)
-        app = build_gui(root, repository, data_dir)
+        app = build_gui(root, repository, data_file)
         if fallback_reason:
             app.status.set(f"Motor Python activo: {fallback_reason}")
         root.mainloop()
@@ -4762,13 +4929,15 @@ def run_gui(data_dir: Path | None = None, *, python_backend: bool = False,
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="PEA-i UPC con interfaz Tkinter")
-    parser.add_argument("--data-dir", type=Path, help="Carpeta PEA-i que se abre al iniciar")
+    parser.add_argument("--data", type=Path,
+                        help="Archivo de datos PEA-i (.csv) que se abre al iniciar; por defecto data/pea_upc.csv. "
+                             "También acepta una carpeta anterior para convertirla")
     parser.add_argument("--cpp-binary", type=Path, help="Ejecutable C++ compilado (opcional)")
     parser.add_argument("--python-backend", action="store_true",
                         help="Usar la implementación Python independiente en vez del backend C++")
     args = parser.parse_args()
     try:
-        run_gui(args.data_dir, python_backend=args.python_backend, cpp_binary=args.cpp_binary)
+        run_gui(args.data, python_backend=args.python_backend, cpp_binary=args.cpp_binary)
     except DataError as exc:
         parser.exit(1, f"Error: {exc}\n")
 

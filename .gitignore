@@ -4,11 +4,10 @@ __pycache__/
 .pytest_cache/
 build/
 data/local/
-data/demo/
 **/.backup/
 *.tmp
 .claude/
 .agents/
 .codex/
 docs/cambios_sesion.md
-data/sample_scienti/
+data/sample_scienti.csv

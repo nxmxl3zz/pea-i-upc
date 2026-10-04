@@ -1,4 +1,4 @@
-"""Recorre los menus C++ con datos nuevos y comprueba los CSV desde Python."""
+"""Recorre los menus C++ con datos nuevos y comprueba el archivo guardado desde Python."""
 
 import importlib.util
 from pathlib import Path
@@ -39,14 +39,14 @@ def main() -> None:
             ("3", "grupos_productos", {"grupo_id": "G-CLI", "producto_id": "P-CLI"}),
         ):
             actions += [relation_option, "3", *values(kind, fields), "0"]
-        actions += ["0", "7", "2", "G-CLI", "4", "2025", "2025", "", "", "11", folder, "0"]
+        actions += ["0", "7", "2", "G-CLI", "4", "2025", "2025", "", "", "11", str(Path(folder) / "datos.csv"), "0"]
         run = subprocess.run(
             [str(binary)], input="\n".join(actions) + "\n", text=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             cwd=ROOT, timeout=20, check=True,
         )
         assert "Productos unicos: 1" in run.stdout, run.stdout[-3000:]
-        saved = pea.load_repository(Path(folder))
+        saved = pea.load_repository(Path(folder) / "datos.csv")
         assert len(saved.rows("grupos")) == 1
         assert len(saved.rows("investigadores")) == 1
         assert len(saved.rows("productos")) == 1

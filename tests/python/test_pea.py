@@ -41,6 +41,26 @@ def sample() -> pea.Repository:
     return repo
 
 
+def write_folder(repo: pea.Repository, path: Path, version: str = "3") -> None:
+    """Carpeta anterior al archivo único, con un CSV por tabla como en las versiones 1 a 3."""
+    path.mkdir(parents=True, exist_ok=True)
+    tables = {"manifest": [{"version": version, "guardado": "2026-09-24T00:00:00"}],
+              **{kind: repo.rows(kind) for kind in pea.ALL_FIELDS},
+              "cola_validacion": list(repo.queue),
+              "historial": [{"orden": str(index), "snapshot": state} for index, state in enumerate(repo.history)]}
+    for name, rows in tables.items():
+        fields = pea.DATA_SECTIONS[name]
+        with (path / f"{name}.csv").open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.writer(stream, lineterminator="\n")
+            writer.writerow(fields)
+            writer.writerows([pea._storage_cell(row.get(field, "")) for field in fields] for row in rows)
+
+
+def section_markers(path: Path) -> list[str]:
+    with path.open(encoding="utf-8", newline="") as stream:
+        return [record[0] for record in csv.reader(stream) if len(record) == 1 and record[0].startswith("#")]
+
+
 class StartupTest(unittest.TestCase):
     def test_windows_bundle_matches_cpp_source(self):
         root = SOURCE.parents[2]
@@ -188,8 +208,9 @@ class DomainTest(unittest.TestCase):
         repo = sample()
         repo.enqueue_review("P1", "Tildes: acción")
         with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp)
+            path = Path(temp) / "datos.csv"
             pea.save_repository(repo, path)
+            self.assertEqual(sorted(item.name for item in Path(temp).iterdir()), ["datos.csv"])
             loaded = pea.load_repository(path)
             self.assertEqual(loaded.snapshot(), repo.snapshot())
             self.assertEqual(loaded.history.length, repo.history.length)
@@ -197,18 +218,101 @@ class DomainTest(unittest.TestCase):
             self.assertEqual(loaded.queue.length, 0)
             self.assertEqual(loaded.get("productos", "P2")["titulo"], "Trabajo\nmultilínea")
 
+    def test_single_file_sections_in_order(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "datos.csv"
+            pea.save_repository(sample(), path)
+            self.assertEqual(section_markers(path), ["#" + name for name in pea.DATA_SECTIONS])
+            self.assertEqual(list(pea.DATA_SECTIONS), [
+                "manifest", "grupos", "investigadores", "productos", "planes",
+                "membresias", "autorias", "grupos_productos", "cola_validacion", "historial"])
+            manifest = [row for section, _, row in pea.read_data_sections(path) if section == "manifest"]
+            self.assertEqual([row["version"] for row in manifest], ["4"])
+
+    def test_single_file_tolerates_bom_crlf_and_blank_lines(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "datos.csv"
+            repo = sample()
+            pea.save_repository(repo, path)
+            text = path.read_text(encoding="utf-8")
+            path.write_bytes(b"\xef\xbb\xbf" + (text + "\n\n").replace("\n", "\r\n").encode("utf-8"))
+            loaded = pea.load_repository(path)
+            self.assertEqual(loaded.get("productos", "P2")["titulo"], "Trabajo\r\nmultilínea")
+            self.assertEqual(len(loaded.rows("autorias")), 2)
+
+    def test_single_file_rejects_bad_structure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            good = Path(temp) / "datos.csv"
+            pea.save_repository(sample(), good)
+            lines = good.read_text(encoding="utf-8").split("\n")
+            broken = Path(temp) / "roto.csv"
+
+            def rejects(text: str, message: str) -> None:
+                broken.write_text(text, encoding="utf-8")
+                with self.assertRaises(pea.DataError) as caught:
+                    pea.load_repository(broken)
+                self.assertIn(message, str(caught.exception))
+
+            cut = lines.index("#grupos_productos")
+            rejects("\n".join(lines[:cut]) + "\n", "falta la sección #grupos_productos")
+            first, second = lines.index("#grupos"), lines.index("#investigadores")
+            swapped = lines[:first] + lines[second:lines.index("#productos")] + lines[first:second] + lines[lines.index("#productos"):]
+            rejects("\n".join(swapped), "línea 4: se esperaba la sección #grupos")
+            header = lines.index("#planes") + 1
+            rejects("\n".join(lines[:header] + ["id,nombre"] + lines[header + 1:]), "encabezados incorrectos en #planes")
+            row = lines.index("#autorias") + 2
+            rejects("\n".join(lines[:row] + [lines[row] + ",sobrante"] + lines[row + 1:]),
+                    f"línea {row + 1}: fila malformada en #autorias")
+            rejects("G1,Grupo\n" + "\n".join(lines), "línea 1: el archivo debe comenzar con #manifest")
+            rejects("\n".join(lines).replace("\n4,", "\n3,", 1), "Versión de datos incompatible")
+            rejects("\n".join(lines) + "#extra\n", "sección sobrante #extra")
+
+    def test_failed_save_keeps_previous_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "datos.csv"
+            repo = sample()
+            pea.save_repository(repo, path)
+            before = path.read_bytes()
+            repo.update("grupos", "G1", {"nombre": "Cambio que no se guarda"})
+            with patch.object(pea.os, "replace", side_effect=OSError("disco lleno")):
+                with self.assertRaises(OSError):
+                    pea.save_repository(repo, path)
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual([item.name for item in Path(temp).iterdir() if item.name.endswith(".tmp")], [])
+            self.assertTrue(repo.dirty)
+
     def test_previous_save_can_be_recovered(self):
         repo = sample()
         with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp)
+            path = Path(temp) / "datos.csv"
             pea.save_repository(repo, path)
             repo.update("grupos", "G1", {"nombre": "Nuevo nombre"})
             pea.save_repository(repo, path)
-            (path / "grupos.csv").write_text("archivo dañado", encoding="utf-8")
+            path.write_text("archivo dañado", encoding="utf-8")
             with self.assertRaises(pea.DataError):
                 pea.load_repository(path)
-            recovered = pea.load_repository(path / ".backup")
+            self.assertEqual(pea.backup_of(path), Path(temp) / ".backup" / "datos.csv")
+            recovered = pea.load_repository(pea.backup_of(path))
             self.assertEqual(recovered.get("grupos", "G1")["nombre"], "Grupo uno")
+
+    def test_saving_to_a_folder_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaises(pea.DataError):
+                pea.save_repository(sample(), Path(temp))
+
+    def test_legacy_folder_opens_by_folder_or_manifest(self):
+        repo = sample()
+        repo.enqueue_review("P1", "Revisar")
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp) / "anterior"
+            write_folder(repo, folder)
+            for path in (folder, folder / "manifest.csv"):
+                self.assertTrue(pea.is_folder_data(path))
+                loaded = pea.load_repository(path)
+                self.assertEqual(loaded.snapshot(), repo.snapshot())
+                self.assertTrue(loaded.undo())
+            self.assertEqual(pea.backup_of(folder), folder / ".backup")
+            self.assertFalse(pea.is_folder_data(Path(temp) / "datos.csv"))
 
     def test_product_year_derived_from_date(self):
         repo = pea.Repository()
@@ -444,8 +548,63 @@ class DomainTest(unittest.TestCase):
                 if isinstance(repo, pea.CppRepository):
                     repo.close()
 
+    def test_gruplac_reimport_refreshes_existing_records(self):
+        url = "https://scienti.minciencias.gov.co/gruplac/jsp/visualiza/visualizagr.jsp?nro=123"
+        profile = "https://scienti.minciencias.gov.co/cvlac/visualizador/generarCurriculoCv.do?cod_rh=0042"
+
+        def page(level: str, period: str, typology: str):
+            return pea.parse_web_page(f"""<h1>Grupo de prueba</h1><h2>Datos básicos</h2>
+            <p>Clasificación: {level}</p>
+            <h2>Integrantes del grupo</h2><table>
+            <tr><th>Nombre</th><th>Vinculación</th><th>Horas</th><th>Inicio - Fin</th></tr>
+            <tr><td><a href="{profile}">1.- Ana Pérez</a></td><td>Investigador</td><td>20</td><td>{period}</td></tr>
+            </table>
+            <h2>Artículos publicados</h2>
+            <p>1.- {typology}: Estudio verificable</p>
+            <p>Colombia, Revista X, 2024 vol:2, DOI:10.1000/uno</p>
+            <p>Autores: Ana Perez</p>
+            <h2>Libros publicados</h2>""", url)
+
+        first = page("B", "2020/1 - Actual", "Publicado en revista especializada")
+        product_id = first.related_products[0]["id"]
+        binary = SOURCE.parents[2] / "build" / "pea_cpp"
+        for factory in (pea.Repository, lambda: pea.CppRepository(binary)):
+            if factory is not pea.Repository and not binary.exists():
+                continue
+            repo = factory()
+            try:
+                pea.import_gruplac_preview(repo, first)
+                repo.update("productos", product_id, {"observacion": "Revisado a mano",
+                                                      "url": "https://doi.org/10.1000/uno"})
+                repo.update("grupos", "G-123", {"unidad": "Facultad de prueba"})
+                repo.update("investigadores", "I-0042", {"fuente": "Fuente anterior"})
+                same = pea.import_gruplac_preview(repo, first)
+                self.assertEqual((same["actualizados"], same["errors"]), (0, []))
+                self.assertEqual(repo.get("investigadores", "I-0042")["fuente"], "Fuente anterior")
+                self.assertEqual(repo.get("productos", product_id)["url"], "https://doi.org/10.1000/uno")
+                changed = pea.import_gruplac_preview(repo, page("A", "2020/1 - 2025/6", "Artículo de investigación"))
+                self.assertEqual((changed["actualizados"], changed["errors"]), (3, []))
+                membership = repo.get("membresias", ("G-123", "I-0042"))
+                self.assertEqual((membership["activo"], membership["rol"]), ("0", "Investigador · 2020/1 - 2025/6"))
+                product = repo.get("productos", product_id)
+                self.assertEqual(product["tipologia"], "Artículo de investigación")
+                self.assertEqual((product["url"], product["observacion"]),
+                                 ("https://doi.org/10.1000/uno", "Revisado a mano"))
+                group = repo.get("grupos", "G-123")
+                self.assertEqual((group["categoria"], group["unidad"]), ("A", "Facultad de prueba"))
+                if isinstance(repo, pea.Repository):
+                    before = repo.history_size()
+                    quiet = pea.import_gruplac_preview(repo, page("A1", "2020/1 - 2025/6", "Artículo de investigación"),
+                                                       remember=False)
+                    self.assertEqual(quiet["actualizados"], 1)
+                    self.assertEqual(repo.history_size(), before)
+            finally:
+                if isinstance(repo, pea.CppRepository):
+                    repo.close()
+
     def test_real_dataset_loads_with_expected_relations(self):
-        real = pea.load_repository(SOURCE.parents[2] / "data" / "real")
+        real = pea.load_repository(SOURCE.parents[2] / "data" / "pea_upc.csv")
+        self.assertEqual(pea.DEFAULT_DATA_FILE, SOURCE.parents[2] / "data" / "pea_upc.csv")
         self.assertEqual(real.statistics()["total"], 6363)
         self.assertEqual(real.statistics(view="Grupo", selected_id="G-00000000002099")["total"], 197)
         self.assertEqual(real.statistics(view="Investigador", selected_id="I-0000494917")["total"], 15)
@@ -491,9 +650,10 @@ class DomainTest(unittest.TestCase):
 
     def test_demo_contract(self):
         with tempfile.TemporaryDirectory(prefix="pea-fixture-") as folder:
+            output = Path(folder) / "demo.csv"
             subprocess.run([sys.executable, str(SOURCE.parents[2] / "scripts/build_demo.py"),
-                            "--output", folder], check=True, capture_output=True, text=True)
-            demo = pea.load_repository(Path(folder))
+                            "--output", str(output)], check=True, capture_output=True, text=True)
+            demo = pea.load_repository(output)
             self.assertEqual(demo.statistics()["total"], 4)
             self.assertEqual(demo.statistics(start=2025, end=2026)["total"], 2)
             self.assertEqual(demo.statistics(start=2022, end=2026)["total"], 3)
@@ -564,12 +724,12 @@ class SecurityTest(unittest.TestCase):
         repo.create("grupos", {"id": "G1", "nombre": "=1+1"}, remember=False)
         repo.create("productos", {"id": "P1", "titulo": "'=texto"}, remember=False)
         with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp)
+            path = Path(temp) / "datos.csv"
             pea.save_repository(repo, path)
-            with (path / "grupos.csv").open(encoding="utf-8", newline="") as stream:
-                self.assertEqual(next(csv.DictReader(stream))["nombre"], "'=1+1")
-            with (path / "productos.csv").open(encoding="utf-8", newline="") as stream:
-                self.assertEqual(next(csv.DictReader(stream))["titulo"], "''=texto")
+            with path.open(encoding="utf-8", newline="") as stream:
+                stored = {record[0]: record for record in csv.reader(stream)}
+            self.assertEqual(stored["G1"][1], "'=1+1")
+            self.assertEqual(stored["P1"][1], "''=texto")
             loaded = pea.load_repository(path)
             self.assertEqual(loaded.get("grupos", "G1")["nombre"], "=1+1")
             self.assertEqual(loaded.get("productos", "P1")["titulo"], "'=texto")
@@ -577,11 +737,7 @@ class SecurityTest(unittest.TestCase):
     def test_legacy_v1_variants_load(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp)
-            pea.save_repository(sample(), path)
-            with (path / "manifest.csv").open("w", encoding="utf-8", newline="") as stream:
-                writer = csv.writer(stream)
-                writer.writerow(("version", "guardado"))
-                writer.writerow(("1", "2026-09-24T00:00:00"))
+            write_folder(sample(), path, "1")
             groups = pea._csv_read(path / "grupos.csv", pea.ENTITY_FIELDS["grupos"], encoded=True)
             with (path / "grupos.csv").open("w", encoding="utf-8", newline="") as stream:
                 fields = ("id", "nombre", "sigla", *pea.ENTITY_FIELDS["grupos"][2:])
@@ -603,9 +759,7 @@ class SecurityTest(unittest.TestCase):
     def test_version_2_product_category_moves_to_observation(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp)
-            pea.save_repository(sample(), path)
-            with (path / "manifest.csv").open("w", encoding="utf-8", newline="") as stream:
-                csv.writer(stream).writerows((("version", "guardado"), ("2", "2026-09-24T00:00:00")))
+            write_folder(sample(), path, "2")
             products = pea._csv_read(path / "productos.csv", pea.ENTITY_FIELDS["productos"], encoded=True)
             products[0].update(categoria="A1", validacion="pendiente")
             products[1].update(categoria="")
@@ -619,9 +773,11 @@ class SecurityTest(unittest.TestCase):
                              "Categoría registrada antes de la versión 3: A1")
             self.assertEqual(loaded.get("productos", "P1")["validacion"], "validado")
             self.assertEqual(loaded.get("productos", "P2")["observacion"], "")
-            pea.save_repository(loaded, path)
-            with (path / "manifest.csv").open(encoding="utf-8") as stream:
-                self.assertEqual(next(csv.DictReader(stream))["version"], "3")
+            converted = path / "datos.csv"
+            pea.save_repository(loaded, converted)
+            manifest = [row for section, _, row in pea.read_data_sections(converted) if section == "manifest"]
+            self.assertEqual(manifest[0]["version"], "4")
+            self.assertEqual(pea.load_repository(converted).snapshot(), loaded.snapshot())
 
     def test_extract_pdf_text_caps_output(self):
         class Stream:

@@ -1,10 +1,11 @@
-"""Importa el conjunto completo de grupos de la Universidad Popular del Cesar.
+"""Actualiza el archivo de datos con los grupos de la Universidad Popular del Cesar.
 
 Enumeración obtenida de la búsqueda pública "Ciencia y Tecnología para Todos"
 (busquedaGrupoXInstitucionGrupos.do?codInst=947), Convocatoria 957 de 2024.
-Cada grupo se descarga desde su ficha GrupLAC pública y se incorpora con el
-mismo motor de importación que usa la interfaz (import_gruplac_preview), pero
-con el historial desactivado para que la carga masiva no sea cuadrática.
+Cada grupo se descarga desde su ficha GrupLAC pública y se fusiona en el archivo
+existente con el mismo motor de importación que usa la interfaz
+(import_gruplac_preview): agrega lo nuevo, actualiza lo que la fuente cambió y no
+borra nada. El historial se desactiva para que la carga masiva no sea cuadrática.
 """
 
 from __future__ import annotations
@@ -18,8 +19,9 @@ pea = runpy.run_path(str(ROOT / "src" / "python" / "Taller2_REMR.py"))
 
 DataError = pea["DataError"]
 Repository = pea["Repository"]
-clean_row = pea["clean_row"]
 fetch_web_page = pea["fetch_web_page"]
+import_gruplac_preview = pea["import_gruplac_preview"]
+load_repository = pea["load_repository"]
 save_repository = pea["save_repository"]
 
 GROUP_URL = "https://scienti.minciencias.gov.co/gruplac/jsp/visualiza/visualizagr.jsp?nro={nro}"
@@ -95,119 +97,51 @@ GROUPS: list[tuple[str, str]] = [
 ]
 
 
-def import_group(repo: Repository, preview) -> dict:
-    """Equivalente a import_gruplac_preview, pero con historial desactivado.
-
-    El motor de la interfaz registra un snapshot completo en cada alta para
-    poder deshacer; en una carga masiva eso es cuadrático, así que aquí se
-    repite la misma lógica de fusión llamando a create(..., remember=False).
-    """
-    if preview.suggested_kind != "grupos" or not preview.suggested_row:
-        raise DataError("La ficha no contiene un grupo")
-    source_group = preview.suggested_row
-    group = clean_row("grupos", source_group)
-    if group["codigo_gruplac"] != source_group["codigo_gruplac"]:
-        raise DataError("El código GrupLAC revisado no coincide con la fuente")
-    group_id = group["id"]
-    counts = {kind: 0 for kind in (
-        "grupos", "investigadores", "membresias", "planes", "productos", "grupos_productos", "autorias")}
-    counts["existentes"] = 0
-    counts["errors"] = []
-
-    def add(kind: str, row: dict, key) -> bool:
-        existing = repo.get(kind, key)
-        if existing is not None:
-            if kind == "grupos" and existing["codigo_gruplac"] != source_group["codigo_gruplac"]:
-                counts["errors"].append(f"{kind} {key}: ID ocupado por otro grupo")
-                return False
-            if kind == "investigadores" and existing["codigo_cvlac"] != row["codigo_cvlac"]:
-                counts["errors"].append(f"{kind} {key}: ID ocupado por otro perfil")
-                return False
-            if kind == "productos" and (existing["titulo"] != row["titulo"] or existing["anio"] != row["anio"]):
-                counts["errors"].append(f"{kind} {key}: ID ocupado por otro producto")
-                return False
-            counts["existentes"] += 1
-            return True
-        try:
-            repo.create(kind, row, remember=False)
-        except (DataError, OSError, ValueError) as exc:
-            counts["errors"].append(f"{kind} {key}: {exc}")
-            return False
-        counts[kind] += 1
-        return True
-
-    if not add("grupos", group, group_id):
-        return counts
-    available_people = set()
-    for person, _ in preview.related_members:
-        if add("investigadores", person, person["id"]):
-            available_people.add(person["id"])
-    if preview.related_plan:
-        add("planes", {**preview.related_plan, "grupo_id": group_id}, preview.related_plan["id"])
-    for person, membership in preview.related_members:
-        if person["id"] in available_people:
-            add("membresias", {**membership, "grupo_id": group_id}, (group_id, person["id"]))
-    available_products = set()
-    for product in preview.related_products:
-        if add("productos", product, product["id"]):
-            available_products.add(product["id"])
-    for product in preview.related_products:
-        if product["id"] in available_products:
-            add("grupos_productos", {
-                "grupo_id": group_id, "producto_id": product["id"],
-                "origen": "GrupLAC: producto listado en la ficha",
-            }, (group_id, product["id"]))
-    for authorship in preview.related_authorships:
-        product_id, researcher_id = authorship["producto_id"], authorship["investigador_id"]
-        if product_id in available_products and researcher_id in available_people:
-            add("autorias", authorship, (product_id, researcher_id))
-    return counts
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Importar los 66 grupos UPC desde sus fichas GrupLAC")
-    parser.add_argument("--output", type=Path, default=ROOT / "data" / "real",
-                        help="Carpeta CSV de salida")
-    parser.add_argument("--limit", type=int, help="Máximo de grupos a importar (para pruebas)")
+    parser = argparse.ArgumentParser(description="Actualizar el archivo de datos con los 66 grupos UPC de GrupLAC")
+    parser.add_argument("--data", type=Path, default=ROOT / "data" / "pea_upc.csv",
+                        help="Archivo de datos que se actualiza (se crea si no existe)")
+    parser.add_argument("--limit", type=int, help="Máximo de grupos a consultar (para pruebas)")
     args = parser.parse_args()
     if args.limit is not None and args.limit < 1:
         parser.error("--limit debe ser positivo")
-    if args.limit and args.output.resolve() == (ROOT / "data" / "real").resolve():
-        parser.error("--limit requiere --output para no reemplazar el conjunto completo")
 
-    repo = Repository()
-    totals = {kind: 0 for kind in ("grupos", "investigadores", "membresias", "planes",
-                                   "productos", "grupos_productos", "autorias")}
+    repo = load_repository(args.data) if args.data.exists() else Repository()
+    kinds = ("grupos", "investigadores", "membresias", "planes", "productos", "grupos_productos", "autorias")
+    added = {kind: 0 for kind in kinds}
+    updated = 0
     failures: list[tuple[str, str]] = []
-    for index, (nro, name) in enumerate(GROUPS[:args.limit] if args.limit else GROUPS, start=1):
+    selected = GROUPS[:args.limit] if args.limit else GROUPS
+    for index, (nro, name) in enumerate(selected, start=1):
         url = GROUP_URL.format(nro=nro)
         try:
             preview = fetch_web_page(url)
-            counts = import_group(repo, preview)
+            counts = import_gruplac_preview(repo, preview, remember=False)
         except (DataError, OSError, ValueError) as exc:
             failures.append((name, str(exc)))
-            print(f"[{index:2d}/{len(GROUPS)}] FALLO  {name}: {exc}")
+            print(f"[{index:2d}/{len(selected)}] FALLO  {name}: {exc}")
             continue
-        for kind in totals:
-            totals[kind] += counts[kind]
-        print(f"[{index:2d}/{len(GROUPS)}] OK     {name}  "
-              f"(investigadores +{counts['investigadores']}, productos +{counts['productos']})")
+        for kind in kinds:
+            added[kind] += counts[kind]
+        updated += counts["actualizados"]
+        print(f"[{index:2d}/{len(selected)}] OK     {name}  (nuevos: {sum(counts[kind] for kind in kinds)}, "
+              f"actualizados: {counts['actualizados']})")
         if counts["errors"]:
             for error in counts["errors"][:5]:
                 print(f"          - {error}")
             failures.append((name, f"{len(counts['errors'])} registros o vínculos rechazados"))
 
+    # Fusionar nunca borra: los grupos que fallaron conservan sus datos anteriores.
+    if updated or any(added.values()) or not args.data.exists():
+        save_repository(repo, args.data)
+    print(f"\nArchivo {args.data}: {updated} registros actualizados; nuevos:")
+    for kind in kinds:
+        print(f"  {kind}: {added[kind]}")
     if failures:
-        print(f"\n{len(failures)} grupo(s) con importación incompleta; no se reemplazó {args.output}:")
+        print(f"\n{len(failures)} grupo(s) con importación incompleta (se conservan sus datos anteriores):")
         for name, reason in failures:
             print(f"  - {name}: {reason}")
         raise SystemExit(1)
-
-    save_repository(repo, args.output)
-    print(f"\nGuardado en {args.output}:")
-    for kind in ("grupos", "investigadores", "membresias", "planes",
-                 "productos", "grupos_productos", "autorias"):
-        print(f"  {kind}: {totals[kind]}")
 
 
 if __name__ == "__main__":

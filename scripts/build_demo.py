@@ -1,4 +1,4 @@
-"""Genera datos ficticios para pruebas locales, fuera del repositorio."""
+"""Genera un archivo de datos ficticios para pruebas, fuera de data/ (que solo guarda datos reales)."""
 
 import argparse
 import importlib.util
@@ -7,7 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument("--output", type=Path, default=ROOT / "data" / "demo")
+parser.add_argument("--output", type=Path, required=True, help="Archivo .csv de salida")
 args = parser.parse_args()
 SOURCE = ROOT / "src" / "python" / "Taller2_REMR.py"
 SPEC = importlib.util.spec_from_file_location("pea", SOURCE)
