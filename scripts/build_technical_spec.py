@@ -61,7 +61,7 @@ def architecture_image(path: Path) -> None:
     box(draw, (25, 60, 350, 215), ["Usuario", "Tkinter"])
     box(draw, (475, 60, 800, 215), ["Mensajes JSON", "stdin / stdout"])
     box(draw, (925, 60, 1250, 215), ["Motor C++", "Repository"])
-    box(draw, (1350, 60, 1570, 215), ["CSV", "persistencia"])
+    box(draw, (1350, 60, 1570, 215), ["Archivo", "único CSV"])
     arrow(draw, (355, 135), (468, 135))
     arrow(draw, (805, 135), (918, 135))
     arrow(draw, (1255, 135), (1343, 135))
@@ -106,7 +106,7 @@ def use_case_image(path: Path) -> None:
         "Importar y revisar fuentes",
         "Filtrar y consultar estadísticas",
         "Revisar cola y deshacer",
-        "Guardar o recuperar datos CSV",
+        "Guardar o recuperar el archivo",
     ]
     for index, line in enumerate(labels):
         top = 8 + index * 92
@@ -278,11 +278,12 @@ def build() -> None:
     heading(doc, "1 Objetivo y alcance")
     paragraph(doc, "Las operaciones de dominio son alta, consulta, edición, desactivación, reactivación y baja "
                    "de entidades y relaciones. C++ ofrece menús de consola y un protocolo local de solicitudes; "
-                   "Python ofrece un panel Tkinter y conserva un motor autónomo con el mismo esquema de datos. "
-                   "Tkinter inicia el proceso C++ en modo API cuando encuentra un binario vigente y, en caso "
-                   "contrario, ejecuta el motor Python.")
+                   "Python ofrece una interfaz Tkinter y conserva un motor autónomo con el mismo esquema de datos. "
+                   "Tkinter usa el motor C++ en modo API: toma un binario compilado vigente, en Windows el "
+                   "ejecutable incluido si sus huellas coinciden, o lo compila con CMake. Si no lo consigue, "
+                   "ejecuta el motor Python y lo indica en la barra de estado.")
     paragraph(doc, "Las salidas comprenden fichas y relaciones consultables, revisión pendiente, historial de "
-                   "deshacer, distribuciones descriptivas y diez archivos CSV por carpeta. La adquisición "
+                   "deshacer, distribuciones descriptivas y un archivo único de datos. La adquisición "
                    "externa usa fichas públicas GrupLAC o CvLAC, CSV, Excel, Word y PDF con texto extraíble. "
                    "El conjunto incluido reúne fichas públicas de 66 grupos UPC; no es un censo institucional.")
 
@@ -290,7 +291,7 @@ def build() -> None:
     paragraph(doc, "La interfaz Tkinter envía una solicitud JSON por línea a la entrada estándar de "
                    "pea_cpp --api y recibe una respuesta JSON por la salida estándar. No intervienen puertos "
                    "ni servicios de red en la conexión entre procesos. Repository mantiene listas, "
-                   "multilistas, pila y cola en memoria y coordina el guardado CSV. Python obtiene y "
+                   "multilistas, pila y cola en memoria y coordina el guardado del archivo. Python obtiene y "
                    "previsualiza las fuentes web; los registros confirmados se incorporan mediante "
                    "operaciones del motor activo.")
     with tempfile.TemporaryDirectory(prefix="pea-doc-") as folder:
@@ -302,7 +303,23 @@ def build() -> None:
         model_image(model)
         use_case_image(use_case)
         figure(doc, architecture, "Figura 1. Procesos y flujo de datos de la aplicación.")
-        paragraph(doc, "Los casos de uso cubren inicio vacío o desde carpeta, mantenimiento de entidades y "
+        paragraph(doc, "La ventana Tkinter organiza el trabajo en una barra lateral con tres grupos: Análisis "
+                       "(Dashboard y Gráficos), Registros (Grupos, Investigadores, Productos, Planes y "
+                       "Relaciones: integrantes, autorías y grupos-productos) y Seguimiento (Cola de revisión). "
+                       "Admite tema claro u oscuro y Ctrl+Z para deshacer.")
+        heading(doc, "Protocolo entre procesos", 2)
+        paragraph(doc, "Cada solicitud es un objeto JSON en una línea con la acción y sus parámetros como "
+                       "cadenas; la respuesta es {\"ok\":true,\"result\":…} o {\"ok\":false,\"error\":…}. Al conectarse, la interfaz "
+                       "envía ping y exige la respuesta {\"backend\":\"cpp\",\"protocol\":\"3\"}; con otra "
+                       "versión no usa el proceso. pea_cpp acepta --data ARCHIVO para abrir un archivo al iniciar.")
+        add_table(doc, ["Grupo", "Acciones del protocolo 3"], [
+            ["Sesión y archivo", "ping, state, reset, load, save, shutdown"],
+            ["Consulta", "rows, page, get, related, related_page, summary, field_usage, product_issues, statistics"],
+            ["Cambios", "new_id, create, update, delete, toggle, import_csv"],
+            ["Cola de revisión", "queue_rows, queue_page, queue_front, enqueue_review, enqueue_rejected, process_review, discard_review"],
+            ["Historial", "undo, clear_history"],
+        ], [3.6, 13.2])
+        paragraph(doc, "Los casos de uso cubren inicio vacío o desde el archivo de datos, mantenimiento de entidades y "
                        "vínculos, incorporación de fuentes, consulta estadística, revisión, deshacer y guardado.")
         figure(doc, use_case, "Figura 2. Casos de uso principales del usuario.")
 
@@ -338,10 +355,10 @@ def build() -> None:
                    "Inserción al final O(1); recorrido O(n); búsqueda por ID O(1) promedio con índice."],
                   ["Multilista", "Membresías, autorías y vínculos grupo-producto recorridos desde cualquiera de sus extremos.",
                    "Inserción O(1) promedio con índice; recorrer vecinos O(k)."],
-                  ["Pila", "Deshacer las últimas 30 operaciones. Python conserva instantáneas; C++ guarda cambios compactos.",
+                  ["Pila", "Deshacer las últimas 30 operaciones. C++ guarda las operaciones inversas de cada cambio; Python guarda instantáneas y también aplica las inversas que C++ dejó en el historial.",
                    "Apilar y desapilar O(1); el tamaño del registro de deshacer depende del cambio."],
-                  ["Cola", "Revisiones pendientes de productos en orden de llegada.",
-                   "Encolar, consultar frente y desencolar O(1)."],
+                  ["Cola", "Revisiones pendientes de productos en orden de llegada; se encolan uno a uno o todos los rechazados en una sola acción.",
+                   "Encolar, consultar frente y desencolar O(1); enviar los rechazados O(P)."],
               ], [2.8, 8.0, 6.0])
     paragraph(doc, "Los nodos son la fuente de verdad. Los diccionarios y mapas sirven de índices auxiliares. "
                    "La consulta estadística recorre productos activos y vínculos pertinentes; no existe una "
@@ -352,23 +369,28 @@ def build() -> None:
     bullet(doc, "Alta, búsqueda, consulta, edición, desactivación, reactivación y baja de entidades y relaciones; los IDs y los extremos de una relación no se editan.")
     bullet(doc, "No se elimina en cascada un grupo, investigador o producto con relaciones pendientes; primero se resuelven esos vínculos o se desactiva el registro.")
     bullet(doc, "Los códigos GrupLAC, CvLAC y DOI no vacíos son únicos. El DOI se compara sin distinguir mayúsculas ni el prefijo doi.org. Las fechas siguen AAAA-MM-DD; el año del producto debe concordar con su fecha.")
-    bullet(doc, "La validación de un producto es automática: queda validado si tiene año, tipología, una autoría activa de un investigador activo, un vínculo activo con un grupo activo y una URL o un DOI válido. Se recalcula al cambiar el producto o sus vínculos y no equivale a la clasificación oficial de Minciencias.")
+    bullet(doc, "La validación de un producto es automática: queda validado si tiene año, tipología, una autoría activa de un investigador activo, un vínculo activo con un grupo activo y una URL verificable o un DOI válido. Un DOI registrado con formato inválido también lo rechaza. Se recalcula al cambiar el producto, sus vínculos o el estado de un grupo o investigador enlazado, y no equivale a la clasificación oficial de Minciencias.")
     bullet(doc, "Los productos no tienen categoría: GrupLAC solo publica la clasificación del grupo. La categoría se gestiona en grupos e investigadores y la interfaz la muestra en el módulo de grupos.")
-    bullet(doc, "La cola conserva trabajos pendientes y la pila permite deshacer. Ambas se guardan junto con las entidades y relaciones.")
+    bullet(doc, "La cola conserva trabajos pendientes y no admite dos veces el mismo producto; la pila permite deshacer. Ambas se guardan junto con las entidades y relaciones.")
 
     heading(doc, "6 Persistencia e interoperabilidad")
-    paragraph(doc, "Cada carpeta de datos contiene manifest.csv, cuatro archivos de entidades, tres de relaciones, "
-                   "cola_validacion.csv e historial.csv. El formato común es CSV UTF-8 con encabezados, "
-                   "comillas y saltos de línea conforme al formato CSV. manifest.csv declara la versión 3. "
-                   "Ambos motores leen las versiones 1 y 2 y las migran al guardar; una categoría de producto "
+    paragraph(doc, "Todos los datos se guardan en un solo archivo CSV UTF-8, data/pea_upc.csv, dividido en "
+                   "secciones: manifest, grupos, investigadores, productos, planes, membresías, autorías, "
+                   "vínculos grupo-producto, cola de revisión e historial, siempre en ese orden. Cada sección "
+                   "empieza con una fila de una sola celda #nombre, sigue su encabezado y luego sus filas. "
+                   "Ambos motores leen el archivo de arriba abajo y crean cada registro al leerlo: las "
+                   "relaciones aparecen después de las entidades que enlazan. El manifiesto declara la "
+                   "versión 4. Las carpetas de las versiones 1 a 3, con un CSV por tabla, se abren por la "
+                   "carpeta o su manifest.csv y se guardan como archivo único; una categoría de producto "
                    "anterior se conserva en la observación. El formato neutraliza los "
                    "valores que una hoja de cálculo interpretaría como fórmulas y recupera su valor original "
-                   "al cargar. Se valida la integridad referencial. Se preparan archivos temporales "
-                   "y se conserva .backup del guardado previo para recuperación.")
-    paragraph(doc, "Las dos aplicaciones pueden abrir por turnos la misma carpeta. No existe bloqueo de "
-                   "escritura multiusuario; abrir simultáneamente una carpeta editable puede producir "
-                   "conflictos. La interfaz Tkinter trata data/real como muestra de solo lectura: las "
-                   "modificaciones se guardan en otra carpeta mediante Guardar como.")
+                   "al cargar. Se valida la integridad referencial. El guardado escribe un temporal, conserva "
+                   "en .backup el archivo previo y lo reemplaza de una sola vez.")
+    paragraph(doc, "Las dos aplicaciones pueden abrir por turnos el mismo archivo. No existe bloqueo de "
+                   "escritura multiusuario; abrir simultáneamente un archivo editable puede producir "
+                   "conflictos. La interfaz abre data/pea_upc.csv al iniciar y guarda en él; cada "
+                   "importación se guarda de inmediato, de modo que los datos crecen con cada fuente. Si el archivo "
+                   "no puede leerse, la interfaz ofrece abrir la copia .backup.")
 
     heading(doc, "7 Adquisición e importación")
     paragraph(doc, "Ambos programas importan CSV del esquema PEA-i con vista previa y conteo de filas "
@@ -376,7 +398,10 @@ def build() -> None:
                    "dependencias opcionales, y consulta URL públicas HTTP/HTTPS de HTML, texto, "
                    "CSV o PDF de texto y muestra su contenido antes de crear registros. La extracción "
                    "estructurada se limita a fichas GrupLAC/CvLAC y metadatos explícitos de artículos. "
-                   "Las páginas de estructura desconocida se limitan a vista previa y captura supervisada.")
+                   "Las páginas de estructura desconocida se limitan a vista previa y captura supervisada. "
+                   "Volver a importar una ficha GrupLAC agrega lo nuevo y actualiza los campos que la fuente "
+                   "publica (clasificación del grupo, período de los integrantes, tipología de productos), "
+                   "sin borrar registros ni reemplazar las observaciones de revisión.")
     paragraph(doc, "La importación de PDF de texto requiere pdftotext de Poppler. Los escaneos sin texto "
                    "seleccionable requieren OCR externo. C++ dispone de importación CSV autónoma.")
 
@@ -389,7 +414,7 @@ def build() -> None:
                    "se inspeccionan antes de extraerlos, con un máximo de 10.000 entradas y 128 MB "
                    "de tamaño declarado sin comprimir. El conversor PDF tiene 25 segundos para extraer "
                    "hasta cinco millones de caracteres y límites adicionales de CPU y memoria en POSIX. "
-                   "Cada CSV admite hasta 500.000 filas y 100.000 caracteres por campo.")
+                   "Cada tabla admite hasta 500.000 filas y 100.000 caracteres por campo.")
     paragraph(doc, "El ejecutable Windows incluido se usa cuando su SHA-256 y la huella de las fuentes "
                    "coinciden. Esas huellas detectan cambios accidentales, pero no autentican al autor. "
                    "Los parámetros privados de URL se omiten al guardar la procedencia; se retienen solo "
@@ -404,13 +429,18 @@ def build() -> None:
                    "tipología, validación y reglas incumplidas.")
     paragraph(doc, "Total(vista, filtros) = número de IDs de producto activos distintos que satisfacen "
                    "los vínculos activos y todos los filtros. Un producto unido a varios grupos o autores "
-                   "se cuenta una sola vez dentro de la vista. Cuando se fija un rango temporal, "
-                   "los productos sin año quedan fuera; fuera del rango sí cuentan en el total y aparecen "
-                   "como Sin dato en la distribución correspondiente.")
+                   "se cuenta una sola vez dentro de la vista. Si se fija un rango de años, los productos sin "
+                   "año quedan fuera; sin rango, cuentan en el total y aparecen como Sin dato en la "
+                   "distribución por año.")
     paragraph(doc, "No se almacena un cubo OLAP materializado. Cada solicitud selecciona una dimensión "
                    "relacional; la consulta no admite una intersección simultánea de grupo e investigador. "
-                   "La consola muestra tablas y cifras; Tkinter muestra "
-                   "barras por año, tipología, validación y reglas incumplidas, además de una tabla de productos.")
+                   "La consola C++ muestra los conteos en tablas y cifras, con ventanas de todos los años, "
+                   "últimos 2, últimos 5 o un rango.")
+    paragraph(doc, "En Tkinter, el Dashboard reúne los filtros (vista, ventana de observación y validación), "
+                   "cuatro indicadores (productos, validados, rechazados y sin año), un histograma por año, la "
+                   "distribución por tipología y la tabla paginada de productos de la vista. La página "
+                   "Gráficos amplía cuatro distribuciones: por año en histograma, por tipología, por "
+                   "validación y por reglas incumplidas.")
 
     heading(doc, "9 Historias de usuario y aceptación")
     add_table(doc,
@@ -426,6 +456,8 @@ def build() -> None:
                    "Las vistas por grupo, investigador y producto respetan años y validación."],
                   ["HU05", "Como gestor quiero importar una fuente pública o CSV.",
                    "La vista previa identifica la fuente, muestra campos y registra aceptación o rechazo."],
+                  ["HU06", "Como analista quiero un dashboard con indicadores y gráficos.",
+                   "Para la vista y los filtros elegidos muestra totales, histograma por año y barras por tipología, validación y reglas."],
               ], [1.8, 7.2, 7.8])
 
     heading(doc, "10 Correspondencia entre requisitos y diseño")
@@ -439,15 +471,15 @@ def build() -> None:
         ("R07", "Fuentes externas", "CSV en ambos motores; URL pública, PDF, XLSX y DOCX en Python."),
         ("R08", "Listas", "Lista doble enlazada por tipo de entidad."),
         ("R09", "Multilistas", "Vínculos indexados y recorribles desde ambos extremos."),
-        ("R10", "Pilas", "Deshacer LIFO de hasta 30 acciones, persistido en historial.csv."),
-        ("R11", "Colas", "Revisión FIFO persistida en cola_validacion.csv."),
-        ("R12", "CRUD y persistencia", "Operaciones de dominio y esquema CSV versión 3, con migración de las versiones 1 y 2."),
+        ("R10", "Pilas", "Deshacer LIFO de hasta 30 acciones, persistido en la sección historial."),
+        ("R11", "Colas", "Revisión FIFO persistida en la sección cola_validacion; envío de todos los rechazados en una acción."),
+        ("R12", "CRUD y persistencia", "Operaciones de dominio y archivo único versión 4, con migración de las carpetas 1 a 3."),
         ("R13", "Categoría y validación", "Categoría en grupos e investigadores; validación de productos por reglas, recalculada en cada cambio."),
         ("R14", "Ventanas temporales", "Dos años, cinco años o intervalo personalizado."),
         ("R15", "Vistas estadísticas", "Total, grupo, investigador o producto sin duplicar IDs."),
         ("R16", "Presentación C++", "Menús, tablas y resúmenes numéricos en consola."),
-        ("R17", "Presentación Python", "Barras por año, tipología, validación y reglas incumplidas; tabla paginada."),
-        ("R18", "Inicio con o sin datos", "Carga inicial de data/real, inicio vacío y apertura de carpeta CSV."),
+        ("R17", "Presentación Python", "Dashboard con indicadores, histograma por año y barras por tipología, validación y reglas incumplidas; tabla paginada."),
+        ("R18", "Inicio con o sin datos", "Carga inicial de data/pea_upc.csv, inicio vacío y apertura de otro archivo."),
         ("R19", "Archivos fuente", "Taller2_REMR.cpp y Taller2_REMR.py."),
         ("R20", "Especificación", "Modelo, estructuras, algoritmos, contratos y diagramas."),
     ]
@@ -455,16 +487,16 @@ def build() -> None:
               [1.25, 4.5, 11.05])
 
     heading(doc, "11 Restricciones del sistema y alcance de los datos")
-    paragraph(doc, "El conjunto data/real reúne fichas públicas GrupLAC de 66 grupos UPC. Contiene "
-                   "2.736 investigadores, 3.291 membresías, 66 planes, 6.363 productos únicos, 6.735 "
-                   "vínculos grupo-producto y 9.703 autorías. Hay 274 investigadores con categoría "
+    paragraph(doc, "El archivo data/pea_upc.csv reúne fichas públicas GrupLAC de 66 grupos UPC. Contiene "
+                   "2.736 investigadores, 3.291 membresías (1.687 vigentes), 66 planes, 6.363 productos únicos "
+                   "con año entre 1984 y 2026, 6.735 vínculos grupo-producto y 9.703 autorías. Hay 274 investigadores con categoría "
                    "CvLAC capturada. La validación automática deja 6.323 productos validados y 40 "
                    "rechazados (37 sin autor del censo y 3 con DOI mal formado). Las fichas públicas pueden "
                    "cambiar; este conjunto no constituye un censo institucional actualizado.")
     paragraph(doc, "La extracción de URL depende del contenido público entregado por el servidor. Los PDF "
                    "escaneados requieren OCR externo; las páginas que generan sus datos exclusivamente con "
                    "JavaScript o exigen autenticación no suministran registros estructurados por esta vía. "
-                   "La persistencia no implementa bloqueo de escritura entre procesos: una carpeta editable "
+                   "La persistencia no implementa bloqueo de escritura entre procesos: un archivo editable "
                    "debe abrirse en una instancia a la vez.")
     paragraph(doc, "El motor Python autónomo guarda instantáneas en el historial; el motor C++ conserva "
                    "registros compactos de cambios. La consulta estadística construye agregados bajo demanda "
@@ -472,17 +504,17 @@ def build() -> None:
                    "depende del número de entidades, vínculos y longitud de los campos almacenados.")
 
     heading(doc, "12 Diccionario de persistencia")
-    add_table(doc, ["Archivo", "Campos guardados"], [
-        ["manifest.csv", "version, guardado"],
-        ["grupos.csv", "id, nombre, codigo_gruplac, fecha_creacion, unidad, responsable, categoria, descripcion, objetivos, mision, vision, lineas, url, fuente, activo"],
-        ["investigadores.csv", "id, nombre, codigo_cvlac, afiliacion, categoria, contacto, url, fuente, activo"],
-        ["productos.csv", "id, titulo, anio, fecha, familia, tipologia, validacion, observacion, doi, url, fuente, activo"],
-        ["planes.csv", "id, grupo_id, nombre, inicio, fin, objetivo, indicador, meta, actividad, activo"],
-        ["membresias.csv", "grupo_id, investigador_id, rol, inicio, fin, activo"],
-        ["autorias.csv", "producto_id, investigador_id, orden, rol, activo"],
-        ["grupos_productos.csv", "grupo_id, producto_id, origen, activo"],
-        ["cola_validacion.csv", "id, producto_id, motivo, creado"],
-        ["historial.csv", "orden, snapshot"],
+    add_table(doc, ["Sección (en orden)", "Campos guardados"], [
+        ["#manifest", "version, guardado"],
+        ["#grupos", "id, nombre, codigo_gruplac, fecha_creacion, unidad, responsable, categoria, descripcion, objetivos, mision, vision, lineas, url, fuente, activo"],
+        ["#investigadores", "id, nombre, codigo_cvlac, afiliacion, categoria, contacto, url, fuente, activo"],
+        ["#productos", "id, titulo, anio, fecha, familia, tipologia, validacion, observacion, doi, url, fuente, activo"],
+        ["#planes", "id, grupo_id, nombre, inicio, fin, objetivo, indicador, meta, actividad, activo"],
+        ["#membresias", "grupo_id, investigador_id, rol, inicio, fin, activo"],
+        ["#autorias", "producto_id, investigador_id, orden, rol, activo"],
+        ["#grupos_productos", "grupo_id, producto_id, origen, activo"],
+        ["#cola_validacion", "id, producto_id, motivo, creado"],
+        ["#historial", "orden, snapshot"],
     ], [4.0, 12.8])
 
     heading(doc, "13 Ejecución y referencias")
@@ -490,12 +522,14 @@ def build() -> None:
                    "Iniciar PEA-i.pyw mediante doble clic; el repositorio incluye pea_cpp.exe. "
                    "Para la consola se ejecuta bin/windows/pea_cpp.exe. En Linux se ejecuta "
                    "python3 src/python/Taller2_REMR.py; CMake compila C++17 si no existe el binario. "
-                   "El modo Python independiente se fuerza con --python-backend. El README del "
-                   "repositorio contiene los comandos completos.")
-    bullet(doc, "Enunciado del taller: ENUNCIADO_TALLER_2.md, Universidad Popular del Cesar, 2026.")
-    bullet(doc, "Esquema y reglas exactas: docs/esquema_datos.md; protocolo: docs/protocolo_backend.md.")
-    bullet(doc, "Procedencia de datos: data/real/README.md y fichas públicas GrupLAC y CvLAC enlazadas allí.")
+                   "La interfaz abre otro archivo con --data ARCHIVO y fuerza el motor Python con "
+                   "--python-backend. La consola acepta pea_cpp --data ARCHIVO; sin él pregunta si iniciar "
+                   "vacía o abrir un archivo. Las pruebas automáticas están en tests/.")
+    bullet(doc, "Enunciado del taller: docs/ENUNCIADO_TALLER_2.md, Universidad Popular del Cesar, 2026.")
+    bullet(doc, "Esquema y reglas: apartados 5, 6 y 12; protocolo entre procesos: apartado 2.")
+    bullet(doc, "Procedencia de datos: data/README.md y fichas públicas GrupLAC y CvLAC enlazadas allí.")
     bullet(doc, "Código fuente: src/cpp/Taller2_REMR.cpp y src/python/Taller2_REMR.py.")
+    bullet(doc, "Video de presentación: docs/pea-i-por-dentro.mp4.")
 
     heading(doc, "14 Algoritmos principales")
     paragraph(doc, "Consulta estadística: la multilista selecciona los IDs de producto asociados a la "
@@ -505,13 +539,18 @@ def build() -> None:
                    "tiempo promedio y O(P + R + D) memoria temporal. C++ usa conjuntos y mapas ordenados: "
                    "el tiempo es O(P + R log(R + 1) + P log(R + 1) + P log(D + 1)) y la memoria adicional "
                    "es O(R + L + D), donde L es el tamaño de página solicitado.")
-    paragraph(doc, "Guardado: se valida el esquema y las relaciones; se escriben CSV temporales; "
-                   "se conservan los archivos anteriores en .backup; y se sustituyen los archivos "
-                   "de destino. En una carga, la versión del manifiesto y los encabezados se "
-                   "comprueban antes de reconstruir vínculos, cola e historial.")
-    paragraph(doc, "Revisión: encolar añade al final; procesar lee el frente, exige una observación "
-                   "y cambia el estado del producto; el registro de deshacer entra en la pila; "
-                   "por último se retira el frente. Deshacer aplica la acción inversa más reciente.")
+    paragraph(doc, "Guardado: se escriben todas las secciones en un archivo temporal; se conserva el "
+                   "archivo anterior en .backup; y se sustituye el archivo de destino de una sola vez. "
+                   "Carga: se recorre el archivo en orden; cada marca debe ser la siguiente sección "
+                   "esperada y cada encabezado debe coincidir con el esquema; cada fila se valida y se "
+                   "inserta al leerla, de modo que los vínculos encuentran sus extremos ya cargados.")
+    paragraph(doc, "Revisión: encolar añade al final si el producto no espera ya en la cola; enviar los "
+                   "rechazados encola, en una sola acción, cada producto activo rechazado con sus reglas "
+                   "incumplidas como motivo. Procesar lee el frente, exige una nota, la guarda en la "
+                   "observación del producto, apila el registro de deshacer y retira el frente; la "
+                   "validación no cambia porque es automática. Descartar retira el frente sin nota. En C++ "
+                   "el registro de procesar contiene dos inversas: restaurar la observación y devolver el "
+                   "trabajo al frente. Deshacer aplica el registro más reciente.")
 
     heading(doc, "15 Contratos de operación")
     add_table(doc, ["Operación", "Entrada y precondición", "Salida y postcondición"], [
@@ -521,10 +560,14 @@ def build() -> None:
          "La relación activa se consulta desde grupo y desde producto."],
         ["Cerrar revisión", "Cola no vacía y nota de revisión no vacía.",
          "La nota queda en la observación, el producto sale del frente y la acción entra en la pila; la validación se recalcula sola."],
+        ["Enviar rechazados", "Ninguna; los productos ya encolados se omiten.",
+         "Cada producto activo rechazado queda al final de la cola con sus reglas como motivo; una sola entrada de deshacer; devuelve cuántos entraron."],
+        ["Deshacer", "Historial no vacío.",
+         "Se restaura el estado previo a la última acción, incluida la cola, y el historial disminuye en uno."],
         ["Consultar estadísticas", "Vista válida; ID seleccionado cuando corresponde; rango inicial no mayor que el final.",
          "Total único y distribuciones calculadas tras filtrar; paginar no modifica el total."],
-        ["Guardar carpeta", "Datos con integridad referencial y ruta de destino escribible.",
-         "Se escriben diez CSV del esquema 3 y se conserva el guardado anterior en .backup."],
+        ["Guardar archivo", "Datos con integridad referencial y ruta de destino escribible.",
+         "Se escribe el archivo único del esquema 4 y se conserva el guardado anterior en .backup."],
     ], [3.15, 6.8, 6.85])
 
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
