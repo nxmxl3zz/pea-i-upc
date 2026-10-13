@@ -121,3 +121,6 @@ PEA_TEST_CPP=build/pea_cpp python3 -m unittest discover -s tests/python -v
 En Windows PowerShell: `$env:PEA_TEST_CPP = 'bin/windows/pea_cpp.exe'`, seguido de `py -3 -m unittest discover -s tests/python -v`. Estas pruebas usan archivos temporales y no guardan cambios en `data/`.
 
 `python3 scripts/import_upc_dataset.py` vuelve a consultar la lista de grupos públicos y fusiona los cambios en `data/pea_upc.csv` con las mismas reglas de la interfaz; necesita Internet y, si una ficha falla, ese grupo conserva sus datos anteriores. Use `--limit N` para consultar solo los primeros grupos y `--data OTRO.csv` para actualizar otro archivo. `python3 scripts/populate_cvlac.py` completa la categoría CvLAC de los investigadores en el mismo archivo. `python3 scripts/build_real_sample.py` genera por separado una muestra pequeña en `data/sample_scienti.csv` y no reemplaza el conjunto de 66 grupos.
+
+
+### Rafael Miranda
