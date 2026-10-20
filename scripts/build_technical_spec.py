@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import runpy
 import tempfile
+from typing import Any
 
 from docx import Document
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
@@ -21,6 +23,18 @@ BOLD_FONT = "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf"
 NAVY = (25, 52, 78)
 PALE = (232, 239, 246)
 GRAY = (90, 103, 115)
+# Corte de los indicadores publicados: captura del 19 de octubre de 2026.
+INDICATOR_CUTOFF = 2026
+CLASS_TERMS = {"TOP": "Nc.Top", "A": "Nc.A", "B": "Nc.B", "ASC": "AP", "DPC": "DPC",
+               "FRH_A": "Fr.A", "FRH_B": "Fr.B"}
+CLASS_NAMES = {
+    "TOP": "Productos tipo TOP (nuevo conocimiento de la más alta calidad)",
+    "A": "Productos tipo A", "B": "Productos tipo B",
+    "ASC": "Apropiación social del conocimiento",
+    "DPC": "Divulgación pública de la ciencia",
+    "FRH_A": "Formación de recurso humano tipo A (doctorado)",
+    "FRH_B": "Formación de recurso humano tipo B",
+}
 
 
 def font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
@@ -92,22 +106,27 @@ def model_image(path: Path) -> None:
 
 
 def use_case_image(path: Path) -> None:
-    canvas = Image.new("RGB", (1600, 570), "white")
-    draw = ImageDraw.Draw(canvas)
-    draw.ellipse((120, 125, 200, 205), outline=NAVY, width=5)
-    draw.line((160, 205, 160, 390), fill=NAVY, width=5)
-    draw.line((75, 260, 245, 260), fill=NAVY, width=5)
-    draw.line((160, 390, 85, 500), fill=NAVY, width=5)
-    draw.line((160, 390, 235, 500), fill=NAVY, width=5)
-    draw.text((60, 520), "Usuario", font=font(30, True), fill=NAVY)
     labels = [
         "Cargar o iniciar sin datos",
         "Gestionar registros y relaciones",
-        "Importar y revisar fuentes",
+        "Asignar categoría a un producto",
+        "Importar ficha GrupLAC",
+        "Importar ficha CvLAC",
         "Filtrar y consultar estadísticas",
+        "Calcular indicador de grupo",
+        "Calcular indicador de investigador",
         "Revisar cola y deshacer",
         "Guardar o recuperar el archivo",
     ]
+    canvas = Image.new("RGB", (1600, 16 + len(labels) * 92), "white")
+    draw = ImageDraw.Draw(canvas)
+    middle = canvas.height // 2
+    draw.ellipse((120, middle - 180, 200, middle - 100), outline=NAVY, width=5)
+    draw.line((160, middle - 100, 160, middle + 85), fill=NAVY, width=5)
+    draw.line((75, middle - 45, 245, middle - 45), fill=NAVY, width=5)
+    draw.line((160, middle + 85, 85, middle + 195), fill=NAVY, width=5)
+    draw.line((160, middle + 85, 235, middle + 195), fill=NAVY, width=5)
+    draw.text((60, middle + 215), "Usuario", font=font(30, True), fill=NAVY)
     for index, line in enumerate(labels):
         top = 8 + index * 92
         xy = (475, top, 1540, top + 76)
@@ -115,7 +134,48 @@ def use_case_image(path: Path) -> None:
         width = draw.textbbox((0, 0), line, font=font(29, True))[2]
         draw.text((475 + (1065 - width) // 2, top + 20),
                   line, font=font(29, True), fill=NAVY)
-        arrow(draw, (280, 285), (465, top + 38))
+        arrow(draw, (280, middle - 20), (465, top + 38))
+    canvas.save(path)
+
+
+def dashed(draw: ImageDraw.ImageDraw, start: tuple[int, int], end: tuple[int, int]) -> None:
+    (x1, y), (x2, _) = start, end
+    step = 1 if x2 > x1 else -1
+    for x in range(x1, x2, 26 * step):
+        draw.line((x, y, x + 14 * step if abs(x2 - x) > 14 else x2, y), fill=NAVY, width=4)
+
+
+def sequence_image(path: Path, title: str, lifelines: list[str],
+                   messages: list[tuple[int, int, str] | tuple[int, int, str, bool]]) -> None:
+    """Diagrama de secuencia UML: líneas de vida y mensajes numerados; True marca una respuesta."""
+    step, first = 64, 190
+    height = first + len(messages) * step + 30
+    canvas = Image.new("RGB", (1600, height), "white")
+    draw = ImageDraw.Draw(canvas)
+    draw.text((30, 16), title, font=font(30, True), fill=NAVY)
+    span = 1600 // len(lifelines)
+    xs = [span // 2 + index * span for index in range(len(lifelines))]
+    for x, name in zip(xs, lifelines):
+        box(draw, (x - span // 2 + 12, 70, x + span // 2 - 12, 140), [name])
+        for y in range(140, height - 20, 24):
+            draw.line((x, y, x, min(y + 12, height - 20)), fill=GRAY, width=3)
+    for index, message in enumerate(messages, start=1):
+        source, target, label = message[:3]
+        response = len(message) > 3 and bool(message[3])
+        y = first + (index - 1) * step + 32
+        start, end = (xs[source], y), (xs[target], y)
+        if response:
+            dashed(draw, start, end)
+            sign = 1 if end[0] > start[0] else -1
+            draw.line((end, (end[0] - 18 * sign, y - 10)), fill=NAVY, width=4)
+            draw.line((end, (end[0] - 18 * sign, y + 10)), fill=NAVY, width=4)
+        else:
+            arrow(draw, start, end)
+        text = f"{index}. {label}"
+        left = min(start[0], end[0]) + 12
+        bounds = draw.textbbox((left, y - 34), text, font=font(21))
+        draw.rectangle((bounds[0] - 4, bounds[1] - 2, bounds[2] + 4, bounds[3] + 2), fill="white")
+        draw.text((left, y - 34), text, font=font(21), fill=NAVY)
     canvas.save(path)
 
 
@@ -259,7 +319,48 @@ def setup(doc: Document) -> None:
     footer._p.append(field)
 
 
+def number(value: int) -> str:
+    return f"{value:,}".replace(",", ".")
+
+
+def decimal(value: float, digits: int = 6) -> str:
+    return f"{value:.{digits}f}".replace(".", ",")
+
+
+def engine_facts() -> dict[str, Any]:
+    """Lee el catálogo, las estimaciones y las cifras de la captura desde el motor Python."""
+    pea = runpy.run_path(str(ROOT / "src/python/Taller2_REMR.py"))
+    repo = pea["load_repository"](ROOT / "data/pea_upc.csv")
+    products = repo.rows("productos")
+    years = [int(row["anio"]) for row in products if row["anio"]]
+    statistics = repo.statistics(limit=0)
+    indicators = []
+    for kind, key, label in (("grupos", "G-00000000002099", "GISICO (GrupLAC)"),
+                             ("investigadores", "I-0000494917", "Adith Bismarck Pérez Orozco (CvLAC)")):
+        side = "left" if kind == "grupos" else "right"
+        relation = "grupos_productos" if kind == "grupos" else "autorias"
+        linked = sum(1 for row in repo.related(relation, key, side) if row["activo"] == "1")
+        indicators.append((label, linked, repo.indicator(kind, key, end=INDICATOR_CUTOFF)))
+    return {
+        "pea": pea,
+        "counts": {kind: len(repo.rows(kind)) for kind in pea["ALL_FIELDS"]},
+        "active_memberships": sum(1 for row in repo.rows("membresias") if row["activo"] == "1"),
+        "people_with_category": sum(1 for row in repo.rows("investigadores") if row["categoria"]),
+        "years": (min(years), max(years)),
+        "validation": statistics["por_validacion"],
+        "rules": statistics["por_regla"],
+        "categorized": sum(1 for row in products if row["categoria"]),
+        "estimated": sum(1 for row in products if row["categoria_origen"] == "estimada"),
+        "manual": sum(1 for row in products if row["categoria_origen"] == "manual"),
+        "indicators": indicators,
+    }
+
+
 def build() -> None:
+    facts = engine_facts()
+    pea = facts["pea"]
+    catalog = pea["MODEL_2024"]
+    coefficients = pea["MODEL_COEFFICIENTS"]
     doc = Document()
     doc.core_properties.title = "Especificación técnica del Programa Estadístico de Análisis de Investigación"
     doc.core_properties.subject = "Modelo de datos, estructuras, algoritmos y contratos de PEA-i"
@@ -273,7 +374,8 @@ def build() -> None:
                    "Universidad Popular del Cesar. El modelo conserva cada entidad una sola vez y representa "
                    "sus relaciones mediante multilistas. Esta especificación define las entradas y salidas, "
                    "estructuras, reglas de integridad, consultas estadísticas, persistencia e interoperabilidad "
-                   "de las soluciones C++ y Python.")
+                   "de las soluciones C++ y Python, y el cálculo del indicador de producción científica de "
+                   "grupos e investigadores según el modelo de medición Minciencias 2024 (apartado 9).")
 
     heading(doc, "1 Objetivo y alcance")
     paragraph(doc, "Las operaciones de dominio son alta, consulta, edición, desactivación, reactivación y baja "
@@ -283,9 +385,11 @@ def build() -> None:
                    "ejecutable incluido si sus huellas coinciden, o lo compila con CMake. Si no lo consigue, "
                    "ejecuta el motor Python y lo indica en la barra de estado.")
     paragraph(doc, "Las salidas comprenden fichas y relaciones consultables, revisión pendiente, historial de "
-                   "deshacer, distribuciones descriptivas y un archivo único de datos. La adquisición "
+                   "deshacer, distribuciones descriptivas, el indicador de producción de un grupo o de un "
+                   "investigador y un archivo único de datos. La adquisición "
                    "externa usa fichas públicas GrupLAC o CvLAC, CSV, Excel, Word y PDF con texto extraíble. "
-                   "El conjunto incluido reúne fichas públicas de 66 grupos UPC; no es un censo institucional.")
+                   "El conjunto incluido reúne fichas públicas de 66 grupos UPC y una ficha CvLAC; no es un "
+                   "censo institucional.")
 
     heading(doc, "2 Arquitectura y casos de uso")
     paragraph(doc, "La interfaz Tkinter envía una solicitud JSON por línea a la entrada estándar de "
@@ -310,17 +414,20 @@ def build() -> None:
         heading(doc, "Protocolo entre procesos", 2)
         paragraph(doc, "Cada solicitud es un objeto JSON en una línea con la acción y sus parámetros como "
                        "cadenas; la respuesta es {\"ok\":true,\"result\":…} o {\"ok\":false,\"error\":…}. Al conectarse, la interfaz "
-                       "envía ping y exige la respuesta {\"backend\":\"cpp\",\"protocol\":\"3\"}; con otra "
+                       "envía ping y exige la respuesta {\"backend\":\"cpp\",\"protocol\":\"4\"}; con otra "
                        "versión no usa el proceso. pea_cpp acepta --data ARCHIVO para abrir un archivo al iniciar.")
-        add_table(doc, ["Grupo", "Acciones del protocolo 3"], [
+        add_table(doc, ["Grupo", "Acciones del protocolo 4"], [
             ["Sesión y archivo", "ping, state, reset, load, save, shutdown"],
             ["Consulta", "rows, page, get, related, related_page, summary, field_usage, product_issues, statistics"],
-            ["Cambios", "new_id, create, update, delete, toggle, import_csv"],
+            ["Modelo 2024", "catalog (169 subtipos con clase, ventana y pesos), indicator (tipo, ID, años inicial y final, validación)"],
+            ["Cambios", "new_id, create, update, delete, toggle, preview_csv, import_csv"],
             ["Cola de revisión", "queue_rows, queue_page, queue_front, enqueue_review, enqueue_rejected, process_review, discard_review"],
             ["Historial", "undo, clear_history"],
         ], [3.6, 13.2])
         paragraph(doc, "Los casos de uso cubren inicio vacío o desde el archivo de datos, mantenimiento de entidades y "
-                       "vínculos, incorporación de fuentes, consulta estadística, revisión, deshacer y guardado.")
+                       "vínculos, asignación de la categoría del modelo a un producto, incorporación de fichas "
+                       "GrupLAC y CvLAC, consulta estadística, cálculo del indicador de un grupo o de un "
+                       "investigador, revisión, deshacer y guardado.")
         figure(doc, use_case, "Figura 2. Casos de uso principales del usuario.")
 
         heading(doc, "3 Modelo de información")
@@ -338,14 +445,17 @@ def build() -> None:
                    "Ficha y productos vinculados; integrantes y planes."],
                   ["Investigador", "ID, nombre, CvLAC, afiliación, categoría, contacto público, estado y fuente.",
                    "Ficha, grupos y productos de autoría."],
-                  ["Producto", "ID, título, año o fecha, familia, tipología, observación, DOI, URL y fuente; la validación se calcula.",
-                   "Ficha, grupos, autores y contribución a estadísticas."],
+                  ["Producto", "ID, título, año o fecha, familia, tipología, categoría del modelo 2024 y su origen "
+                               "(estimada o manual), observación, DOI, URL y fuente; la validación se calcula.",
+                   "Ficha, grupos, autores, clase, peso relativo y valor en puntos de su categoría; "
+                   "contribución a estadísticas e indicadores."],
                   ["Plan", "ID, grupo, plazo, objetivo, indicador, meta y actividad.",
                    "Plan consultable dentro del grupo."],
               ], [2.5, 7.3, 7.0])
     paragraph(doc, "Las salidas estadísticas son total de productos únicos, conteos por año, tipología, "
-                   "validación y reglas incumplidas, más listas paginadas. Los campos vacíos no se completan con valores "
-                   "supuestos. Las variables exactas de persistencia figuran en el diccionario del apartado 12.")
+                   "categoría, validación y reglas incumplidas, más listas paginadas. Los campos vacíos no se "
+                   "completan con valores supuestos. Las variables del indicador de producción se describen en "
+                   "el apartado 9 y las de persistencia en el diccionario del apartado 13.")
 
     heading(doc, "4 Estructuras de datos y complejidad")
     add_table(doc,
@@ -369,8 +479,8 @@ def build() -> None:
     bullet(doc, "Alta, búsqueda, consulta, edición, desactivación, reactivación y baja de entidades y relaciones; los IDs y los extremos de una relación no se editan.")
     bullet(doc, "No se elimina en cascada un grupo, investigador o producto con relaciones pendientes; primero se resuelven esos vínculos o se desactiva el registro.")
     bullet(doc, "Los códigos GrupLAC, CvLAC y DOI no vacíos son únicos. El DOI se compara sin distinguir mayúsculas ni el prefijo doi.org. Las fechas siguen AAAA-MM-DD; el año del producto debe concordar con su fecha.")
-    bullet(doc, "La validación de un producto es automática: queda validado si tiene año, tipología, una autoría activa de un investigador activo, un vínculo activo con un grupo activo y una URL verificable o un DOI válido. Un DOI registrado con formato inválido también lo rechaza. Se recalcula al cambiar el producto, sus vínculos o el estado de un grupo o investigador enlazado, y no equivale a la clasificación oficial de Minciencias.")
-    bullet(doc, "Los productos no tienen categoría: GrupLAC solo publica la clasificación del grupo. La categoría se gestiona en grupos e investigadores y la interfaz la muestra en el módulo de grupos.")
+    bullet(doc, "La validación de un producto es automática: queda validado si tiene año, tipología, una autoría activa de un investigador activo o un vínculo activo con un grupo activo, y una URL verificable o un DOI válido. Basta el autor o el grupo porque GrupLAC publica eventos, proyectos, consultorías y redes sin autores, y CvLAC productos que ningún grupo declara. Un DOI registrado con formato inválido también lo rechaza. Se recalcula al cambiar el producto, sus vínculos o el estado de un grupo o investigador enlazado, y no equivale a la clasificación oficial de Minciencias.")
+    bullet(doc, "La categoría de un producto es uno de los 169 subtipos del modelo Minciencias 2024 (por ejemplo ART_A1 o TP_B) o queda vacía; un código desconocido se rechaza. Su origen es «estimada» cuando la asigna el importador y «manual» cuando la elige una persona; cambiar la categoría a mano la marca como manual y vaciarla borra el origen. La categoría de grupos e investigadores sigue siendo su clasificación publicada.")
     bullet(doc, "La cola conserva trabajos pendientes y no admite dos veces el mismo producto; la pila permite deshacer. Ambas se guardan junto con las entidades y relaciones.")
 
     heading(doc, "6 Persistencia e interoperabilidad")
@@ -380,9 +490,12 @@ def build() -> None:
                    "empieza con una fila de una sola celda #nombre, sigue su encabezado y luego sus filas. "
                    "Ambos motores leen el archivo de arriba abajo y crean cada registro al leerlo: las "
                    "relaciones aparecen después de las entidades que enlazan. El manifiesto declara la "
-                   "versión 4. Las carpetas de las versiones 1 a 3, con un CSV por tabla, se abren por la "
-                   "carpeta o su manifest.csv y se guardan como archivo único; una categoría de producto "
-                   "anterior se conserva en la observación. El formato neutraliza los "
+                   "versión 5, que añade categoria y categoria_origen a los productos. Un archivo de la "
+                   "versión 4 se abre con sus productos sin categoría y se guarda como versión 5; su historial "
+                   "de deshacer sigue siendo aplicable. Las carpetas de las versiones 1 a 3, con un CSV por "
+                   "tabla, se abren por la carpeta o su manifest.csv y se guardan como archivo único; la "
+                   "categoría libre de un producto de las versiones 1 y 2 se conserva en la observación. "
+                   "El formato neutraliza los "
                    "valores que una hoja de cálculo interpretaría como fórmulas y recupera su valor original "
                    "al cargar. Se valida la integridad referencial. El guardado escribe un temporal, conserva "
                    "en .backup el archivo previo y lo reemplaza de una sola vez.")
@@ -400,8 +513,18 @@ def build() -> None:
                    "estructurada se limita a fichas GrupLAC/CvLAC y metadatos explícitos de artículos. "
                    "Las páginas de estructura desconocida se limitan a vista previa y captura supervisada. "
                    "Volver a importar una ficha GrupLAC agrega lo nuevo y actualiza los campos que la fuente "
-                   "publica (clasificación del grupo, período de los integrantes, tipología de productos), "
-                   "sin borrar registros ni reemplazar las observaciones de revisión.")
+                   "publica (clasificación y fecha de creación del grupo, período de los integrantes, tipología "
+                   "y categoría estimada de productos), sin borrar registros ni reemplazar las observaciones de "
+                   "revisión ni una categoría elegida manualmente.")
+    paragraph(doc, "De GrupLAC se leen la producción bibliográfica y técnica, la apropiación social, la "
+                   "divulgación pública (eventos, redes, contenidos, consultorías, informes), la producción en "
+                   "arte, los trabajos dirigidos, los proyectos y los programas y cursos de formación. En las "
+                   "secciones nuevas solo se incorporan las entradas que tienen una categoría del modelo. De "
+                   "CvLAC se leen artículos, libros, capítulos, documentos de trabajo, otros artículos, software, "
+                   "innovaciones, empresas de base tecnológica y trabajos dirigidos; cada producto queda con la "
+                   "autoría del investigador y, si ya existe por su DOI o por título y año, se fusiona con el "
+                   "registro importado desde GrupLAC. La fecha de creación del grupo se toma del año y mes de "
+                   "formación de la ficha.")
     paragraph(doc, "La importación de PDF de texto requiere pdftotext de Poppler. Los escaneos sin texto "
                    "seleccionable requieren OCR externo. C++ dispone de importación CSV autónoma.")
 
@@ -437,12 +560,146 @@ def build() -> None:
                    "La consola C++ muestra los conteos en tablas y cifras, con ventanas de todos los años, "
                    "últimos 2, últimos 5 o un rango.")
     paragraph(doc, "En Tkinter, el Dashboard reúne los filtros (vista, ventana de observación y validación), "
-                   "cuatro indicadores (productos, validados, rechazados y sin año), un histograma por año, la "
-                   "distribución por tipología y la tabla paginada de productos de la vista. La página "
-                   "Gráficos amplía cuatro distribuciones: por año en histograma, por tipología, por "
-                   "validación y por reglas incumplidas.")
+                   "cuatro indicadores (productos, validados, rechazados y sin año), el panel del indicador de "
+                   "producción cuando la vista es un grupo o un investigador (apartado 9), un histograma por "
+                   "año, la distribución por tipología y la tabla paginada de productos de la vista. La página "
+                   "Gráficos amplía cinco distribuciones: por año en histograma, por tipología, por categoría "
+                   "del modelo, por validación y por reglas incumplidas.")
 
-    heading(doc, "9 Historias de usuario y aceptación")
+    heading(doc, "9 Indicador de producción científica")
+    paragraph(doc, "El indicador sigue el Anexo 1 de la Convocatoria Nacional de Reconocimiento y Medición "
+                   "de Grupos 2024 de Minciencias (M601PR04G01, versión 02, apartados 2.2.9, 2.2.10, 3.3 a 3.10). "
+                   "Para un grupo se calcula con los productos vinculados al grupo; para un investigador, con la "
+                   "misma fórmula y los productos de su autoría:")
+    formula = doc.add_paragraph()
+    formula.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    formula.add_run("Ind = 3,7·Nc.Top + 2,3·Nc.A + 0,4·Nc.B + 1,5·AP + 0,5·DPC + 1·Fr.A + 0,2·Fr.B "
+                    "+ 0,1·Cohe + 0,3·Coop").bold = True
+    paragraph(doc, "Cada término es un índice entre 0 y 1, de modo que el indicador vale como máximo 10. "
+                   "Ambos motores implementan el mismo cálculo y una prueba de integración compara sus "
+                   "resultados.")
+
+    heading(doc, "Variables de entrada y salida del modelo", 2)
+    add_table(doc, ["Variable", "Origen o cálculo", "Uso"], [
+        ["Entrada: categoría del producto", "Uno de los 169 subtipos del catálogo; estimada por el importador o elegida a mano.",
+         "Define la clase, la ventana, el peso relativo y el peso global."],
+        ["Entrada: año del producto", "Campo anio.", "Decide si el producto cae en la ventana del subtipo."],
+        ["Entrada: vínculos activos", "grupos_productos (grupo) o autorías (investigador).", "Seleccionan los productos de la entidad."],
+        ["Entrada: membresías activas", "Integrantes activos de grupos activos.", "Alimentan la cohesión y la cooperación."],
+        ["Entrada: fecha de creación del grupo", "Año y mes de formación en GrupLAC.", "Limita el período de observación."],
+        ["Entrada: ventana y validación", "Año de corte (por defecto, el actual), año inicial opcional y filtro validado/rechazado.",
+         "Recortan el período y los productos contados."],
+        ["Salida: λ por subtipo", "ln(productos del subtipo / período + 1).", "Conteo escalado del subtipo."],
+        ["Salida: valor por clase", "Σ λ × peso global de los subtipos de la clase.", "Producción de la clase."],
+        ["Salida: Cohe y Coop", "Coautorías internas y grupos relacionados por producto.", "Colaboración."],
+        ["Salida: índices y aportes", "Valor / máximo de la población; aporte = coeficiente × índice.", "Términos de la fórmula."],
+        ["Salida: indicador", "Suma de los nueve aportes.", "Resultado entre 0 y 10."],
+        ["Salida: conteos", "Productos contados, estimados, sin categoría y tamaño de la población.", "Contexto del resultado."],
+    ], [4.0, 7.2, 5.6])
+
+    heading(doc, "Cálculo", 2)
+    bullet(doc, "Peso global del subtipo = peso de la más alta calidad de su familia (Tabla 6) × peso relativo "
+                "(apartado 2.2.9). Ejemplos del Anexo: ART_A2 = 100 × 5,5 = 550; CAP_LIB_B = 60 × 8 = 480; "
+                "PA1 = 500 × 10 = 5.000. La interfaz llama «valor en puntos» al peso global.")
+    bullet(doc, "Período del subtipo = mínimo entre su ventana (5, 7 o 10 años, Tabla 5), la edad del grupo al "
+                "corte (corte − año de creación + 1) y, si hay año inicial, corte − inicio + 1. Cuenta un "
+                "producto activo, vinculado por una relación activa, con categoría y con año dentro de "
+                "[corte − período + 1, corte]. Un grupo creado después del corte no cuenta productos.")
+    bullet(doc, "λ = ln(n / período + 1); valor del subtipo = λ × peso global; valor de la clase = suma de sus subtipos.")
+    bullet(doc, "Cohesión (sobre los P productos contados de clases TOP, A y B) = máx(0, Autores / P − 1), "
+                "donde Autores suma, por producto, los autores activos que son integrantes activos del grupo. "
+                "Para un investigador cuentan él mismo y los integrantes de sus grupos activos.")
+    bullet(doc, "Cooperación = máx(0, Σ grupos relacionados por producto / P − 1); los grupos relacionados son "
+                "los grupos activos de los autores del producto, más el propio grupo cuando la entidad es un grupo.")
+    bullet(doc, "Índice = valor / máximo del mismo término entre todas las entidades activas del mismo tipo, "
+                "calculadas con los mismos filtros (0 si el máximo es 0). Aporte = coeficiente × índice.")
+    add_table(doc, ["Término", "Clase", "Coeficiente", "Subtipos", "Ejemplos (peso global)"], [
+        [CLASS_TERMS[name], CLASS_NAMES[name], decimal(coefficients[name], 1),
+         str(sum(1 for item in catalog.values() if item.clase == name)),
+         ", ".join(f"{item.codigo} ({number(round(item.peso_global))})"
+                   for item in [item for item in catalog.values() if item.clase == name][:3])]
+        for name in CLASS_TERMS
+    ] + [["Cohe", "Índice de cohesión", "0,1", "—", "Coautoría entre integrantes"],
+         ["Coop", "Índice de cooperación", "0,3", "—", "Coautoría entre grupos"]],
+              [1.6, 5.4, 1.8, 1.6, 6.4])
+
+    heading(doc, "Decisiones de interpretación", 2)
+    bullet(doc, "Población de referencia: Minciencias normaliza contra los grupos de la misma gran área OCDE "
+                "del país. PEA-i normaliza contra las entidades activas cargadas (los grupos UPC o los "
+                "investigadores del archivo), por lo que el resultado es relativo a esa población y no una "
+                "clasificación oficial. Con una sola entidad cargada, cada término no nulo vale 1.")
+    bullet(doc, "Categorías estimadas: GrupLAC y CvLAC no publican la categoría de cada producto, que depende "
+                "de índices externos (JCR, SJR, Publindex). El importador asigna la categoría más baja de la "
+                "familia que corresponde a la sección y la tipología, la marca como estimada y la reemplaza "
+                "en cada reimportación; una categoría elegida a mano nunca se sobrescribe.")
+    bullet(doc, "La validación automática no excluye productos del indicador salvo que se filtre por "
+                "validado o rechazado. Los productos sin año o sin categoría no cuentan; los sin categoría "
+                "de los últimos diez años se informan aparte.")
+    estimates = pea["CATEGORY_ESTIMATES"]
+    order = list(CLASS_TERMS)
+    estimate_rows = sorted(
+        ([section if section != "*" else "Cualquiera", kind if kind != "*" else "Cualquiera", code,
+          CLASS_TERMS[catalog[code].clase]] for (section, kind), code in estimates.items()),
+        key=lambda row: (order.index(catalog[row[2]].clase), row[0], row[1]))
+    paragraph(doc, "Tabla de estimación usada por el importador (sección GrupLAC, tipología declarada y "
+                   "categoría asignada); las entradas de CvLAC se traducen a la sección GrupLAC equivalente:")
+    add_table(doc, ["Sección GrupLAC", "Tipología", "Categoría", "Término"], estimate_rows, [6.6, 5.6, 2.5, 2.1])
+
+    heading(doc, "Presentación y resultados", 2)
+    paragraph(doc, "En Tkinter, al elegir la vista Grupo o Investigador en el Dashboard aparece el panel "
+                   "«Ind. x de 10» con la población de referencia, los productos contados, estimados y sin "
+                   "categoría, una barra por término (coeficiente y aporte) y el botón «Detalle por subtipo» "
+                   "con cantidad, período, λ, peso global y valor de cada subtipo. Los filtros de ventana y "
+                   "validación del Dashboard se aplican al indicador. El formulario de producto permite elegir "
+                   "la categoría y muestra su clase, peso relativo, valor en puntos y ventana. En la consola "
+                   "C++, la opción 12 calcula el indicador de un grupo o de un investigador y lista la tabla "
+                   "de pesos del modelo.")
+    add_table(doc, ["Entidad", "Productos vinculados", "Contados", "Estimados", "Sin categoría", "Población", "Indicador"], [
+        [label, number(linked), number(result["productos"]), number(result["estimadas"]),
+         number(result["sin_categoria"]), number(result["poblacion"]), decimal(result["indicador"])]
+        for label, linked, result in facts["indicators"]
+    ], [4.4, 2.2, 1.7, 1.8, 1.9, 2.0, 2.8])
+    paragraph(doc, f"Cifras calculadas sobre data/pea_upc.csv con corte {INDICATOR_CUTOFF}, sin año inicial "
+                   "ni filtro de validación. Los productos vinculados fuera de las ventanas de observación no "
+                   "se cuentan.")
+    with tempfile.TemporaryDirectory(prefix="pea-doc-") as folder:
+        temp = Path(folder)
+        group_sequence = temp / "secuencia_grupo.png"
+        person_sequence = temp / "secuencia_investigador.png"
+        sequence_image(group_sequence, "Indicador de un grupo desde su URL GrupLAC",
+                       ["Usuario", "Tkinter", "Importador", "GrupLAC", "Motor C++"], [
+                           (0, 1, "Importar → URL pública (ficha GrupLAC)"),
+                           (1, 2, "fetch_web_page(url)"),
+                           (2, 3, "GET visualizagr.jsp?nro=…"),
+                           (3, 2, "HTML de la ficha", True),
+                           (2, 1, "Vista previa: grupo, integrantes, productos con categoría estimada", True),
+                           (0, 1, "Importar datos detectados"),
+                           (1, 4, "create / update: grupo, investigadores, productos, vínculos"),
+                           (1, 4, "save(data/pea_upc.csv)"),
+                           (0, 1, "Dashboard: vista Grupo, ventana y validación"),
+                           (1, 4, "indicator(grupos, ID, inicio, corte, estado)"),
+                           (4, 1, "JSON: clases, Cohe, Coop, subtipos, indicador", True),
+                           (1, 0, "Panel «Ind. x de 10» con barras por término", True),
+                       ])
+        sequence_image(person_sequence, "Indicador de un investigador desde su URL CvLAC",
+                       ["Usuario", "Tkinter", "Importador", "CvLAC", "Motor C++"], [
+                           (0, 1, "Importar → URL pública (ficha CvLAC)"),
+                           (1, 2, "fetch_web_page(url)"),
+                           (2, 3, "GET generarCurriculoCv.do?cod_rh=…"),
+                           (3, 2, "HTML de la hoja de vida", True),
+                           (2, 1, "Vista previa: investigador y productos con categoría estimada", True),
+                           (0, 1, "Importar datos detectados"),
+                           (1, 4, "create / update: investigador, productos, autorías"),
+                           (1, 4, "save(data/pea_upc.csv)"),
+                           (0, 1, "Dashboard: vista Investigador, ventana y validación"),
+                           (1, 4, "indicator(investigadores, ID, inicio, corte, estado)"),
+                           (4, 1, "JSON: clases, Cohe, Coop, subtipos, indicador", True),
+                           (1, 0, "Panel «Ind. x de 10» con barras por término", True),
+                       ])
+        figure(doc, group_sequence, "Figura 4. Diagrama de secuencia: indicador de un grupo desde GrupLAC.")
+        figure(doc, person_sequence, "Figura 5. Diagrama de secuencia: indicador de un investigador desde CvLAC.")
+
+    heading(doc, "10 Historias de usuario y aceptación")
     add_table(doc,
               ["Historia", "Necesidad", "Criterio de aceptación"],
               [
@@ -457,41 +714,63 @@ def build() -> None:
                   ["HU05", "Como gestor quiero importar una fuente pública o CSV.",
                    "La vista previa identifica la fuente, muestra campos y registra aceptación o rechazo."],
                   ["HU06", "Como analista quiero un dashboard con indicadores y gráficos.",
-                   "Para la vista y los filtros elegidos muestra totales, histograma por año y barras por tipología, validación y reglas."],
+                   "Para la vista y los filtros elegidos muestra totales, histograma por año y barras por tipología, categoría, validación y reglas."],
+                  ["HU07", "Como analista quiero el indicador de producción del grupo cuya URL GrupLAC proporciono.",
+                   "Tras importar la ficha, la vista Grupo muestra el indicador, sus nueve términos y el detalle por subtipo; C++ y Python dan el mismo valor."],
+                  ["HU08", "Como analista quiero el indicador del investigador cuya URL CvLAC proporciono.",
+                   "Tras importar la hoja de vida, la vista Investigador calcula el indicador con la misma fórmula sobre sus productos."],
+                  ["HU09", "Como gestor quiero corregir la categoría de un producto.",
+                   "Elijo uno de los 169 subtipos; el producto queda con origen manual y una reimportación no lo cambia."],
               ], [1.8, 7.2, 7.8])
 
-    heading(doc, "10 Correspondencia entre requisitos y diseño")
+    heading(doc, "11 Correspondencia entre requisitos y diseño")
     rows = [
         ("R01", "Dos soluciones", "Consola C++17; interfaz Tkinter y motor Python autónomo."),
         ("R02", "Grupos", "Registro con ID, código GrupLAC, categoría, líneas, fuente y estado."),
         ("R03", "Investigadores", "Registro con ID, CvLAC, afiliación, categoría, fuente y estado."),
-        ("R04", "Productos", "Registro con fecha, tipología, DOI y URL; validación automática."),
+        ("R04", "Productos", "Registro con fecha, tipología, categoría del modelo, peso relativo y valor en puntos, DOI y URL; validación automática."),
         ("R05", "Integrantes y planes", "Membresía grupo-investigador y plan con grupo_id."),
-        ("R06", "Entradas y salidas", "Campos del apartado 3; CSV y distribuciones del apartado 8."),
-        ("R07", "Fuentes externas", "CSV en ambos motores; URL pública, PDF, XLSX y DOCX en Python."),
+        ("R06", "Entradas y salidas", "Campos del apartado 3; variables del modelo del apartado 9; CSV y distribuciones del apartado 8."),
+        ("R07", "Fuentes externas", "CSV en ambos motores; URL pública (GrupLAC y CvLAC), PDF, XLSX y DOCX en Python."),
         ("R08", "Listas", "Lista doble enlazada por tipo de entidad."),
         ("R09", "Multilistas", "Vínculos indexados y recorribles desde ambos extremos."),
         ("R10", "Pilas", "Deshacer LIFO de hasta 30 acciones, persistido en la sección historial."),
         ("R11", "Colas", "Revisión FIFO persistida en la sección cola_validacion; envío de todos los rechazados en una acción."),
-        ("R12", "CRUD y persistencia", "Operaciones de dominio y archivo único versión 4, con migración de las carpetas 1 a 3."),
-        ("R13", "Categoría y validación", "Categoría en grupos e investigadores; validación de productos por reglas, recalculada en cada cambio."),
+        ("R12", "CRUD y persistencia", "Operaciones de dominio y archivo único versión 5, con lectura de la versión 4 y migración de las carpetas 1 a 3."),
+        ("R13", "Categoría y validación", "Categoría del modelo 2024 en productos (estimada o manual) y clasificación en grupos e investigadores; validación de productos por reglas, recalculada en cada cambio."),
         ("R14", "Ventanas temporales", "Dos años, cinco años o intervalo personalizado."),
         ("R15", "Vistas estadísticas", "Total, grupo, investigador o producto sin duplicar IDs."),
-        ("R16", "Presentación C++", "Menús, tablas y resúmenes numéricos en consola."),
-        ("R17", "Presentación Python", "Dashboard con indicadores, histograma por año y barras por tipología, validación y reglas incumplidas; tabla paginada."),
+        ("R16", "Presentación C++", "Menús, tablas y resúmenes numéricos en consola, incluido el indicador (opción 12)."),
+        ("R17", "Presentación Python", "Dashboard con indicadores, panel del indicador de producción, histograma por año y barras por tipología, categoría, validación y reglas incumplidas; tabla paginada."),
         ("R18", "Inicio con o sin datos", "Carga inicial de data/pea_upc.csv, inicio vacío y apertura de otro archivo."),
         ("R19", "Archivos fuente", "Taller2_REMR.cpp y Taller2_REMR.py."),
-        ("R20", "Especificación", "Modelo, estructuras, algoritmos, contratos y diagramas."),
+        ("R20", "Especificación", "Modelo, estructuras, algoritmos, contratos, diagrama de casos de uso y diagramas de secuencia UML."),
+        ("R21", "Indicador del grupo", "Fórmula Minciencias 2024 sobre los productos del grupo de la URL GrupLAC (apartado 9)."),
+        ("R22", "Indicador del investigador", "Misma fórmula sobre los productos del investigador de la URL CvLAC (apartado 9)."),
     ]
     add_table(doc, ["ID", "Requisito", "Diseño correspondiente"], [list(row) for row in rows],
               [1.25, 4.5, 11.05])
 
-    heading(doc, "11 Restricciones del sistema y alcance de los datos")
-    paragraph(doc, "El archivo data/pea_upc.csv reúne fichas públicas GrupLAC de 66 grupos UPC. Contiene "
-                   "2.736 investigadores, 3.291 membresías (1.687 vigentes), 66 planes, 6.363 productos únicos "
-                   "con año entre 1984 y 2026, 6.735 vínculos grupo-producto y 9.703 autorías. Hay 274 investigadores con categoría "
-                   "CvLAC capturada. La validación automática deja 6.323 productos validados y 40 "
-                   "rechazados (37 sin autor del censo y 3 con DOI mal formado). Las fichas públicas pueden "
+    heading(doc, "12 Restricciones del sistema y alcance de los datos")
+    counts = facts["counts"]
+    rules = facts["rules"]
+    paragraph(doc, "El archivo data/pea_upc.csv reúne fichas públicas GrupLAC de 66 grupos UPC y la ficha "
+                   f"CvLAC del investigador del enunciado. Contiene {number(counts['investigadores'])} "
+                   f"investigadores, {number(counts['membresias'])} membresías "
+                   f"({number(facts['active_memberships'])} vigentes), {number(counts['planes'])} planes, "
+                   f"{number(counts['productos'])} productos únicos con año entre {facts['years'][0]} y "
+                   f"{facts['years'][1]}, {number(counts['grupos_productos'])} vínculos grupo-producto y "
+                   f"{number(counts['autorias'])} autorías. Hay {number(facts['people_with_category'])} "
+                   "investigadores con categoría CvLAC capturada. "
+                   f"{number(facts['categorized'])} productos tienen categoría del modelo "
+                   f"({number(facts['estimated'])} estimadas y {number(facts['manual'])} manuales). "
+                   f"La validación automática deja {number(facts['validation'].get('validado', 0))} productos "
+                   f"validados y {number(facts['validation'].get('rechazado', 0))} rechazados"
+                   + ("; las reglas incumplidas son: " + ", ".join(
+                       f"{pea['RULE_LABELS'][code].lower()} {number(count)}" for code, count in rules.items())
+                      if rules else "") + ". "
+                   "Tres DOI publicados con defectos en GrupLAC se corrigieron al importar: uno partido por un "
+                   "espacio se reparó y dos truncados no se guardan como DOI. Las fichas públicas pueden "
                    "cambiar; este conjunto no constituye un censo institucional actualizado.")
     paragraph(doc, "La extracción de URL depende del contenido público entregado por el servidor. Los PDF "
                    "escaneados requieren OCR externo; las páginas que generan sus datos exclusivamente con "
@@ -503,21 +782,15 @@ def build() -> None:
                    "y no reserva una celda para cada combinación de dimensiones. El tamaño de la memoria "
                    "depende del número de entidades, vínculos y longitud de los campos almacenados.")
 
-    heading(doc, "12 Diccionario de persistencia")
-    add_table(doc, ["Sección (en orden)", "Campos guardados"], [
-        ["#manifest", "version, guardado"],
-        ["#grupos", "id, nombre, codigo_gruplac, fecha_creacion, unidad, responsable, categoria, descripcion, objetivos, mision, vision, lineas, url, fuente, activo"],
-        ["#investigadores", "id, nombre, codigo_cvlac, afiliacion, categoria, contacto, url, fuente, activo"],
-        ["#productos", "id, titulo, anio, fecha, familia, tipologia, validacion, observacion, doi, url, fuente, activo"],
-        ["#planes", "id, grupo_id, nombre, inicio, fin, objetivo, indicador, meta, actividad, activo"],
-        ["#membresias", "grupo_id, investigador_id, rol, inicio, fin, activo"],
-        ["#autorias", "producto_id, investigador_id, orden, rol, activo"],
-        ["#grupos_productos", "grupo_id, producto_id, origen, activo"],
-        ["#cola_validacion", "id, producto_id, motivo, creado"],
-        ["#historial", "orden, snapshot"],
-    ], [4.0, 12.8])
+    heading(doc, "13 Diccionario de persistencia")
+    add_table(doc, ["Sección (en orden)", "Campos guardados"],
+              [["#" + name, ", ".join(fields)] for name, fields in pea["DATA_SECTIONS"].items()],
+              [4.0, 12.8])
+    paragraph(doc, f"El manifiesto declara la versión {pea['SCHEMA_VERSION']}. En los productos, categoria "
+                   "es un código del catálogo del modelo o queda vacía, y categoria_origen vale estimada, "
+                   "manual o queda vacía.")
 
-    heading(doc, "13 Ejecución y referencias")
+    heading(doc, "14 Ejecución y referencias")
     paragraph(doc, "En Windows de 64 bits, con Python 3.10 o posterior y Tkinter, se abre "
                    "Iniciar PEA-i.pyw mediante doble clic; el repositorio incluye pea_cpp.exe. "
                    "Para la consola se ejecuta bin/windows/pea_cpp.exe. En Linux se ejecuta "
@@ -526,12 +799,16 @@ def build() -> None:
                    "--python-backend. La consola acepta pea_cpp --data ARCHIVO; sin él pregunta si iniciar "
                    "vacía o abrir un archivo. Las pruebas automáticas están en tests/.")
     bullet(doc, "Enunciado del taller: docs/ENUNCIADO_TALLER_2.md, Universidad Popular del Cesar, 2026.")
-    bullet(doc, "Esquema y reglas: apartados 5, 6 y 12; protocolo entre procesos: apartado 2.")
+    bullet(doc, "Enunciado del Parcial 2 de Estructura de Datos, Universidad Popular del Cesar, octubre de 2026.")
+    bullet(doc, "Minciencias, Anexo 1. Convocatoria nacional para el reconocimiento y medición de grupos de "
+                "investigación, desarrollo tecnológico o de innovación y para el reconocimiento de investigadores "
+                "del SNCTI 2024 (M601PR04G01, versión 02).")
+    bullet(doc, "Esquema y reglas: apartados 5, 6 y 13; protocolo entre procesos: apartado 2; indicador: apartado 9.")
     bullet(doc, "Procedencia de datos: data/README.md y fichas públicas GrupLAC y CvLAC enlazadas allí.")
     bullet(doc, "Código fuente: src/cpp/Taller2_REMR.cpp y src/python/Taller2_REMR.py.")
     bullet(doc, "Video de presentación: docs/pea-i-por-dentro.mp4.")
 
-    heading(doc, "14 Algoritmos principales")
+    heading(doc, "15 Algoritmos principales")
     paragraph(doc, "Consulta estadística: la multilista selecciona los IDs de producto asociados a la "
                    "vista. Se recorren los productos activos, se aplican los filtros y se incrementan "
                    "los conteos. La lista visible se pagina sin alterar el total. Con P productos, R "
@@ -551,8 +828,16 @@ def build() -> None:
                    "validación no cambia porque es automática. Descartar retira el frente sin nota. En C++ "
                    "el registro de procesar contiene dos inversas: restaurar la observación y devolver el "
                    "trabajo al frente. Deshacer aplica el registro más reciente.")
+    paragraph(doc, "Indicador: se construye una vez el índice auxiliar investigador → grupos activos a partir "
+                   "de las membresías. Para la entidad pedida y para cada entidad activa del mismo tipo se "
+                   "recorren sus vínculos activos en la multilista; cada producto contado se clasifica por su "
+                   "subtipo y, si es de nuevo conocimiento (TOP, A o B), se recorren sus autorías para la "
+                   "cohesión y la cooperación. Luego se toman los máximos por término y se normaliza. Con M "
+                   "membresías, V vínculos de la población y A autorías de sus productos de nuevo "
+                   "conocimiento, el tiempo es O(M + V + A) promedio en Python y O((M + V + A) log n) en C++, "
+                   "y la memoria adicional es O(M + S), donde S es el número de subtipos con productos.")
 
-    heading(doc, "15 Contratos de operación")
+    heading(doc, "16 Contratos de operación")
     add_table(doc, ["Operación", "Entrada y precondición", "Salida y postcondición"], [
         ["Crear producto", "ID y título no vacíos; ID y DOI sin colisión; año y fecha concordantes.",
          "Un nodo activo queda indexado por ID; no se crean relaciones implícitas."],
@@ -566,8 +851,12 @@ def build() -> None:
          "Se restaura el estado previo a la última acción, incluida la cola, y el historial disminuye en uno."],
         ["Consultar estadísticas", "Vista válida; ID seleccionado cuando corresponde; rango inicial no mayor que el final.",
          "Total único y distribuciones calculadas tras filtrar; paginar no modifica el total."],
+        ["Calcular indicador", "Tipo grupos o investigadores; ID existente y activo; año inicial no mayor que el corte; validación vacía, validado o rechazado.",
+         "Siete clases, cohesión y cooperación con valor, máximo, índice y aporte; subtipos contados; indicador entre 0 y 10. No modifica datos."],
+        ["Asignar categoría", "Código del catálogo de 169 subtipos o vacío.",
+         "El producto queda con origen manual (o sin origen si se vacía) y la reimportación conserva la elección."],
         ["Guardar archivo", "Datos con integridad referencial y ruta de destino escribible.",
-         "Se escribe el archivo único del esquema 4 y se conserva el guardado anterior en .backup."],
+         "Se escribe el archivo único del esquema 5 y se conserva el guardado anterior en .backup."],
     ], [3.15, 6.8, 6.85])
 
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)

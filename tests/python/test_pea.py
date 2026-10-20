@@ -1,9 +1,11 @@
 """Pruebas del núcleo, ejecutables con python -m unittest discover -s tests/python."""
 
 import csv
+from collections import Counter
 from email.message import Message
 import hashlib
 import importlib.util
+import math
 import os
 from pathlib import Path
 import shutil
@@ -14,8 +16,11 @@ import time
 import unittest
 from unittest.mock import patch
 
+import fixture_f
+
 
 SOURCE = Path(__file__).resolve().parents[2] / "src" / "python" / "Taller2_REMR.py"
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 SPEC = importlib.util.spec_from_file_location("pea", SOURCE)
 pea = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(pea)
@@ -41,6 +46,12 @@ def sample() -> pea.Repository:
     return repo
 
 
+def indicator_fixture() -> pea.Repository:
+    repo = pea.Repository()
+    fixture_f.populate(repo)
+    return repo
+
+
 def write_folder(repo: pea.Repository, path: Path, version: str = "3") -> None:
     """Carpeta anterior al archivo único, con un CSV por tabla como en las versiones 1 a 3."""
     path.mkdir(parents=True, exist_ok=True)
@@ -49,7 +60,7 @@ def write_folder(repo: pea.Repository, path: Path, version: str = "3") -> None:
               "cola_validacion": list(repo.queue),
               "historial": [{"orden": str(index), "snapshot": state} for index, state in enumerate(repo.history)]}
     for name, rows in tables.items():
-        fields = pea.DATA_SECTIONS[name]
+        fields = pea.PRODUCT_FIELDS_V4 if name == "productos" else pea.DATA_SECTIONS[name]
         with (path / f"{name}.csv").open("w", encoding="utf-8", newline="") as stream:
             writer = csv.writer(stream, lineterminator="\n")
             writer.writerow(fields)
@@ -88,6 +99,74 @@ class StartupTest(unittest.TestCase):
             self.assertEqual(notice, "CMake falló")
             with self.assertRaisesRegex(pea.DataError, "CMake falló"):
                 pea.open_gui_repository(cpp_binary=Path("backend.exe"))
+
+    @staticmethod
+    def pip_result(code: int, stderr: str = ""):
+        return lambda command, **_options: subprocess.CompletedProcess(command, code, "", stderr)
+
+    def test_bootstrap_does_nothing_when_customtkinter_is_installed(self):
+        with patch("importlib.util.find_spec", return_value=object()):
+            self.assertTrue(pea.ensure_customtkinter(ask=lambda _text: self.fail("no debe preguntar"),
+                                                     run=lambda *_args, **_kw: self.fail("no debe instalar")))
+
+    def test_bootstrap_installs_when_missing_and_confirmed(self):
+        calls, questions = [], []
+        def run(command, **_options):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+        with patch("importlib.util.find_spec", side_effect=[None, object()]), \
+             patch.object(pea.sys, "prefix", "/usr"), patch.object(pea.sys, "base_prefix", "/usr"), \
+             patch.object(pea.site, "addsitedir") as add_site:
+            self.assertTrue(pea.ensure_customtkinter(ask=lambda text: questions.append(text) or True, run=run))
+        self.assertEqual(calls, [[pea.sys.executable, "-m", "pip", "install", "customtkinter==6.0.0", "--user"]])
+        self.assertIn("customtkinter==6.0.0", questions[0])
+        add_site.assert_called_once()
+
+    def test_bootstrap_installs_inside_a_virtual_environment_without_user_flag(self):
+        calls = []
+        def run(command, **_options):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+        with patch("importlib.util.find_spec", side_effect=[None, object()]), \
+             patch.object(pea.sys, "prefix", "/proyecto/.venv"), patch.object(pea.sys, "base_prefix", "/usr"):
+            self.assertTrue(pea.ensure_customtkinter(ask=lambda _text: True, run=run))
+        self.assertNotIn("--user", calls[0])
+
+    def test_bootstrap_declined_does_not_run_pip(self):
+        messages = []
+        with patch("importlib.util.find_spec", return_value=None), \
+             patch.object(pea, "_bootstrap_notice", messages.append):
+            self.assertFalse(pea.ensure_customtkinter(ask=lambda _text: False,
+                                                      run=lambda *_args, **_kw: self.fail("no debe instalar")))
+        self.assertIn("pip install customtkinter==6.0.0", messages[-1])
+
+    def test_bootstrap_explains_externally_managed_python(self):
+        messages = []
+        with patch("importlib.util.find_spec", return_value=None), \
+             patch.object(pea, "_bootstrap_notice", messages.append):
+            self.assertFalse(pea.ensure_customtkinter(
+                ask=lambda _text: True, run=self.pip_result(1, "error: externally-managed-environment")))
+        self.assertIn("python3 -m venv .venv", messages[-1])
+        self.assertIn("requirements.txt", messages[-1])
+
+    def test_bootstrap_reports_other_pip_failures_with_the_command(self):
+        messages = []
+        with patch("importlib.util.find_spec", return_value=None), \
+             patch.object(pea, "_bootstrap_notice", messages.append):
+            self.assertFalse(pea.ensure_customtkinter(
+                ask=lambda _text: True, run=self.pip_result(1, "ERROR: No matching distribution found")))
+        self.assertIn("No matching distribution found", messages[-1])
+        self.assertIn("-m pip install customtkinter==6.0.0", messages[-1])
+
+    def test_domain_import_does_not_need_customtkinter(self):
+        script = ("import runpy, sys; sys.modules['customtkinter'] = None; "
+                  "runpy.run_path(sys.argv[1])")
+        result = subprocess.run([sys.executable, "-c", script, str(SOURCE)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_requirements_pin_customtkinter(self):
+        requirements = (SOURCE.parents[2] / "requirements.txt").read_text(encoding="utf-8").split()
+        self.assertEqual(requirements, [pea.CTK_REQUIREMENT])
 
 
 class StructuresTest(unittest.TestCase):
@@ -129,6 +208,114 @@ class StructuresTest(unittest.TestCase):
 
 
 class DomainTest(unittest.TestCase):
+    def test_model_catalog_matches_anexo(self):
+        self.assertEqual(len(pea.MODEL_2024), 169)
+        self.assertEqual(pea.MODEL_2024["ART_A2"].peso_global, 550)
+        self.assertEqual(pea.MODEL_2024["CAP_LIB_B"].peso_global, 480)
+        self.assertEqual(pea.MODEL_2024["PA1"].peso_global, 5000)
+        self.assertEqual((pea.MODEL_2024["ART_D"].ventana, pea.MODEL_2024["LIB_B"].ventana,
+                          pea.MODEL_2024["PA1"].ventana), (5, 7, 10))
+        self.assertEqual(Counter(s.clase for s in pea.MODEL_2024.values()),
+                         {"TOP": 18, "A": 26, "B": 48, "ASC": 11, "DPC": 46, "FRH_A": 4, "FRH_B": 16})
+        self.assertEqual(pea.MODEL_CLASSES, ("TOP", "A", "B", "ASC", "DPC", "FRH_A", "FRH_B"))
+        self.assertEqual(pea.MODEL_COEFFICIENTS,
+                         {"TOP": 3.7, "A": 2.3, "B": 0.4, "ASC": 1.5, "DPC": 0.5,
+                          "FRH_A": 1.0, "FRH_B": 0.2, "COHE": 0.1, "COOP": 0.3})
+        catalog = pea.Repository().catalog()
+        self.assertEqual(catalog[0]["codigo"], "ART_OPEN_A1")
+        self.assertEqual([row["codigo"] for row in catalog], list(pea.MODEL_2024))
+        for row in catalog:
+            self.assertEqual(set(row), {"codigo", "clase", "familia", "descripcion", "ventana",
+                                        "peso_alta", "peso_relativo", "peso_global"})
+            self.assertIsInstance(row["ventana"], int)
+            for field in ("peso_alta", "peso_relativo", "peso_global"):
+                self.assertIsInstance(row[field], float)
+        catalog[0]["descripcion"] = "No debe alterar el catálogo"
+        self.assertEqual(pea.Repository().catalog()[0]["descripcion"],
+                         "Artículo de investigación A1 acceso abierto")
+
+    def test_product_category_rules(self):
+        repo = pea.Repository()
+        row = repo.create("productos", {"id": "P", "titulo": "T", "categoria": "ART_A1"})
+        self.assertEqual(row["categoria_origen"], "manual")
+        with self.assertRaisesRegex(pea.DataError, "Categoría desconocida: XYZ"):
+            repo.create("productos", {"id": "Q", "titulo": "T", "categoria": "XYZ"})
+        with self.assertRaisesRegex(pea.DataError, "Origen de categoría: estimada o manual"):
+            repo.create("productos", {"id": "R", "titulo": "T", "categoria": "ART_D", "categoria_origen": "otra"})
+        with self.assertRaisesRegex(pea.DataError, "Origen de categoría: estimada o manual"):
+            repo.create("productos", {"id": "R", "titulo": "T", "categoria_origen": "otra"})
+        est = repo.create("productos", {"id": "S", "titulo": "T", "categoria": "ART_D", "categoria_origen": "estimada"})
+        self.assertEqual(est["categoria_origen"], "estimada")
+        self.assertEqual(repo.update("productos", "S", {"observacion": "Conservar estimación"})["categoria_origen"], "estimada")
+        self.assertEqual(repo.update("productos", "S", {"categoria": "ART_D"})["categoria_origen"], "estimada")
+        self.assertEqual(repo.update("productos", "S", {"categoria": "ART_C"})["categoria_origen"], "manual")
+        self.assertEqual(repo.update("productos", "S", {"categoria": ""})["categoria_origen"], "")
+        self.assertEqual(repo.statistics()["por_categoria"], {"ART_A1": 1, "Sin dato": 1})
+        self.assertEqual(repo.update("productos", "S", {"categoria": "ART_D", "categoria_origen": "estimada"})["categoria_origen"], "estimada")
+        self.assertEqual(repo.update("productos", "S", {"categoria": ""})["categoria_origen"], "")
+        self.assertEqual(repo.update("productos", "S", {"categoria_origen": "manual"})["categoria_origen"], "")
+
+    def test_undo_keeps_category_and_v4_history(self):
+        repo = pea.Repository()
+        repo.create("productos", {"id": "P", "titulo": "T", "categoria": "ART_D"})
+        repo.update("productos", "P", {"observacion": "nota"})
+        self.assertTrue(repo.undo())
+        self.assertEqual((repo.get("productos", "P")["categoria"], repo.get("productos", "P")["observacion"]), ("ART_D", ""))
+        loaded = pea.load_repository(FIXTURES / "v4_con_historial.csv")
+        self.assertEqual(loaded.get("productos", "P1")["categoria"], "")
+        self.assertEqual(loaded.get("productos", "P1")["observacion"], "nota")
+        self.assertTrue(loaded.undo())
+        self.assertEqual(loaded.get("productos", "P1")["observacion"], "")
+        with tempfile.TemporaryDirectory() as folder:
+            out = Path(folder) / "datos.csv"
+            pea.save_repository(loaded, out)
+            self.assertEqual(out.read_text(encoding="utf-8").splitlines()[2].split(",")[0], "5")
+            self.assertEqual(pea.load_repository(out).snapshot(), loaded.snapshot())
+            pea.save_repository(repo, out)
+            saved = pea.load_repository(out)
+            self.assertEqual(saved.get("productos", "P")["categoria"], "ART_D")
+            self.assertTrue(saved.undo())
+            self.assertIsNone(saved.get("productos", "P"))
+
+    def test_product_category_delta_history(self):
+        repo = pea.Repository()
+        repo.create("productos", {"id": "P", "titulo": "T", "categoria": "ART_D", "categoria_origen": "estimada"})
+        original = repo.get("productos", "P").copy()
+        repo.update("productos", "P", {"categoria": "ART_C"})
+        change = {"__op": "replace", "__kind": "productos", **original}
+        repo.clear_history()
+        repo.history.push(pea.json.dumps({"__undo": [change]}))
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "datos.csv"
+            pea.save_repository(repo, path)
+            saved = pea.load_repository(path)
+            self.assertTrue(saved.undo())
+            product = saved.get("productos", "P")
+            self.assertEqual((product["categoria"], product["categoria_origen"], product["observacion"]),
+                             ("ART_D", "estimada", ""))
+
+    def test_csv_product_headers_v4_and_v5(self):
+        with tempfile.TemporaryDirectory() as folder:
+            for fields in (pea.PRODUCT_FIELDS_V4, pea.ENTITY_FIELDS["productos"]):
+                with self.subTest(fields=fields):
+                    path = Path(folder) / "importacion.csv"
+                    row = {"id": "P", "titulo": "T", "anio": "2025"}
+                    expected_category = ""
+                    if "categoria" in fields:
+                        row.update(categoria="ART_D", categoria_origen="estimada")
+                        expected_category = "ART_D"
+                    with path.open("w", encoding="utf-8", newline="") as stream:
+                        writer = csv.DictWriter(stream, fieldnames=fields)
+                        writer.writeheader()
+                        writer.writerow(row)
+                    repo = pea.Repository()
+                    self.assertEqual(pea.preview_csv_merge(repo, path, "productos"), (1, 1, []))
+                    self.assertEqual(repo.rows("productos"), [])
+                    self.assertEqual(pea.merge_csv(repo, path, "productos"), (1, []))
+                    self.assertEqual(repo.get("productos", "P")["categoria"], expected_category)
+                    self.assertTrue(repo.undo())
+                    self.assertEqual(repo.rows("productos"), [])
+
     def test_counts_dedupe_year_and_views(self):
         repo = sample()
         self.assertEqual(repo.statistics()["total"], 2)
@@ -137,7 +324,7 @@ class DomainTest(unittest.TestCase):
         self.assertEqual(repo.statistics(view="Grupo", selected_id="G1", start=2025, end=2025)["total"], 1)
         self.assertEqual(repo.statistics(view="Grupo", selected_id="")["total"], 0)
         self.assertEqual(repo.statistics(status="validado")["total"], 1)
-        self.assertEqual(repo.statistics(status="rechazado")["por_regla"], {"autor": 1, "fuente": 1})
+        self.assertEqual(repo.statistics(status="rechazado")["por_regla"], {"fuente": 1})
         with self.assertRaises(pea.DataError):
             repo.statistics(status="pendiente")
 
@@ -158,25 +345,49 @@ class DomainTest(unittest.TestCase):
     def test_automatic_validation_follows_links(self):
         repo = sample()
         self.assertEqual(repo.get("productos", "P1")["validacion"], "validado")
-        self.assertEqual(repo.product_issues("P2"), ["autor", "fuente"])
-        repo.update("productos", "P2", {"validacion": "validado", "url": "https://example.org/p2"})
+        # P2 tiene grupo y no autor: el vínculo con un grupo basta.
+        self.assertEqual(repo.product_issues("P2"), ["fuente"])
+        repo.update("productos", "P2", {"validacion": "rechazado", "url": "https://example.org/p2"})
         self.assertEqual((repo.get("productos", "P2")["validacion"], repo.product_issues("P2")),
-                         ("rechazado", ["autor"]))
+                         ("validado", []))
+        repo.toggle("grupos_productos", ("G2", "P2"))
+        self.assertEqual((repo.get("productos", "P2")["validacion"], repo.product_issues("P2")),
+                         ("rechazado", ["vinculo"]))
         repo.create("autorias", {"producto_id": "P2", "investigador_id": "I2"})
         self.assertEqual(repo.get("productos", "P2")["validacion"], "validado")
         repo.toggle("investigadores", "I2")
-        self.assertEqual(repo.product_issues("P2"), ["autor"])
+        self.assertEqual(repo.product_issues("P2"), ["vinculo"])
         self.assertEqual(repo.get("productos", "P1")["validacion"], "validado")
         self.assertTrue(repo.undo())
         self.assertEqual(repo.get("productos", "P2")["validacion"], "validado")
-        repo.toggle("grupos_productos", ("G2", "P2"))
-        self.assertEqual(repo.product_issues("P2"), ["grupo"])
         repo.update("productos", "P1", {"doi": "10.12/corto"})
         self.assertEqual(repo.product_issues("P1"), ["doi"])
         repo.update("productos", "P1", {"doi": "https://doi.org/10.1234/ok", "url": ""})
         self.assertEqual(repo.product_issues("P1"), [])
         repo.delete("autorias", ("P2", "I2"))
-        self.assertIn("autor", repo.product_issues("P2"))
+        self.assertEqual(repo.product_issues("P2"), ["vinculo"])
+
+    def test_link_rule_accepts_author_or_group(self):
+        repo = pea.Repository()
+        repo.create("grupos", {"id": "G", "nombre": "Grupo"})
+        repo.create("investigadores", {"id": "I", "nombre": "Ana"})
+        for key in ("SOLO-GRUPO", "SOLO-AUTOR", "SIN-VINCULO"):
+            repo.create("productos", {"id": key, "titulo": key, "anio": "2025", "tipologia": "Evento",
+                                      "url": "https://example.org/" + key})
+        repo.create("grupos_productos", {"grupo_id": "G", "producto_id": "SOLO-GRUPO"})
+        repo.create("autorias", {"producto_id": "SOLO-AUTOR", "investigador_id": "I"})
+        self.assertEqual([repo.get("productos", key)["validacion"] for key in ("SOLO-GRUPO", "SOLO-AUTOR")],
+                         ["validado", "validado"])
+        self.assertEqual(repo.product_issues("SIN-VINCULO"), ["vinculo"])
+        self.assertEqual(list(pea.VALIDATION_RULES), ["anio", "tipologia", "vinculo", "doi", "fuente"])
+        self.assertEqual(pea.VALIDATION_RULES["vinculo"], "Sin autor ni grupo activos")
+        repo.toggle("grupos", "G")
+        self.assertEqual(repo.product_issues("SOLO-GRUPO"), ["vinculo"])
+
+    def test_legacy_rule_codes_still_read_from_saved_reasons(self):
+        self.assertEqual(pea.auto_reason_codes("reglas:autor,grupo,fuente"), ["autor", "grupo", "fuente"])
+        self.assertEqual(pea.RULE_LABELS["autor"], "Sin autor activo registrado")
+        self.assertEqual(pea.RULE_LABELS["vinculo"], "Sin autor ni grupo activos")
 
     def test_review_queue_and_undo(self):
         repo = sample()
@@ -197,8 +408,8 @@ class DomainTest(unittest.TestCase):
         repo = sample()
         self.assertEqual(repo.enqueue_rejected(), 1)
         job = repo.queue.peek()
-        self.assertEqual((job["producto_id"], job["motivo"]), ("P2", "reglas:autor,fuente"))
-        self.assertEqual(pea.auto_reason_codes(job["motivo"]), ["autor", "fuente"])
+        self.assertEqual((job["producto_id"], job["motivo"]), ("P2", "reglas:fuente"))
+        self.assertEqual(pea.auto_reason_codes(job["motivo"]), ["fuente"])
         self.assertIsNone(pea.auto_reason_codes("Revisión manual"))
         self.assertEqual(repo.enqueue_rejected(), 0)
         self.assertTrue(repo.undo())
@@ -227,7 +438,7 @@ class DomainTest(unittest.TestCase):
                 "manifest", "grupos", "investigadores", "productos", "planes",
                 "membresias", "autorias", "grupos_productos", "cola_validacion", "historial"])
             manifest = [row for section, _, row in pea.read_data_sections(path) if section == "manifest"]
-            self.assertEqual([row["version"] for row in manifest], ["4"])
+            self.assertEqual([row["version"] for row in manifest], ["5"])
 
     def test_single_file_tolerates_bom_crlf_and_blank_lines(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -264,7 +475,8 @@ class DomainTest(unittest.TestCase):
             rejects("\n".join(lines[:row] + [lines[row] + ",sobrante"] + lines[row + 1:]),
                     f"línea {row + 1}: fila malformada en #autorias")
             rejects("G1,Grupo\n" + "\n".join(lines), "línea 1: el archivo debe comenzar con #manifest")
-            rejects("\n".join(lines).replace("\n4,", "\n3,", 1), "Versión de datos incompatible")
+            rejects("\n".join(lines).replace("\n5,", "\n3,", 1), "Versión de datos incompatible")
+            rejects("\n".join(lines).replace("\n5,", "\n4,", 1), "encabezados incorrectos en #productos")
             rejects("\n".join(lines) + "#extra\n", "sección sobrante #extra")
 
     def test_failed_save_keeps_previous_file(self):
@@ -497,8 +709,54 @@ class DomainTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual((rows[0]["titulo"], rows[0]["anio"], rows[0]["doi"]),
                          ("Estudio verificable", "2024", "10.1000/uno"))
-        self.assertNotIn("categoria", rows[0])
+        self.assertEqual((rows[0]["categoria"], rows[0]["categoria_origen"]), ("ART_D", "estimada"))
         self.assertEqual(pea.parse_web_page(html, url).related_products[0]["id"], rows[0]["id"])
+
+    def test_gruplac_repairs_split_doi_and_drops_incomplete_doi(self):
+        url = "https://scienti.minciencias.gov.co/gruplac/jsp/visualiza/visualizagr.jsp?nro=123"
+        html = """<h1>Grupo de prueba</h1><h2>Datos básicos</h2>
+        <h2>Artículos publicados</h2>
+        <p>1.- Publicado en revista especializada: DOI partido</p>
+        <p>Colombia, GLOBAL JOURNAL ISSN: 1916-9744, 2019 vol:11 fasc: págs: 1 - 13, DOI:10.5539/ gjhs.v11n9p34</p>
+        <p>Autores: Persona A</p>
+        <p>2.- Publicado en revista especializada: DOI incompleto</p>
+        <p>Colombia, REVISTA DE SALUD PUBLICA ISSN: 0124-0064, 2024 vol:26 fasc: págs: 1 - 7, DOI:10.15446/.</p>
+        <p>Autores: Persona B</p>
+        <h2>Libros publicados</h2>"""
+        rows = {row["titulo"]: row for row in pea.parse_gruplac_articles(html, url)}
+        self.assertEqual(rows["DOI partido"]["doi"], "10.5539/gjhs.v11n9p34")
+        self.assertEqual(rows["DOI incompleto"]["doi"], "")
+        self.assertIn("DOI incompleto en la fuente: 10.15446/", rows["DOI incompleto"]["fuente"])
+        # El ID sigue derivándose del texto publicado, para no duplicar productos ya importados.
+        self.assertEqual(rows["DOI partido"]["id"], pea.product_id(pea.product_identity(
+            "DOI partido", "2019", "10.5539/", "Publicado en revista especializada", True)))
+        self.assertEqual(rows["DOI incompleto"]["id"], pea.product_id(pea.product_identity(
+            "DOI incompleto", "2024", "10.15446/", "Publicado en revista especializada", True)))
+
+    def test_reimport_replaces_an_invalid_stored_doi(self):
+        repo = pea.Repository()
+        for key, doi in (("P-VACIO", "10.15446/"), ("P-REPARADO", "10.5539/")):
+            repo.create("productos", {"id": key, "titulo": key, "anio": "2024", "tipologia": "Artículo", "doi": doi})
+        counts = {"existentes": 0, "actualizados": 0, "errors": []}
+        for key, doi in (("P-VACIO", ""), ("P-REPARADO", "10.5539/gjhs.v11n9p34")):
+            row = pea.clean_row("productos", {"id": key, "titulo": key, "anio": "2024", "tipologia": "Artículo",
+                                              "doi": doi, "fuente": "GrupLAC, consultado hoy"})
+            self.assertTrue(pea._merge_record(repo, "productos", row, key, counts, {}))
+        self.assertEqual((repo.get("productos", "P-VACIO")["doi"], repo.get("productos", "P-REPARADO")["doi"]),
+                         ("", "10.5539/gjhs.v11n9p34"))
+        self.assertEqual(repo.get("productos", "P-VACIO")["fuente"], "GrupLAC, consultado hoy")
+        self.assertEqual(counts["errors"], [])
+
+    def test_reimport_matches_title_that_differs_only_in_final_period(self):
+        # Otro grupo lista el mismo artículo sin el punto final; su DOI truncado ya no sirve para emparejarlo.
+        repo = pea.Repository()
+        repo.create("productos", {"id": "P", "titulo": "Violencia Obstétrica, Valledupar, Colombia.",
+                                  "anio": "2024", "tipologia": "Artículo"})
+        counts = {"existentes": 0, "actualizados": 0, "errors": []}
+        row = pea.clean_row("productos", {"id": "P", "titulo": "Violencia obstétrica, Valledupar, Colombia",
+                                          "anio": "2024", "tipologia": "Artículo"})
+        self.assertTrue(pea._merge_record(repo, "productos", row, "P", counts, {}))
+        self.assertEqual(counts["errors"], [])
 
     def test_gruplac_roster_plan_products_and_repeat_import(self):
         url = "https://scienti.minciencias.gov.co/gruplac/jsp/visualiza/visualizagr.jsp?nro=123"
@@ -605,18 +863,21 @@ class DomainTest(unittest.TestCase):
     def test_real_dataset_loads_with_expected_relations(self):
         real = pea.load_repository(SOURCE.parents[2] / "data" / "pea_upc.csv")
         self.assertEqual(pea.DEFAULT_DATA_FILE, SOURCE.parents[2] / "data" / "pea_upc.csv")
-        self.assertEqual(real.statistics()["total"], 6363)
-        self.assertEqual(real.statistics(view="Grupo", selected_id="G-00000000002099")["total"], 197)
-        self.assertEqual(real.statistics(view="Investigador", selected_id="I-0000494917")["total"], 15)
+        self.assertEqual(real.statistics(limit=0)["total"], 21419)
+        self.assertEqual(real.statistics(view="Grupo", selected_id="G-00000000002099", limit=0)["total"], 438)
+        self.assertEqual(real.statistics(view="Investigador", selected_id="I-0000494917", limit=0)["total"], 86)
         self.assertEqual(len(real.rows("grupos")), 66)
-        self.assertEqual(len(real.rows("investigadores")), 2736)
-        self.assertEqual(len(real.rows("membresias")), 3291)
+        self.assertEqual(len(real.rows("investigadores")), 2748)
+        self.assertEqual(len(real.rows("membresias")), 3303)
         self.assertEqual(len(real.rows("planes")), 66)
-        self.assertEqual(len(real.rows("autorias")), 9703)
-        self.assertEqual(len(real.rows("grupos_productos")), 6735)
-        self.assertNotIn("categoria", pea.ENTITY_FIELDS["productos"])
-        self.assertEqual(real.statistics(limit=0)["por_validacion"], {"validado": 6323, "rechazado": 40})
-        self.assertEqual(real.statistics(limit=0)["por_regla"], {"autor": 37, "doi": 3})
+        self.assertEqual(len(real.rows("autorias")), 17170)
+        self.assertEqual(len(real.rows("grupos_productos")), 22781)
+        self.assertEqual(Counter(row["categoria_origen"] for row in real.rows("productos")),
+                         {"estimada": 20917, "": 502})
+        self.assertEqual(sum(bool(row["categoria"]) for row in real.rows("productos")), 20917)
+        self.assertEqual(sum(bool(row["fecha_creacion"]) for row in real.rows("grupos")), 66)
+        self.assertEqual(real.statistics(limit=0)["por_validacion"], {"validado": 21419})
+        self.assertEqual(real.statistics(limit=0)["por_regla"], {})
         self.assertEqual(sum(bool(row["categoria"]) for row in real.rows("investigadores")), 274)
         self.assertEqual(real.get("investigadores", "I-0000494917")["categoria"], "Investigador Asociado (I)")
 
@@ -661,6 +922,403 @@ class DomainTest(unittest.TestCase):
             self.assertEqual(demo.queue.peek()["producto_id"], "P-DEMO-2")
             self.assertEqual(demo.statistics(limit=0)["por_validacion"], {"validado": 3, "rechazado": 1})
             self.assertEqual(demo.product_issues("P-DEMO-4"), ["fuente"])
+
+
+class ScientiImportTest(unittest.TestCase):
+    GROUP_URL = "https://scienti.minciencias.gov.co/gruplac/jsp/visualiza/visualizagr.jsp?nro=123"
+    CV_URL = "https://scienti.minciencias.gov.co/cvlac/visualizador/generarCurriculoCv.do?cod_rh=0000494917"
+
+    def repositories(self):
+        repos = [pea.Repository()]
+        binary = SOURCE.parents[2] / "build/pea_cpp"
+        if binary.exists():
+            cpp = pea.CppRepository(binary)
+            self.addCleanup(cpp.close)
+            repos.append(cpp)
+        return repos
+
+    def group_preview(self):
+        return pea.parse_web_page((FIXTURES / "gruplac_nuevas_secciones.html").read_text(encoding="utf-8"), self.GROUP_URL)
+
+    def cv_preview(self):
+        return pea.parse_web_page((FIXTURES / "cvlac_productos.html").read_text(encoding="utf-8"), self.CV_URL)
+
+    def test_estimate_category_map(self):
+        self.assertEqual(pea.estimate_category("Artículos publicados", "Publicado en revista especializada"), "ART_D")
+        self.assertEqual(pea.estimate_category("Trabajos dirigidos/turorías", "Pregrado"), "TP_B")
+        self.assertEqual(pea.estimate_category("Otros artículos publicados", "Epílogo"), "")
+        # Prensa y divulgación: publicación editorial no especializada, como ya lo clasifica CvLAC.
+        for kind in ("Revista de divulgación", "Periódico de noticias", "Columna de opinión"):
+            self.assertEqual(pea.estimate_category("Otros artículos publicados", kind), "PEE_C2")
+        self.assertEqual(pea.estimate_category("Libros publicados", "Libro pedagógico y/o de divulgación"), "LIB_DIV")
+        self.assertTrue(all(code in pea.MODEL_2024 for code in pea.CATEGORY_ESTIMATES.values() if code))
+
+    def test_gruplac_new_sections_and_creation_date(self):
+        preview = self.group_preview()
+        self.assertEqual(preview.suggested_row["fecha_creacion"], "2001-02-01")
+        self.assertEqual({p["categoria"]: p["anio"] for p in preview.related_products},
+                         {"TP_B": "2026", "PID_C": "2024", "EC_B": "2025"})
+        self.assertTrue(all(p["categoria_origen"] == "estimada" for p in preview.related_products))
+        thesis = next(p for p in preview.related_products if p["categoria"] == "TP_B")
+        self.assertIn((thesis["id"], "I-0042"),
+                      [(r["producto_id"], r["investigador_id"]) for r in preview.related_authorships])
+        for repo in self.repositories():
+            counts = pea.import_gruplac_preview(repo, preview)
+            self.assertEqual((counts["productos"], counts["errors"]), (3, []))
+
+    def test_reimport_keeps_manual_category(self):
+        preview = self.group_preview()
+        for repo in self.repositories():
+            pea.import_gruplac_preview(repo, preview)
+            product = next(p for p in preview.related_products if p["categoria"] == "TP_B")
+            repo.update("productos", product["id"], {"categoria": "ART_A1"})
+            pea.import_gruplac_preview(repo, preview)
+            row = repo.get("productos", product["id"])
+            self.assertEqual((row["categoria"], row["categoria_origen"]), ("ART_A1", "manual"))
+            other = next(p for p in preview.related_products if p["categoria"] == "PID_C")
+            repo.update("productos", other["id"], {"categoria": ""})
+            refreshed = pea.import_gruplac_preview(repo, preview)
+            self.assertEqual((refreshed["actualizados"], refreshed["errors"]), (1, []))
+            row = repo.get("productos", other["id"])
+            self.assertEqual((row["categoria"], row["categoria_origen"]), ("PID_C", "estimada"))
+
+    def test_gruplac_category_sections_and_boundaries(self):
+        for section, stop, kind, code in (
+            ("Conceptos técnicos", "Diseños industriales", "Concepto", "CT"),
+            ("Generación de Contenido Virtual", "Estrategias de Comunicación del Conocimiento", "Página web", "GC"),
+            ("Eventos Artísticos", "Talleres de Creación", "Festival", "ECA_B"),
+            ("Programa académico de doctorado", "Programa académico de maestría", "Programa", "AP_A"),
+        ):
+            with self.subTest(section=section):
+                html = f'<h2>{section}</h2><p>1.- {kind}: Producto de prueba</p><p>2025,</p><h2>{stop}</h2>'
+                products = pea.parse_gruplac_products(html, self.GROUP_URL)
+                self.assertEqual([(p.row["categoria"], p.row["anio"]) for p in products], [(code, "2025")])
+        bad = (FIXTURES / "gruplac_nuevas_secciones.html").read_text(encoding="utf-8").replace("2001 - 2", "2001 - 13")
+        self.assertEqual(pea.parse_scienti_html(bad, self.GROUP_URL)[1]["fecha_creacion"], "")
+
+    def test_reimport_changed_estimate_keeps_estimated_origin(self):
+        original = self.group_preview()
+        target = next(p for p in original.related_products if p["categoria"] == "TP_B")
+        revised = original._replace(related_products=tuple(
+            {**p, "categoria": "TM_B"} if p["id"] == target["id"] else p for p in original.related_products))
+        for repo in self.repositories():
+            pea.import_gruplac_preview(repo, original)
+            for preview, category in ((revised, "TM_B"), (original, "TP_B")):
+                counts = pea.import_gruplac_preview(repo, preview)
+                self.assertEqual((counts["actualizados"], counts["errors"]), (1, []))
+                row = repo.get("productos", target["id"])
+                self.assertEqual((row["categoria"], row["categoria_origen"]), (category, "estimada"))
+
+    def test_cvlac_products_parse_and_import(self):
+        html = (FIXTURES / "cvlac_productos.html").read_text(encoding="utf-8")
+        entries = pea.parse_cvlac_products(html, self.CV_URL)
+        self.assertEqual([(p.row["categoria"], p.row["anio"]) for p in entries], [("ART_D", "2023"), ("TP_B", "2005")])
+        self.assertEqual(entries[0].row["doi"], "10.15643134/2346030X.3249")
+        preview = self.cv_preview()
+        self.assertEqual(len(preview.related_authorships), 2)
+        self.assertTrue(all(r["investigador_id"] == "I-0000494917" for r in preview.related_authorships))
+        for repo in self.repositories():
+            counts = pea.import_cvlac_preview(repo, preview)
+            self.assertEqual((counts["investigadores"], counts["productos"], counts["autorias"], counts["errors"]), (1, 2, 2, []))
+            again = pea.import_cvlac_preview(repo, preview)
+            self.assertEqual((again["existentes"], again["actualizados"], again["errors"]), (3, 0, []))
+            self.assertEqual(len(repo.rows("productos")), 2)
+
+    def test_cvlac_product_merges_with_gruplac_twin(self):
+        preview = self.cv_preview()
+        article = preview.related_products[0]
+        preview = preview._replace(related_products=(article,), related_authorships=preview.related_authorships[:1])
+        html = f'<h1>Grupo de prueba</h1><h2>Datos básicos</h2><h2>Artículos publicados</h2><p>1.- Publicado en revista especializada: {article["titulo"].upper()}</p><p>2023, DOI:{article["doi"]}</p><h2>Libros publicados</h2>'
+        group = pea.parse_web_page(html, self.GROUP_URL)
+        self.assertEqual(group.related_products[0]["id"], article["id"])
+        for repo in self.repositories():
+            pea.import_gruplac_preview(repo, group)
+            repo.update("productos", article["id"], {"categoria": "ART_A1"})
+            counts = pea.import_cvlac_preview(repo, preview)
+            self.assertEqual(counts["errors"], [])
+            self.assertEqual((len(repo.rows("productos")), len(repo.rows("grupos_productos")), len(repo.rows("autorias"))), (1, 1, 1))
+            row = repo.get("productos", article["id"])
+            self.assertEqual((row["categoria"], row["categoria_origen"]), ("ART_A1", "manual"))
+
+    def test_cvlac_technical_titles_and_block_boundaries(self):
+        html = '''<p>Producción técnica - Softwares - Computacional</p><blockquote>
+        <p>ANA PEREZ,</p><p>AG-CASU: Software de prueba,</p><p>Nombre comercial: AG,</p><p>,2025,</p></blockquote>
+        <p>Producción técnica - Innovación de proceso o procedimiento</p><blockquote>
+        <p>ANA PEREZ,</p><p>Prueba,</p><p>Nombre comercial: ,</p><p>,2024,</p></blockquote>
+        <p>Producción técnica - Empresa de base tecnológica - Spin-off</p><blockquote>
+        <p>ANA PEREZ,</p><p>Empresa de prueba,,</p><p>Nombre comercial: EMP,</p><p>,2023,</p></blockquote>
+        <p>Producción bibliográfica - Artículo - Publicado en revista especializada</p><blockquote>
+        <p>ANA PEREZ,</p><p>"Artículo sin fecha"</p></blockquote><h3>Eventos científicos</h3><p>Evento en 2026.</p>'''
+        entries = pea.parse_cvlac_products(html, self.CV_URL)
+        self.assertEqual([(p.row["titulo"], p.row["categoria"]) for p in entries],
+                         [("AG-CASU: Software de prueba", "SF"), ("Prueba", "IPP"), ("Empresa de prueba", "EBT_B")])
+
+    def test_cvlac_technical_twin_has_stable_metadata(self):
+        group_html = '<h1>Grupo de prueba</h1><h2>Datos básicos</h2><h2>Softwares</h2><p>1.- Computacional: Software de prueba</p><p>2025,</p><h2>Empresas de base tecnológica</h2>'
+        cv_html = '<p>Producción técnica - Softwares - Computacional</p><blockquote><p>ANA PEREZ,</p><p>Software de prueba,</p><p>Nombre comercial: Prueba,</p><p>,2025,</p></blockquote>'
+        group = pea.parse_web_page(group_html, self.GROUP_URL)
+        entries = pea.parse_cvlac_products(cv_html, self.CV_URL)
+        cv = self.cv_preview()._replace(related_products=tuple(p.row for p in entries), related_authorships=())
+        self.assertEqual(group.related_products[0]["id"], cv.related_products[0]["id"])
+        for repo in self.repositories():
+            pea.import_gruplac_preview(repo, group)
+            counts = pea.import_cvlac_preview(repo, cv)
+            self.assertEqual((counts["productos"], counts["actualizados"], counts["autorias"], counts["errors"]), (0, 0, 1, []))
+            counts = pea.import_gruplac_preview(repo, group)
+            self.assertEqual((counts["actualizados"], counts["errors"]), (0, []))
+
+    def test_cvlac_review_rejects_different_profile(self):
+        preview = self.cv_preview()
+        repo = pea.Repository()
+        with self.assertRaisesRegex(pea.DataError, "código CvLAC revisado no coincide"):
+            pea.import_cvlac_preview(repo, preview, {**preview.suggested_row, "codigo_cvlac": "otro"})
+        self.assertEqual(repo.rows("investigadores"), [])
+
+    def test_import_script_accepts_repeated_cvlac(self):
+        spec = importlib.util.spec_from_file_location("import_upc_test", SOURCE.parents[2] / "scripts/import_upc_dataset.py")
+        script = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(script)
+        preview = self.cv_preview()
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "datos.csv"
+            with patch.object(script, "GROUPS", []), patch.object(script, "fetch_web_page", return_value=preview) as fetch:
+                with patch.object(sys, "argv", ["import_upc_dataset.py", "--data", str(target), "--cvlac", self.CV_URL,
+                                                 "--cvlac", self.CV_URL]), patch("builtins.print"):
+                    script.main()
+            self.assertEqual(fetch.call_count, 2)
+            repo = pea.load_repository(target)
+            self.assertEqual((len(repo.rows("productos")), len(repo.rows("autorias")), repo.history_size()), (2, 2, 0))
+
+
+class IndicatorTest(unittest.TestCase):
+    def test_indicator_group_matches_fixture(self):
+        repo = indicator_fixture()
+        r = repo.indicator("grupos", "G1", end=2026)
+        self.assertEqual((r["poblacion"], r["productos"], r["sin_categoria"], r["estimadas"]), (2, 4, 1, 0))
+        sub = {s["codigo"]: s for s in r["subtipos"]}
+        self.assertEqual(list(sub), ["ART_D", "LIB_B", "WP"])
+        self.assertEqual((sub["ART_D"]["cantidad"], sub["ART_D"]["periodo"]), (2, 5))
+        self.assertAlmostEqual(sub["ART_D"]["lambda"], 0.336472, 6)
+        self.assertAlmostEqual(sub["LIB_B"]["valor"], 320.475342, 6)
+        self.assertAlmostEqual(r["cohesion"]["valor"], 1 / 3, 6)
+        self.assertAlmostEqual(r["cooperacion"]["valor"], 2 / 3, 6)
+        self.assertAlmostEqual(r["clases"][2]["indice"], 0.829843, 6)
+        self.assertAlmostEqual(r["indicador"], 3.531937, 6)
+        self.assertEqual([c["clase"] for c in r["clases"]], list(pea.MODEL_CLASSES))
+        self.assertEqual((r["tipo"], r["id"], r["corte"], r["inicio"], r["estado"]),
+                         ("grupos", "G1", 2026, None, ""))
+        self.assertTrue(all(p["validacion"] == "rechazado" for p in repo.rows("productos")))
+        self.assertEqual(set(r), {"tipo", "id", "corte", "inicio", "estado", "poblacion", "productos",
+                                  "sin_categoria", "estimadas", "clases", "cohesion", "cooperacion",
+                                  "subtipos", "indicador"})
+        for term in (*r["clases"], r["cohesion"], r["cooperacion"]):
+            for field in ("coeficiente", "valor", "maximo", "indice", "aporte"):
+                self.assertIsInstance(term[field], float)
+        self.assertAlmostEqual(r["indicador"], sum(t["aporte"] for t in r["clases"]) +
+                               r["cohesion"]["aporte"] + r["cooperacion"]["aporte"], 12)
+
+    def test_indicator_age_window_status_and_researcher(self):
+        repo = indicator_fixture()
+        g2 = repo.indicator("grupos", "G2", end=2026)
+        self.assertEqual([(s["codigo"], s["cantidad"], s["periodo"]) for s in g2["subtipos"]], [("ART_D", 1, 2)])
+        self.assertAlmostEqual(g2["indicador"], 0.4, 6)
+        narrow = repo.indicator("grupos", "G1", start=2025, end=2026)
+        art = next(s for s in narrow["subtipos"] if s["codigo"] == "ART_D")
+        self.assertEqual((art["cantidad"], art["periodo"]), (1, 2))
+        self.assertAlmostEqual(art["lambda"], 0.405465, 6)
+        validated = repo.indicator("grupos", "G1", end=2026, status="validado")
+        self.assertEqual((validated["productos"], validated["indicador"]), (0, 0.0))
+        self.assertEqual(validated["estado"], "validado")
+        self.assertEqual(repo.indicator("grupos", "G1", end=2026, status="rechazado")["indicador"],
+                         repo.indicator("grupos", "G1", end=2026)["indicador"])
+        i1 = repo.indicator("investigadores", "I1", end=2026)
+        self.assertAlmostEqual(i1["cohesion"]["valor"], 0.5, 6)
+        self.assertAlmostEqual(i1["cooperacion"]["valor"], 1.0, 6)
+        self.assertAlmostEqual(i1["indicador"], 1.3, 6)
+
+    def test_indicator_single_population_and_inactive(self):
+        repo = indicator_fixture()
+        repo.toggle("grupos", "G1")
+        r = repo.indicator("grupos", "G2", end=2026)
+        self.assertEqual(r["poblacion"], 1)
+        self.assertAlmostEqual(r["indicador"], 0.4, 6)
+        for term in (*r["clases"], r["cohesion"], r["cooperacion"]):
+            self.assertEqual(term["indice"], 1.0 if term["valor"] else 0.0)
+        with self.assertRaisesRegex(pea.DataError, "Registro inactivo"):
+            repo.indicator("grupos", "G1", end=2026)
+
+    def test_indicator_group_younger_than_cutoff(self):
+        repo = indicator_fixture()
+        r = repo.indicator("grupos", "G2", end=2024)
+        self.assertEqual((r["productos"], r["subtipos"], r["indicador"]), (0, [], 0.0))
+        first_year = repo.indicator("grupos", "G2", end=2025)
+        self.assertEqual(first_year["productos"], 0)
+        repo.update("grupos", "G1", {"fecha_creacion": "2026-12-31"})
+        one_year = repo.indicator("grupos", "G1", end=2026)
+        self.assertEqual((one_year["productos"], one_year["indicador"]), (0, 0.0))
+
+    def test_indicator_ignores_category_without_year(self):
+        repo = indicator_fixture()
+        repo.create("productos", {"id": "P9", "titulo": "Sin año", "tipologia": "Prueba", "categoria": "ART_D"})
+        repo.create("grupos_productos", {"grupo_id": "G1", "producto_id": "P9"})
+        r = repo.indicator("grupos", "G1", end=2026)
+        self.assertEqual((r["productos"], r["sin_categoria"]), (4, 1))
+
+    def test_indicator_errors_and_default_cutoff(self):
+        repo = indicator_fixture()
+        for kind, key, options, message in (
+            ("productos", "P1", {}, "Tipo de indicador: grupos o investigadores"),
+            ("grupos", "missing", {}, "Registro no encontrado"),
+            ("grupos", "G1", {"start": 2026, "end": 2025}, "El año inicial supera al final"),
+            ("grupos", "G1", {"status": "pendiente"}, "Validación: validado o rechazado"),
+        ):
+            with self.subTest(kind=kind, key=key, options=options):
+                with self.assertRaisesRegex(pea.DataError, message):
+                    repo.indicator(kind, key, **options)
+        repo.toggle("investigadores", "I3")
+        with self.assertRaisesRegex(pea.DataError, "Registro inactivo"):
+            repo.indicator("investigadores", "I3", end=2026)
+        today = pea.date.today().year
+        self.assertEqual(repo.indicator("grupos", "G1")["corte"], today)
+        self.assertEqual(repo.indicator("grupos", "G1", start=today + 1)["indicador"], 0.0)
+
+    def test_indicator_filters_population_maxima(self):
+        repo = indicator_fixture()
+        # Con la misma ventana de dos años, G1 y G2 tienen un artículo cada uno.
+        narrow = repo.indicator("grupos", "G1", start=2025, end=2026)
+        self.assertEqual(narrow["clases"][2]["indice"], 1.0)
+        self.assertAlmostEqual(narrow["clases"][2]["maximo"], 45 * math.log(1.5), 12)
+        repo.update("productos", "P4", {"url": "https://example.org/p4"})
+        validated = repo.indicator("grupos", "G1", end=2026, status="validado")
+        self.assertEqual(validated["clases"][2]["valor"], 0.0)
+        self.assertAlmostEqual(validated["clases"][2]["maximo"], 45 * math.log(1.5), 12)
+        repo.toggle("grupos", "G2")
+        alone = repo.indicator("grupos", "G1", end=2026)
+        self.assertEqual(alone["poblacion"], 1)
+        self.assertEqual(alone["clases"][2]["indice"], 1.0)
+        self.assertEqual(alone["cooperacion"]["valor"], 0.0)
+
+    def test_indicator_ignores_inactive_products_and_links(self):
+        for kind, key in (("productos", "P1"), ("grupos_productos", ("G1", "P1"))):
+            with self.subTest(kind=kind):
+                repo = indicator_fixture()
+                repo.toggle(kind, key)
+                r = repo.indicator("grupos", "G1", end=2026)
+                self.assertEqual(r["productos"], 3)
+                self.assertEqual(r["cohesion"]["valor"], 0.0)
+                self.assertEqual(r["cooperacion"]["valor"], 0.5)
+        repo = indicator_fixture()
+        repo.toggle("autorias", ("P1", "I1"))
+        self.assertEqual(repo.indicator("investigadores", "I1", end=2026)["productos"], 2)
+        self.assertEqual(repo.indicator("grupos", "G1", end=2026)["productos"], 4)
+
+    def test_indicator_active_authors_and_memberships(self):
+        for kind, key in (("investigadores", "I2"), ("autorias", ("P1", "I2")),
+                           ("membresias", ("G1", "I2"))):
+            with self.subTest(kind=kind):
+                repo = indicator_fixture()
+                repo.toggle(kind, key)
+                group = repo.indicator("grupos", "G1", end=2026)
+                person = repo.indicator("investigadores", "I1", end=2026)
+                self.assertEqual(group["productos"], 4)
+                self.assertEqual(group["cohesion"]["valor"], 0.0)
+                self.assertAlmostEqual(group["cooperacion"]["valor"], 2 / 3, 12)
+                self.assertEqual(person["cohesion"]["valor"], 0.0)
+
+    def test_indicator_researcher_cohesion_uses_all_active_groups(self):
+        repo = indicator_fixture()
+        repo.create("productos", {"id": "P9", "titulo": "Coautor de otro grupo", "anio": "2025", "categoria": "ART_D"})
+        for researcher in ("I1", "I3"):
+            repo.create("autorias", {"producto_id": "P9", "investigador_id": researcher})
+        r = repo.indicator("investigadores", "I1", end=2026)
+        self.assertAlmostEqual(r["cohesion"]["valor"], 2 / 3, 12)
+        self.assertEqual(r["cooperacion"]["valor"], 1.0)
+        repo.toggle("membresias", ("G1", "I1"))
+        repo.toggle("membresias", ("G2", "I1"))
+        isolated = repo.indicator("investigadores", "I1", end=2026)
+        self.assertEqual((isolated["cohesion"]["valor"], isolated["cooperacion"]["valor"]), (0.0, 0.0))
+
+    def test_indicator_uncategorized_and_estimated_counts(self):
+        repo = indicator_fixture()
+        for product_id, year, active in (("P-OLD", "2016", "1"), ("P-EDGE", "2017", "1"),
+                                          ("P-FUTURE", "2027", "1"), ("P-NO-YEAR", "", "1"),
+                                          ("P-INACTIVE", "2025", "0")):
+            repo.create("productos", {"id": product_id, "titulo": product_id, "anio": year, "activo": active})
+            repo.create("grupos_productos", {"grupo_id": "G1", "producto_id": product_id})
+        repo.update("productos", "P1", {"categoria_origen": "estimada"})
+        repo.update("productos", "P5", {"categoria_origen": "estimada"})
+        r = repo.indicator("grupos", "G1", end=2026)
+        self.assertEqual((r["sin_categoria"], r["estimadas"]), (2, 1))
+        self.assertEqual(repo.indicator("grupos", "G1", start=2025, end=2026)["sin_categoria"], 1)
+        self.assertEqual(repo.indicator("grupos", "G1", end=2026, status="validado")["sin_categoria"], 0)
+        repo.update("grupos", "G1", {"fecha_creacion": "2025-01-01"})
+        self.assertEqual(repo.indicator("grupos", "G1", end=2026)["sin_categoria"], 2)
+
+    def test_indicator_empty_group_and_missing_creation_date(self):
+        repo = pea.Repository()
+        repo.create("grupos", {"id": "G", "nombre": "Sin fecha de creación"})
+        self.assertEqual(repo.indicator("grupos", "G", end=2026)["indicador"], 0.0)
+        repo.create("productos", {"id": "P", "titulo": "Sin autores", "anio": "2017", "categoria": "PA1"})
+        repo.create("grupos_productos", {"grupo_id": "G", "producto_id": "P"})
+        r = repo.indicator("grupos", "G", end=2026)
+        self.assertEqual((r["productos"], r["subtipos"][0]["periodo"]), (1, 10))
+        self.assertAlmostEqual(r["subtipos"][0]["valor"], 5000 * math.log(1.1), 12)
+        self.assertEqual((r["cohesion"]["valor"], r["cooperacion"]["valor"], r["indicador"]), (0.0, 0.0, 3.7))
+
+    def test_indicator_is_read_only_and_recomputes_after_edits(self):
+        repo = indicator_fixture()
+        snapshot, history, dirty = repo.snapshot(), repo.history_size(), repo.dirty
+        original = repo.indicator("grupos", "G1", end=2026)
+        self.assertEqual((repo.snapshot(), repo.history_size(), repo.dirty), (snapshot, history, dirty))
+        repo.update("productos", "P1", {"categoria": "ART_A1"})
+        changed = repo.indicator("grupos", "G1", end=2026)
+        self.assertNotEqual(changed["indicador"], original["indicador"])
+        self.assertTrue(repo.undo())
+        self.assertEqual(repo.indicator("grupos", "G1", end=2026), original)
+
+    def test_indicator_sums_subtypes_and_reaches_ten(self):
+        repo = pea.Repository()
+        for group in ("G1", "G2"):
+            repo.create("grupos", {"id": group, "nombre": group})
+        for person in ("I1", "I2"):
+            repo.create("investigadores", {"id": person, "nombre": person})
+            for group in ("G1", "G2"):
+                repo.create("membresias", {"grupo_id": group, "investigador_id": person})
+        for category in ("ART_A1", "LIB_B", "ART_D", "SF", "FIS", "WP", "TD_B", "TP_B"):
+            repo.create("productos", {"id": category, "titulo": category, "anio": "2026", "categoria": category})
+            repo.create("grupos_productos", {"grupo_id": "G1", "producto_id": category})
+            for person in ("I1", "I2"):
+                repo.create("autorias", {"producto_id": category, "investigador_id": person})
+        r = repo.indicator("grupos", "G1", end=2026)
+        self.assertEqual(r["productos"], 8)
+        self.assertAlmostEqual(r["clases"][2]["valor"], (45 + 280) * math.log(1.2), 12)
+        self.assertEqual((r["cohesion"]["valor"], r["cooperacion"]["valor"]), (1.0, 1.0))
+        self.assertTrue(all(term["indice"] == 1.0 for term in (*r["clases"], r["cohesion"], r["cooperacion"])))
+        self.assertAlmostEqual(r["indicador"], 10.0, 12)
+
+    def test_indicator_observation_window_boundaries(self):
+        for category, window in (("ART_D", 5), ("LIB_B", 7), ("PA1", 10)):
+            with self.subTest(category=category):
+                repo = pea.Repository()
+                repo.create("grupos", {"id": "G", "nombre": "Sin límite por edad"})
+                for year in (2026 - window, 2026 - window + 1, 2026, 2027):
+                    repo.create("productos", {"id": str(year), "titulo": str(year), "anio": str(year), "categoria": category})
+                    repo.create("grupos_productos", {"grupo_id": "G", "producto_id": str(year)})
+                r = repo.indicator("grupos", "G", end=2026)
+                self.assertEqual(r["productos"], 2)
+                self.assertEqual(r["subtipos"][0]["periodo"], window)
+                self.assertAlmostEqual(r["subtipos"][0]["lambda"], math.log(2 / window + 1), 12)
+
+    def test_real_dataset_indicator_is_fast(self):
+        repo = pea.load_repository(SOURCE.parents[2] / "data/pea_upc.csv")
+        for kind, key in (("grupos", "G-00000000002099"), ("investigadores", "I-0000494917")):
+            with self.subTest(kind=kind):
+                started = time.monotonic()
+                result = repo.indicator(kind, key, end=2026)
+                elapsed = time.monotonic() - started
+                self.assertLess(elapsed, 5.0)
+                self.assertIsInstance(result["indicador"], float)
+                self.assertTrue(0 <= result["indicador"] <= 10)
 
 
 class SecurityTest(unittest.TestCase):
@@ -747,7 +1405,7 @@ class SecurityTest(unittest.TestCase):
             self.assertEqual(pea.load_repository(path).get("grupos", "G1")["nombre"], "Grupo uno")
             products = pea._csv_read(path / "productos.csv", pea.ENTITY_FIELDS["productos"], encoded=True)
             with (path / "productos.csv").open("w", encoding="utf-8", newline="") as stream:
-                fields = (*(field for field in pea.ENTITY_FIELDS["productos"] if field != "validacion"), "categoria")
+                fields = (*(field for field in pea.PRODUCT_FIELDS_V4 if field != "validacion"), "categoria")
                 writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
                 writer.writeheader()
                 writer.writerows(products)
@@ -764,8 +1422,8 @@ class SecurityTest(unittest.TestCase):
             products[0].update(categoria="A1", validacion="pendiente")
             products[1].update(categoria="")
             with (path / "productos.csv").open("w", encoding="utf-8", newline="") as stream:
-                writer = csv.DictWriter(stream, fieldnames=(*pea.ENTITY_FIELDS["productos"][:6], "categoria",
-                                                            *pea.ENTITY_FIELDS["productos"][6:]))
+                writer = csv.DictWriter(stream, fieldnames=(*pea.PRODUCT_FIELDS_V4[:6], "categoria",
+                                                            *pea.PRODUCT_FIELDS_V4[6:]))
                 writer.writeheader()
                 writer.writerows(products)
             loaded = pea.load_repository(path)
@@ -776,7 +1434,7 @@ class SecurityTest(unittest.TestCase):
             converted = path / "datos.csv"
             pea.save_repository(loaded, converted)
             manifest = [row for section, _, row in pea.read_data_sections(converted) if section == "manifest"]
-            self.assertEqual(manifest[0]["version"], "4")
+            self.assertEqual(manifest[0]["version"], "5")
             self.assertEqual(pea.load_repository(converted).snapshot(), loaded.snapshot())
 
     def test_extract_pdf_text_caps_output(self):

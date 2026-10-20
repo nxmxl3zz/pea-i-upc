@@ -15,7 +15,7 @@ add_test(NAME pea_cpp_core COMMAND pea_cpp --self-test)
 
 find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
-    foreach(check IN ITEMS check_cpp_cli check_interop check_backend)
+    foreach(check IN ITEMS check_cpp_cli check_interop check_backend check_model)
         add_test(
             NAME ${check}
             COMMAND ${Python3_EXECUTABLE}

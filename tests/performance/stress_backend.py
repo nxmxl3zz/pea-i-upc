@@ -31,6 +31,8 @@ def make_data(directory: Path, products: int, people: int, links: int, jobs: int
         writer.writeheader()
         writer.writerow({"version": "1", "guardado": "2026-09-24"})
     for kind, fields in pea.ALL_FIELDS.items():
+        if kind == "productos":
+            fields = pea.PRODUCT_FIELDS_V4
         with (directory / f"{kind}.csv").open("w", encoding="utf-8", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=fields)
             writer.writeheader()
