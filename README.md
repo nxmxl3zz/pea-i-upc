@@ -13,17 +13,23 @@ data/pea_upc.csv                  Archivo único de datos (captura pública UPC)
 data/README.md                    Procedencia y límites de los datos
 docs/especificacion_tecnica.docx  Especificación técnica: modelo, estructuras, esquema y protocolo
 docs/ENUNCIADO_TALLER_2.md        Requisitos del taller
-docs/pea-i-por-dentro.mp4         Video de presentación
+docs/video_taller.mp4             Video del Taller 2: pilas, colas e interfaz
+docs/video_parcial.mp4            Video del Parcial 2: indicador de producción
 scripts/                          Regeneración de datos, documento y binario
 tests/                            Pruebas del dominio, integración y carga
 CMakeLists.txt                    Compilación C++
 ```
 
-## Video de presentación
+## Videos de presentación
 
-[**«PEA-i por dentro»**](docs/pea-i-por-dentro.mp4) (5 min, 1080p) explica cómo funcionan la pila y la
-cola en el código y luego muestra la aplicación real: recorrido, cola de revisión, agregar, eliminar
+[**«PEA-i por dentro»**](docs/video_taller.mp4) (Taller 2, 5 min, 1080p) explica cómo funcionan la pila
+y la cola en el código y luego muestra la aplicación real: recorrido, cola de revisión, agregar, eliminar
 y filtros.
+
+[**«PEA-i: el indicador»**](docs/video_parcial.mp4) (Parcial 2, 5 min, 1080p) explica las categorías del
+modelo Minciencias 2024 y cómo se calcula el indicador de producción recorriendo las multilistas, y luego
+lo muestra en la aplicación real: importar las fichas GrupLAC y CvLAC del enunciado, el detalle por
+subtipo, la ventana de años y una categoría corregida a mano.
 
 ## Instalación y ejecución
 
