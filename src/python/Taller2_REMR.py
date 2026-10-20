@@ -14,6 +14,7 @@ from datetime import date, datetime
 import hashlib
 from html.parser import HTMLParser
 import http.client
+import importlib.util
 import io
 import ipaddress
 import json
@@ -23,8 +24,10 @@ from pathlib import Path
 import queue
 import re
 import shutil
+import site
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 from typing import Any, Callable, Iterator, NamedTuple
@@ -36,14 +39,16 @@ import uuid
 import zipfile
 
 
-# Versión 4: un solo archivo con todas las tablas. Las versiones 1 a 3 eran carpetas con
-# un CSV por tabla; se pueden abrir y se guardan como archivo único.
-SCHEMA_VERSION = "4"
+# Versión 5: categorías del modelo 2024 y su origen en los productos.
+# Se leen archivos v4 y v5 y carpetas v1 a v3; siempre se guarda un archivo único v5.
+SCHEMA_VERSION = "5"
+FILE_VERSIONS = ("4", "5")
 FOLDER_VERSIONS = ("1", "2", "3")
+PRODUCT_FIELDS_V4 = ("id", "titulo", "anio", "fecha", "familia", "tipologia", "validacion", "observacion", "doi", "url", "fuente", "activo")
 ENTITY_FIELDS = {
     "grupos": ("id", "nombre", "codigo_gruplac", "fecha_creacion", "unidad", "responsable", "categoria", "descripcion", "objetivos", "mision", "vision", "lineas", "url", "fuente", "activo"),
     "investigadores": ("id", "nombre", "codigo_cvlac", "afiliacion", "categoria", "contacto", "url", "fuente", "activo"),
-    "productos": ("id", "titulo", "anio", "fecha", "familia", "tipologia", "validacion", "observacion", "doi", "url", "fuente", "activo"),
+    "productos": ("id", "titulo", "anio", "fecha", "familia", "tipologia", "categoria", "categoria_origen", "validacion", "observacion", "doi", "url", "fuente", "activo"),
     "planes": ("id", "grupo_id", "nombre", "inicio", "fin", "objetivo", "indicador", "meta", "actividad", "activo"),
 }
 RELATION_FIELDS = {
@@ -82,18 +87,22 @@ LABELS = {
     "producto_id": "Producto (ID)", "inicio": "Inicio", "fin": "Fin",
     "objetivo": "Objetivo", "indicador": "Indicador", "meta": "Meta",
     "actividad": "Actividad", "rol": "Rol", "orden": "Orden",
-    "origen": "Origen de asociación",
+    "origen": "Origen de asociación", "categoria_origen": "Origen de la categoría",
 }
 # Validación automática de productos. El orden de los códigos es parte del contrato
 # con el backend C++: ambos motores devuelven las mismas reglas en el mismo orden.
+# Un producto se atribuye con un autor o con un grupo activos: GrupLAC publica eventos y
+# proyectos sin autores, y CvLAC productos que ningún grupo declara.
 VALIDATION_RULES = {
     "anio": "Sin año de publicación",
     "tipologia": "Sin tipología",
-    "autor": "Sin autor activo registrado",
-    "grupo": "Sin grupo activo asociado",
+    "vinculo": "Sin autor ni grupo activos",
     "doi": "DOI con formato inválido",
     "fuente": "Sin fuente verificable (URL o DOI)",
 }
+# Códigos anteriores que pueden seguir en motivos de cola guardados.
+LEGACY_RULE_LABELS = {"autor": "Sin autor activo registrado", "grupo": "Sin grupo activo asociado"}
+RULE_LABELS = {**VALIDATION_RULES, **LEGACY_RULE_LABELS}
 VALIDATION_STATES = ("validado", "rechazado")
 # Motivo de cola generado por la validación: "reglas:" seguido de códigos separados por comas.
 AUTO_REASON_PREFIX = "reglas:"
@@ -106,6 +115,204 @@ PDF_TIMEOUT = 25
 MAX_LOCAL_FILE = 32 * 1024 * 1024
 MAX_ARCHIVE_UNPACKED = 128 * 1024 * 1024
 DEFAULT_DATA_FILE = Path(__file__).resolve().parents[2] / "data" / "pea_upc.csv"
+
+
+MODEL_CLASSES: tuple[str, ...] = ("TOP", "A", "B", "ASC", "DPC", "FRH_A", "FRH_B")
+MODEL_COEFFICIENTS: dict[str, float] = {
+    "TOP": 3.7, "A": 2.3, "B": 0.4, "ASC": 1.5, "DPC": 0.5,
+    "FRH_A": 1.0, "FRH_B": 0.2, "COHE": 0.1, "COOP": 0.3,
+}
+NEW_KNOWLEDGE_CLASSES = ("TOP", "A", "B")
+CATEGORY_ORIGINS = ("estimada", "manual")
+
+
+class Subtype(NamedTuple):
+    codigo: str
+    clase: str
+    familia: str
+    descripcion: str
+    ventana: int
+    peso_alta: float
+    peso_relativo: float
+
+    @property
+    def peso_global(self) -> float:
+        return self.peso_alta * self.peso_relativo
+
+
+# Minciencias, Anexo 1 de la convocatoria 2024, §§2.2.9, 3.3, 3.6 y 3.7.
+# Datos de referencia constantes; no dependen de archivos externos en ejecución.
+MODEL_2024: dict[str, Subtype] = {subtype.codigo: subtype for subtype in (
+    Subtype('ART_OPEN_A1', 'TOP', 'ART_R', 'Artículo de investigación A1 acceso abierto', 7, 100.0, 10.0),
+    Subtype('ART_A1', 'TOP', 'ART_R', 'Artículo de investigación A1', 7, 100.0, 9.5),
+    Subtype('ART_OPEN_A2', 'TOP', 'ART_R', 'Artículo de investigación A2 acceso abierto', 7, 100.0, 6.0),
+    Subtype('ART_A2', 'TOP', 'ART_R', 'Artículo de investigación A2', 7, 100.0, 5.5),
+    Subtype('ART_OPEN_B', 'A', 'ART_R', 'Artículo de investigación B acceso abierto', 7, 100.0, 3.5),
+    Subtype('ART_B', 'A', 'ART_R', 'Artículo de investigación B', 7, 100.0, 3.0),
+    Subtype('ART_OPEN_C', 'A', 'ART_R', 'Artículo de investigación C acceso abierto', 7, 100.0, 2.0),
+    Subtype('ART_C', 'A', 'ART_R', 'Artículo de investigación C', 7, 100.0, 1.5),
+    Subtype('ART_OPEN_D', 'B', 'ART_D', 'Artículo de investigación D acceso abierto', 5, 5.0, 10.0),
+    Subtype('ART_D', 'B', 'ART_D', 'Artículo de investigación D', 5, 5.0, 9.0),
+    Subtype('N_A1', 'B', 'N', 'Nota científica A1', 5, 4.0, 10.0),
+    Subtype('N_A2', 'B', 'N', 'Nota científica A2', 5, 4.0, 8.5),
+    Subtype('N_B', 'B', 'N', 'Nota científica B', 5, 4.0, 7.0),
+    Subtype('N_C', 'B', 'N', 'Nota científica C', 5, 4.0, 5.5),
+    Subtype('N_D', 'B', 'N', 'Nota científica D', 5, 4.0, 2.0),
+    Subtype('LIB_A1', 'TOP', 'LIB', 'Libro resultado de investigación A1', 7, 300.0, 10.0),
+    Subtype('LIB_A', 'TOP', 'LIB', 'Libro resultado de investigación A', 7, 300.0, 9.0),
+    Subtype('LIB_B', 'A', 'LIB', 'Libro resultado de investigación B', 7, 300.0, 8.0),
+    Subtype('LIB_C', 'B', 'LIB_C', 'Libro resultado de investigación C', 7, 15.0, 10.0),
+    Subtype('CAP_LIB_A1', 'TOP', 'CAP_LIB', 'Capítulo en libro resultado de investigación A1', 5, 60.0, 10.0),
+    Subtype('CAP_LIB_A', 'TOP', 'CAP_LIB', 'Capítulo en libro resultado de investigación A', 5, 60.0, 9.0),
+    Subtype('CAP_LIB_B', 'A', 'CAP_LIB', 'Capítulo en libro resultado de investigación B', 5, 60.0, 8.0),
+    Subtype('CAP_LIB_C', 'B', 'CAP_LIB_C', 'Capítulo en libro resultado de investigación C', 5, 3.0, 10.0),
+    Subtype('LIB_FOR1', 'B', 'LIB_FOR', 'Libro de formación Q1', 5, 60.0, 10.0),
+    Subtype('PA1', 'TOP', 'PAT', 'Patente de invención A1', 10, 500.0, 10.0),
+    Subtype('PA2', 'TOP', 'PAT', 'Patente de invención A2', 10, 500.0, 7.0),
+    Subtype('PA3', 'A', 'PAT', 'Patente de invención A3', 10, 500.0, 6.0),
+    Subtype('PA4', 'A', 'PAT', 'Patente de invención A4', 10, 500.0, 5.5),
+    Subtype('PB1', 'B', 'PAT', 'Patente de invención B1', 10, 500.0, 5.0),
+    Subtype('PB2', 'B', 'PAT', 'Patente de invención B2', 10, 500.0, 3.5),
+    Subtype('PB3', 'B', 'PAT', 'Patente de invención B3', 10, 500.0, 3.0),
+    Subtype('PB4', 'B', 'PAT', 'Patente de invención B4', 10, 500.0, 2.6),
+    Subtype('PB5', 'B', 'PAT', 'Patente de invención B5', 10, 500.0, 2.5),
+    Subtype('PC', 'B', 'PAT', 'Patente de invención C', 10, 500.0, 1.8),
+    Subtype('MA1', 'TOP', 'MOD', 'Patente de modelo de utilidad A1', 10, 500.0, 6.0),
+    Subtype('MA2', 'TOP', 'MOD', 'Patente de modelo de utilidad A2', 10, 500.0, 4.2),
+    Subtype('MA3', 'A', 'MOD', 'Patente de modelo de utilidad A3', 10, 500.0, 3.6),
+    Subtype('MA4', 'A', 'MOD', 'Patente de modelo de utilidad A4', 10, 500.0, 3.33),
+    Subtype('MB1', 'B', 'MOD', 'Patente de modelo de utilidad B1', 10, 500.0, 3.0),
+    Subtype('MB2', 'B', 'MOD', 'Patente de modelo de utilidad B2', 10, 500.0, 2.1),
+    Subtype('MB3', 'B', 'MOD', 'Patente de modelo de utilidad B3', 10, 500.0, 1.8),
+    Subtype('MB4', 'B', 'MOD', 'Patente de modelo de utilidad B4', 10, 500.0, 1.7),
+    Subtype('MB5', 'B', 'MOD', 'Patente de modelo de utilidad B5', 10, 500.0, 1.5),
+    Subtype('MC', 'B', 'MOD', 'Patente de modelo de utilidad C', 10, 500.0, 1.1),
+    Subtype('VV_A1', 'TOP', 'VV', 'Variedad vegetal A1', 10, 300.0, 10.0),
+    Subtype('VV_A2', 'TOP', 'VV', 'Variedad vegetal A2', 10, 300.0, 8.0),
+    Subtype('VV_A3', 'A', 'VV', 'Variedad vegetal A3', 10, 300.0, 5.0),
+    Subtype('VV_A4', 'A', 'VV', 'Variedad vegetal A4', 10, 300.0, 2.5),
+    Subtype('VV_B1', 'B', 'VV', 'Variedad vegetal B1', 10, 300.0, 5.0),
+    Subtype('VV_B2', 'B', 'VV', 'Variedad vegetal B2', 10, 300.0, 4.0),
+    Subtype('VV_B3', 'B', 'VV', 'Variedad vegetal B3', 10, 300.0, 2.5),
+    Subtype('VV_B4', 'B', 'VV', 'Variedad vegetal B4', 10, 300.0, 1.0),
+    Subtype('VA_A', 'TOP', 'VA', 'Nueva raza animal o población mejorada A', 10, 300.0, 10.0),
+    Subtype('VA_B', 'A', 'VA', 'Nueva raza animal o población mejorada B', 10, 300.0, 5.0),
+    Subtype('AAD_A1', 'TOP', 'AAD', 'Obra o producto de creación (AAD) A1', 10, 100.0, 10.0),
+    Subtype('AAD_A', 'TOP', 'AAD', 'Obra o producto de creación (AAD) A', 10, 100.0, 8.0),
+    Subtype('AAD_B', 'A', 'AAD', 'Obra o producto de creación (AAD) B', 10, 100.0, 6.0),
+    Subtype('AAD_C', 'B', 'AAD', 'Obra o producto de creación (AAD) C', 10, 100.0, 4.0),
+    Subtype('DI_A', 'A', 'DI', 'Diseño industrial A', 5, 35.0, 10.0),
+    Subtype('DI_B', 'B', 'DI', 'Diseño industrial B', 5, 35.0, 5.0),
+    Subtype('ECI', 'A', 'ECI', 'Esquema de circuito integrado', 5, 35.0, 4.0),
+    Subtype('SF', 'B', 'SF', 'Software', 5, 35.0, 8.0),
+    Subtype('PP', 'A', 'PP', 'Planta piloto', 5, 35.0, 4.0),
+    Subtype('PI', 'A', 'PI', 'Prototipo industrial', 5, 35.0, 4.0),
+    Subtype('SD', 'A', 'SD', 'Signo distintivo', 5, 35.0, 4.0),
+    Subtype('PN', 'B', 'PN', 'Producto nutracéutico', 5, 35.0, 6.0),
+    Subtype('CC', 'B', 'CC', 'Colección científica', 5, 35.0, 10.0),
+    Subtype('NRC_A', 'B', 'NRC', 'Nuevo registro científico A', 5, 35.0, 8.0),
+    Subtype('NRC_B', 'B', 'NRC', 'Nuevo registro científico B', 5, 35.0, 5.0),
+    Subtype('SE', 'A', 'SE', 'Secreto empresarial', 5, 100.0, 5.0),
+    Subtype('EBT_A', 'A', 'EBT', 'Empresa de base tecnológica A', 5, 100.0, 10.0),
+    Subtype('EBT_B', 'B', 'EBT', 'Empresa de base tecnológica B', 5, 100.0, 8.0),
+    Subtype('ICC_A', 'A', 'ICC', 'Empresa creativa y cultural A', 5, 100.0, 10.0),
+    Subtype('ICC_B', 'B', 'ICC', 'Empresa creativa y cultural B', 5, 100.0, 4.0),
+    Subtype('IG_A1', 'A', 'IG', 'Innovación en gestión empresarial A1', 5, 100.0, 10.0),
+    Subtype('IG_A2', 'A', 'IG', 'Innovación en gestión empresarial A2', 5, 100.0, 6.0),
+    Subtype('IG_B1', 'B', 'IG', 'Innovación en gestión empresarial B1', 5, 100.0, 5.0),
+    Subtype('IG_B2', 'B', 'IG', 'Innovación en gestión empresarial B2', 5, 100.0, 3.0),
+    Subtype('IPP', 'B', 'IPP', 'Innovación en procedimientos y servicios', 5, 100.0, 5.0),
+    Subtype('RNL_A', 'TOP', 'RNL', 'Regulación, norma, reglamento o legislación A', 5, 100.0, 10.0),
+    Subtype('RNL_B', 'A', 'RNL', 'Regulación, norma, reglamento o legislación B', 5, 100.0, 8.0),
+    Subtype('RNR', 'A', 'RNR', 'Normatividad del espectro radioeléctrico', 5, 100.0, 8.0),
+    Subtype('RNT', 'B', 'RNT', 'Norma técnica', 5, 100.0, 7.0),
+    Subtype('RNPC', 'B', 'RNPC', 'Guía de práctica clínica', 5, 100.0, 7.0),
+    Subtype('GMCF', 'B', 'GMCF', 'Guía de manejo clínico forense', 5, 100.0, 7.0),
+    Subtype('MADV', 'B', 'MADV', 'Manual o modelo de atención diferencial a víctimas', 5, 100.0, 7.0),
+    Subtype('PAU', 'B', 'PAU', 'Protocolo de atención a usuarios/víctimas', 5, 100.0, 7.0),
+    Subtype('PVE', 'B', 'PVE', 'Protocolo de vigilancia epidemiológica', 5, 100.0, 7.0),
+    Subtype('AL', 'B', 'AL', 'Acuerdo de ley', 5, 100.0, 8.0),
+    Subtype('RNPL', 'B', 'RNPL', 'Proyecto de ley', 5, 100.0, 6.0),
+    Subtype('CT', 'B', 'CT', 'Concepto técnico', 5, 15.0, 10.0),
+    Subtype('MR', 'B', 'MR', 'Registro de acuerdo de licencia (AAD)', 5, 14.0, 10.0),
+    Subtype('FIS', 'ASC', 'FIS', 'Proceso ASC para asuntos de interés social', 5, 200.0, 10.0),
+    Subtype('GPP_A', 'ASC', 'GPP', 'Proceso ASC para insumos de política pública A', 5, 200.0, 10.0),
+    Subtype('GPP_B', 'ASC', 'GPP', 'Proceso ASC para insumos de política pública B', 5, 200.0, 7.0),
+    Subtype('GPP_C', 'ASC', 'GPP', 'Proceso ASC para insumos de política pública C', 5, 200.0, 5.0),
+    Subtype('FCP_A', 'ASC', 'FCP', 'Proceso ASC para cadenas productivas A', 5, 200.0, 10.0),
+    Subtype('FCP_B', 'ASC', 'FCP', 'Proceso ASC para cadenas productivas B', 5, 200.0, 5.0),
+    Subtype('FCP_C', 'ASC', 'FCP', 'Proceso ASC para cadenas productivas C', 5, 200.0, 3.0),
+    Subtype('TCCG_A', 'ASC', 'TCCG', 'Proceso ASC Centro de Ciencia y grupo A', 5, 200.0, 10.0),
+    Subtype('TCCG_B', 'ASC', 'TCCG', 'Proceso ASC Centro de Ciencia y grupo B', 5, 200.0, 7.0),
+    Subtype('TCCG_C', 'ASC', 'TCCG', 'Proceso ASC Centro de Ciencia y grupo C', 5, 200.0, 4.0),
+    Subtype('TCCG_D', 'ASC', 'TCCG', 'Proceso ASC Centro de Ciencia y grupo D', 5, 200.0, 1.0),
+    Subtype('EC_A', 'DPC', 'EC', 'Evento científico con componente de apropiación A', 5, 100.0, 10.0),
+    Subtype('EC_B', 'DPC', 'EC', 'Evento científico con componente de apropiación B', 5, 100.0, 6.0),
+    Subtype('RC_A', 'DPC', 'RC', 'Participación en red de conocimiento A', 5, 100.0, 10.0),
+    Subtype('RC_B', 'DPC', 'RC', 'Participación en red de conocimiento B', 5, 100.0, 6.0),
+    Subtype('TC_A', 'DPC', 'TC', 'Taller de creación A', 5, 100.0, 10.0),
+    Subtype('TC_B', 'DPC', 'TC', 'Taller de creación B', 5, 100.0, 8.0),
+    Subtype('TC_C', 'DPC', 'TC', 'Taller de creación C', 5, 100.0, 6.0),
+    Subtype('ECA_A', 'DPC', 'ECA', 'Evento artístico, de arquitectura o diseño A', 5, 100.0, 8.0),
+    Subtype('ECA_B', 'DPC', 'ECA', 'Evento artístico, de arquitectura o diseño B', 5, 100.0, 6.0),
+    Subtype('WP', 'DPC', 'WP', 'Documento de trabajo (working paper)', 5, 100.0, 10.0),
+    Subtype('NSG', 'DPC', 'NSG', 'Nueva secuencia genética', 5, 100.0, 10.0),
+    Subtype('ERL', 'DPC', 'ERL', 'Edición de revista o libro de divulgación', 5, 100.0, 6.0),
+    Subtype('IFI', 'DPC', 'IFI', 'Informe final de investigación', 5, 100.0, 2.0),
+    Subtype('INF', 'DPC', 'INF', 'Informe técnico', 5, 100.0, 5.0),
+    Subtype('CON_CT', 'DPC', 'CON_CT', 'Consultoría científico-tecnológica', 5, 100.0, 7.5),
+    Subtype('CON_AAD', 'DPC', 'CON_AAD', 'Consultoría en arte, arquitectura y diseño', 5, 100.0, 7.5),
+    Subtype('PEE_A1', 'DPC', 'PEE', 'Publicación editorial no especializada A1', 5, 100.0, 10.0),
+    Subtype('PEE_A2', 'DPC', 'PEE', 'Publicación editorial no especializada A2', 5, 100.0, 8.0),
+    Subtype('PEE_B1', 'DPC', 'PEE', 'Publicación editorial no especializada B1', 5, 100.0, 7.0),
+    Subtype('PEE_B2', 'DPC', 'PEE', 'Publicación editorial no especializada B2', 5, 100.0, 5.0),
+    Subtype('PEE_C1', 'DPC', 'PEE', 'Publicación editorial no especializada C1', 5, 100.0, 5.0),
+    Subtype('PEE_C2', 'DPC', 'PEE', 'Publicación editorial no especializada C2', 5, 100.0, 3.0),
+    Subtype('PCD_A1', 'DPC', 'PCD', 'Producción de contenido digital A1', 5, 100.0, 10.0),
+    Subtype('PCD_A2', 'DPC', 'PCD', 'Producción de contenido digital A2', 5, 100.0, 8.0),
+    Subtype('PCD_B1', 'DPC', 'PCD', 'Producción de contenido digital B1', 5, 100.0, 7.0),
+    Subtype('PCD_B2', 'DPC', 'PCD', 'Producción de contenido digital B2', 5, 100.0, 5.0),
+    Subtype('PCD_C1', 'DPC', 'PCD', 'Producción de contenido digital C1', 5, 100.0, 5.0),
+    Subtype('PCD_C2', 'DPC', 'PCD', 'Producción de contenido digital C2', 5, 100.0, 3.0),
+    Subtype('TRM_A1', 'DPC', 'TRM', 'Estrategia y contenido transmedia A1', 5, 100.0, 10.0),
+    Subtype('TRM_A2', 'DPC', 'TRM', 'Estrategia y contenido transmedia A2', 5, 100.0, 8.0),
+    Subtype('TRM_B1', 'DPC', 'TRM', 'Estrategia y contenido transmedia B1', 5, 100.0, 7.0),
+    Subtype('TRM_B2', 'DPC', 'TRM', 'Estrategia y contenido transmedia B2', 5, 100.0, 5.0),
+    Subtype('TRM_C1', 'DPC', 'TRM', 'Estrategia y contenido transmedia C1', 5, 100.0, 5.0),
+    Subtype('TRM_C2', 'DPC', 'TRM', 'Estrategia y contenido transmedia C2', 5, 100.0, 3.0),
+    Subtype('DW_A1', 'DPC', 'DW', 'Desarrollo web A1', 5, 100.0, 10.0),
+    Subtype('DW_A2', 'DPC', 'DW', 'Desarrollo web A2', 5, 100.0, 8.0),
+    Subtype('DW_B1', 'DPC', 'DW', 'Desarrollo web B1', 5, 100.0, 7.0),
+    Subtype('DW_B2', 'DPC', 'DW', 'Desarrollo web B2', 5, 100.0, 5.0),
+    Subtype('DW_C1', 'DPC', 'DW', 'Desarrollo web C1', 5, 100.0, 5.0),
+    Subtype('DW_C2', 'DPC', 'DW', 'Desarrollo web C2', 5, 100.0, 3.0),
+    Subtype('LIB_FOR2', 'DPC', 'LIB_FOR_DPC', 'Libro de formación Q2', 5, 100.0, 10.0),
+    Subtype('LIB_FOR3', 'DPC', 'LIB_FOR_DPC', 'Libro de formación Q3', 5, 100.0, 10.0),
+    Subtype('BOL', 'DPC', 'BOL', 'Boletín divulgativo de resultado de investigación', 5, 100.0, 3.0),
+    Subtype('LIB_DIV', 'DPC', 'LIB_DIV', 'Libro de divulgación o compilación de divulgación', 5, 100.0, 10.0),
+    Subtype('GC', 'DPC', 'GC', 'Generación de contenidos', 5, 100.0, 4.0),
+    Subtype('MAN_GUI', 'DPC', 'MAN_GUI', 'Manual o guía especializada', 5, 100.0, 2.0),
+    Subtype('TD_A', 'FRH_A', 'TD', 'Dirección de tesis de doctorado A', 5, 160.0, 10.0),
+    Subtype('TD_B', 'FRH_A', 'TD', 'Dirección de tesis de doctorado B', 5, 160.0, 5.0),
+    Subtype('TM_A', 'FRH_B', 'TM', 'Dirección de trabajo de grado de maestría A', 5, 70.0, 10.0),
+    Subtype('TM_B', 'FRH_B', 'TM', 'Dirección de trabajo de grado de maestría B', 5, 70.0, 5.0),
+    Subtype('TP_A', 'FRH_B', 'TP', 'Dirección de trabajo de pregrado A', 5, 20.0, 10.0),
+    Subtype('TP_B', 'FRH_B', 'TP', 'Dirección de trabajo de pregrado B', 5, 20.0, 5.0),
+    Subtype('PID_A', 'FRH_B', 'PID', 'Proyecto de investigación y desarrollo A', 5, 50.0, 10.0),
+    Subtype('PID_B', 'FRH_B', 'PID', 'Proyecto de investigación y desarrollo B', 5, 50.0, 6.0),
+    Subtype('PID_C', 'FRH_B', 'PID', 'Proyecto de investigación y desarrollo C', 5, 50.0, 2.0),
+    Subtype('PIC_A', 'FRH_B', 'PIC', 'Proyecto de investigación-creación A', 5, 50.0, 10.0),
+    Subtype('PIC_B', 'FRH_B', 'PIC', 'Proyecto de investigación-creación B', 5, 50.0, 6.0),
+    Subtype('PIC_C', 'FRH_B', 'PIC', 'Proyecto de investigación-creación C', 5, 50.0, 2.0),
+    Subtype('PF_A', 'FRH_B', 'PF', 'Proyecto ID+I con formación A', 5, 50.0, 10.0),
+    Subtype('PF_B', 'FRH_B', 'PF', 'Proyecto ID+I con formación B', 5, 50.0, 8.0),
+    Subtype('PE', 'FRH_B', 'PE', 'Proyecto de extensión y responsabilidad social en CTeI', 5, 100.0, 10.0),
+    Subtype('AP_A', 'FRH_A', 'AP_PROG', 'Apoyo a creación de programa doctorado', 5, 100.0, 10.0),
+    Subtype('AP_B', 'FRH_B', 'AP_PROG', 'Apoyo a creación de programa maestría', 5, 100.0, 8.0),
+    Subtype('AP_C', 'FRH_A', 'AP_CUR', 'Apoyo a creación de cursos doctorado', 5, 100.0, 5.0),
+    Subtype('AP_D', 'FRH_B', 'AP_CUR', 'Apoyo a creación de cursos maestría', 5, 100.0, 3.0),
+    Subtype('APO', 'FRH_B', 'APO', 'Acompañamiento y asesoría Programa Ondas', 5, 30.0, 10.0),
+)}
 
 
 class DataError(ValueError):
@@ -388,6 +595,12 @@ def clean_row(kind: str, values: dict[str, Any]) -> dict[str, str]:
             if not 1900 <= year <= date.today().year + 1:
                 raise DataError("Año fuera de rango")
     if kind == "productos":
+        category = row["categoria"]
+        if category and category not in MODEL_2024:
+            raise DataError(f"Categoría desconocida: {category}")
+        if row["categoria_origen"] not in ("", *CATEGORY_ORIGINS):
+            raise DataError("Origen de categoría: estimada o manual")
+        row["categoria_origen"] = (row["categoria_origen"] or "manual") if category else ""
         # El repositorio recalcula este campo; aquí solo se admite un valor conocido.
         # «pendiente» procede de carpetas anteriores a la validación automática.
         row["validacion"] = row["validacion"] or "rechazado"
@@ -415,17 +628,19 @@ def clean_row(kind: str, values: dict[str, Any]) -> dict[str, str]:
 
 
 def _legacy_row(kind: str, values: dict[str, str]) -> dict[str, str]:
-    """Adapta filas de las versiones 1 y 2 sin alterar los datos persistidos de origen."""
+    """Adapta filas antiguas, también del historial, sin alterar los datos de origen."""
     row = values.copy()
     if kind == "grupos":
         row.pop("sigla", None)
     if kind == "productos":
         row.setdefault("validacion", "pendiente")
-        # La versión 3 retira la categoría de producto; un valor escrito a mano se conserva en la observación.
-        category = (row.pop("categoria", "") or "").strip()
-        if category:
-            note = f"Categoría registrada antes de la versión 3: {category}"
-            row["observacion"] = f"{row.get('observacion', '').strip()}\n{note}".strip()
+        # Solo las categorías anteriores a v3 se trasladan a la observación.
+        # Los snapshots v5 incluyen categoria_origen y conservan su clasificación.
+        if "categoria_origen" not in row:
+            category = (row.pop("categoria", "") or "").strip()
+            if category:
+                note = f"Categoría registrada antes de la versión 3: {category}"
+                row["observacion"] = f"{row.get('observacion', '').strip()}\n{note}".strip()
     return row
 
 
@@ -443,6 +658,22 @@ def _valid_doi(doi: str) -> bool:
             and bool(suffix) and not any(ch in " \t\n\r\f\v" for ch in suffix))
 
 
+def _source_doi(detail: str) -> tuple[str, str]:
+    """DOI tal como lo publica la ficha (deriva el ID) y DOI válido que se guarda, o vacío.
+
+    Repara un DOI partido por un espacio («10.5539/ gjhs.v11n9p34») y descarta uno truncado.
+    """
+    match = re.search(r"\bDOI:\s*(10\.\S+)", detail, re.IGNORECASE)
+    if not match:
+        return "", ""
+    published = match.group(1).rstrip(".,;)")
+    split = re.search(r"\bDOI:\s*(10\.\d{4,9}/)\s+([^\s,;]+)", detail, re.IGNORECASE)
+    for candidate in ((split.group(1) + split.group(2).rstrip(".,;)")) if split else "", published):
+        if candidate and _valid_doi(_doi_text(candidate)):
+            return published, candidate
+    return published, ""
+
+
 def _verifiable_url(url: str) -> bool:
     text = url.strip().lower()
     return any(text.startswith(scheme) and len(text) > len(scheme) for scheme in ("http://", "https://"))
@@ -452,7 +683,7 @@ def auto_reason_codes(reason: str) -> list[str] | None:
     """Códigos de reglas de un motivo generado automáticamente; None si el motivo es manual."""
     if not reason.startswith(AUTO_REASON_PREFIX):
         return None
-    return [code for code in reason[len(AUTO_REASON_PREFIX):].split(",") if code in VALIDATION_RULES]
+    return [code for code in reason[len(AUTO_REASON_PREFIX):].split(",") if code in RULE_LABELS]
 
 
 class Repository:
@@ -467,6 +698,10 @@ class Repository:
         self.queue = LinkedQueue()
         self.issues: dict[str, tuple[str, ...]] = {}
         self.dirty = False
+
+    def catalog(self) -> list[dict[str, Any]]:
+        return [{**subtype._asdict(), "peso_global": subtype.peso_global}
+                for subtype in MODEL_2024.values()]
 
     def rows(self, kind: str) -> list[dict[str, str]]:
         source = self.entities.get(kind) or self.relations.get(kind)
@@ -522,12 +757,12 @@ class Repository:
             failed.append("anio")
         if not product["tipologia"]:
             failed.append("tipologia")
-        if not any(link["activo"] == "1" and (person := self.get("investigadores", link["investigador_id"]))
-                   and person["activo"] == "1" for link in self.relations["autorias"].by_left(product["id"])):
-            failed.append("autor")
-        if not any(link["activo"] == "1" and (group := self.get("grupos", link["grupo_id"]))
-                   and group["activo"] == "1" for link in self.relations["grupos_productos"].by_right(product["id"])):
-            failed.append("grupo")
+        has_author = any(link["activo"] == "1" and (person := self.get("investigadores", link["investigador_id"]))
+                         and person["activo"] == "1" for link in self.relations["autorias"].by_left(product["id"]))
+        has_group = any(link["activo"] == "1" and (group := self.get("grupos", link["grupo_id"]))
+                        and group["activo"] == "1" for link in self.relations["grupos_productos"].by_right(product["id"]))
+        if not has_author and not has_group:
+            failed.append("vinculo")
         doi = _doi_text(product["doi"])
         if doi and not _valid_doi(doi):
             failed.append("doi")
@@ -731,7 +966,12 @@ class Repository:
         current = self.get(kind, key)
         if current is None:
             raise DataError("Registro no encontrado")
-        updated = clean_row(kind, {**current, **values})
+        updated_values = {**current, **values}
+        if kind == "productos" and "categoria" in values and "categoria_origen" not in values:
+            category = str(values["categoria"] or "").strip()
+            if category != current["categoria"]:
+                updated_values["categoria_origen"] = "manual" if category else ""
+        updated = clean_row(kind, updated_values)
         fixed = ("id",) if kind in ENTITY_FIELDS else RELATION_ENDS[kind][:2]
         if any(updated[field] != current[field] for field in fixed):
             raise DataError("Los identificadores son estables; cree otra relación si cambian")
@@ -799,7 +1039,7 @@ class Repository:
             raise DataError("Validación: validado o rechazado")
         products = []
         total = 0
-        tallies: dict[str, dict[str, int]] = {name: {} for name in ("anio", "tipologia", "validacion")}
+        tallies: dict[str, dict[str, int]] = {name: {} for name in ("anio", "tipologia", "categoria", "validacion")}
         rules: dict[str, int] = {}
         for row in self.product_scope(view, selected_id):
             year = int(row["anio"]) if row["anio"] else None
@@ -819,8 +1059,149 @@ class Repository:
                 rules[code] = rules.get(code, 0) + 1
         return {"productos": products, "total": total,
                 "por_anio": tallies["anio"], "por_tipologia": tallies["tipologia"],
+                "por_categoria": tallies["categoria"],
                 "por_validacion": tallies["validacion"], "por_regla": rules}
 
+
+    def _indicator_raw(self, kind: str, key: str, corte: int, inicio: int | None,
+                       status: str, groups_of: dict[str, set[str]]) -> dict[str, Any]:
+        """Valores sin normalizar de una entidad, recorriendo sus vínculos activos."""
+        result: dict[str, Any] = {
+            "valores": dict.fromkeys((*MODEL_CLASSES, "COHE", "COOP"), 0.0),
+            "productos": 0, "sin_categoria": 0, "estimadas": 0, "subtipos": [],
+        }
+        period_cap = corte - inicio + 1 if inicio is not None else None
+        if kind == "grupos":
+            created = self.get(kind, key)["fecha_creacion"]
+            if created:
+                age = corte - int(created[:4]) + 1
+                period_cap = min(period_cap, age) if period_cap is not None else age
+            links = self.relations["grupos_productos"].by_left(key)
+        else:
+            links = self.relations["autorias"].by_right(key)
+        if period_cap is not None and period_cap < 1:
+            return result
+
+        uncategorized_start = max(corte - 9, inicio) if inicio is not None else corte - 9
+        empty_groups: set[str] = set()
+        researcher_groups = groups_of.get(key, empty_groups)
+        counts: dict[str, int] = {}
+        new_knowledge = authors = group_links = 0
+        for link in links:
+            if link["activo"] != "1":
+                continue
+            product = self.get("productos", link["producto_id"])
+            if product is None or product["activo"] != "1" or not product["anio"]:
+                continue
+            if status and product["validacion"] != status:
+                continue
+            year = int(product["anio"])
+            code = product["categoria"]
+            if not code:
+                if uncategorized_start <= year <= corte:
+                    result["sin_categoria"] += 1
+                continue
+            subtype = MODEL_2024.get(code)
+            if subtype is None:
+                continue
+            period = min(subtype.ventana, period_cap) if period_cap is not None else subtype.ventana
+            if not corte - period + 1 <= year <= corte:
+                continue
+            counts[code] = counts.get(code, 0) + 1
+            result["productos"] += 1
+            if product["categoria_origen"] == "estimada":
+                result["estimadas"] += 1
+            if subtype.clase not in NEW_KNOWLEDGE_CLASSES:
+                continue
+            new_knowledge += 1
+            product_groups = {key} if kind == "grupos" else set()
+            for authorship in self.relations["autorias"].by_left(product["id"]):
+                if authorship["activo"] != "1":
+                    continue
+                researcher_id = authorship["investigador_id"]
+                researcher = self.get("investigadores", researcher_id)
+                if researcher is None or researcher["activo"] != "1":
+                    continue
+                author_groups = groups_of.get(researcher_id, empty_groups)
+                if kind == "grupos":
+                    belongs = key in author_groups
+                else:
+                    # S contiene al investigador y a los miembros de cualquiera de sus grupos activos.
+                    belongs = researcher_id == key or not researcher_groups.isdisjoint(author_groups)
+                if belongs:
+                    authors += 1
+                product_groups.update(author_groups)
+            group_links += len(product_groups)
+
+        for code, subtype in MODEL_2024.items():
+            count = counts.get(code, 0)
+            if not count:
+                continue
+            period = min(subtype.ventana, period_cap) if period_cap is not None else subtype.ventana
+            frequency = math.log(count / period + 1)
+            value = frequency * subtype.peso_global
+            result["valores"][subtype.clase] += value
+            result["subtipos"].append({"codigo": code, "clase": subtype.clase, "cantidad": count,
+                                       "periodo": period, "lambda": frequency,
+                                       "peso_global": subtype.peso_global, "valor": value})
+        if new_knowledge:
+            result["valores"]["COHE"] = max(0.0, authors / new_knowledge - 1)
+            result["valores"]["COOP"] = max(0.0, group_links / new_knowledge - 1)
+        return result
+
+    def indicator(self, kind: str, key: str, start: int | None = None,
+                  end: int | None = None, status: str = "") -> dict[str, Any]:
+        """Indicador 2024 relativo al máximo de la población activa del mismo tipo."""
+        if kind not in ("grupos", "investigadores"):
+            raise DataError("Tipo de indicador: grupos o investigadores")
+        if start is not None and end is not None and start > end:
+            raise DataError("El año inicial supera al final")
+        if status and status not in VALIDATION_STATES:
+            raise DataError("Validación: validado o rechazado")
+        entity = self.get(kind, key)
+        if entity is None:
+            raise DataError("Registro no encontrado")
+        if entity["activo"] != "1":
+            raise DataError("Registro inactivo")
+        cutoff = end if end is not None else date.today().year
+
+        # Índice auxiliar de esta consulta; las listas siguen siendo la fuente de verdad.
+        active_groups = {row["id"] for row in self.entities["grupos"] if row["activo"] == "1"}
+        groups_of: dict[str, set[str]] = {}
+        for membership in self.relations["membresias"]:
+            if membership["activo"] != "1" or membership["grupo_id"] not in active_groups:
+                continue
+            researcher_id = membership["investigador_id"]
+            researcher = self.get("investigadores", researcher_id)
+            if researcher is not None and researcher["activo"] == "1":
+                groups_of.setdefault(researcher_id, set()).add(membership["grupo_id"])
+
+        raw = self._indicator_raw(kind, key, cutoff, start, status, groups_of)
+        maxima = raw["valores"].copy()
+        population = 1
+        for other in self.entities[kind]:
+            if other["activo"] != "1" or other["id"] == key:
+                continue
+            population += 1
+            values = self._indicator_raw(kind, other["id"], cutoff, start, status, groups_of)["valores"]
+            for name in maxima:
+                maxima[name] = max(maxima[name], values[name])
+
+        def term(name: str) -> dict[str, float]:
+            value, maximum = raw["valores"][name], maxima[name]
+            index = value / maximum if maximum else 0.0
+            coefficient = MODEL_COEFFICIENTS[name]
+            return {"coeficiente": coefficient, "valor": value, "maximo": maximum,
+                    "indice": index, "aporte": coefficient * index}
+
+        classes = [{"clase": name, **term(name)} for name in MODEL_CLASSES]
+        cohesion, cooperation = term("COHE"), term("COOP")
+        return {"tipo": kind, "id": key, "corte": cutoff, "inicio": start, "estado": status,
+                "poblacion": population, "productos": raw["productos"],
+                "sin_categoria": raw["sin_categoria"], "estimadas": raw["estimadas"],
+                "clases": classes, "cohesion": cohesion, "cooperacion": cooperation,
+                "subtipos": raw["subtipos"],
+                "indicador": sum(c["aporte"] for c in classes) + cohesion["aporte"] + cooperation["aporte"]}
 
     def queue_rows(self) -> list[dict[str, str]]:
         return list(self.queue)
@@ -891,20 +1272,24 @@ def _storage_cell(value: str) -> str:
 
 def _csv_read(path: Path, fields: tuple[str, ...], *, version: str = SCHEMA_VERSION,
               encoded: bool = False) -> list[dict[str, str]]:
-    # La versión 3 ya tiene los campos actuales; solo 1 y 2 necesitan adaptarse.
+    # Las carpetas v1 a v3 usan el encabezado de productos anterior a v5.
+    # Los CSV sueltos aceptan ambos encabezados, también con un nombre de archivo distinto.
     legacy = version in ("1", "2")
     with path.open("r", encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
         actual = set(reader.fieldnames or ())
-        expected = set(fields)
+        product_fields = fields == ENTITY_FIELDS["productos"]
+        expected_fields = PRODUCT_FIELDS_V4 if product_fields and version in FOLDER_VERSIONS else fields
+        expected = set(expected_fields)
+        v4_products = product_fields and actual == set(PRODUCT_FIELDS_V4)
         # v1: grupos con «sigla» y productos sin «validacion»; v1 y v2: productos con «categoria».
         old_groups = version == "1" and path.stem == "grupos" and actual == expected | {"sigla"}
         old_products = legacy and path.stem == "productos" and (
             actual == expected | {"categoria"}
             or (version == "1" and actual in ((expected | {"categoria"}) - {"validacion"},
                                               expected - {"validacion"})))
-        if reader.fieldnames is None or not (actual == expected or old_groups or old_products):
-            raise DataError(f"Encabezados incorrectos en {path.name}; se esperan: {', '.join(fields)}")
+        if reader.fieldnames is None or not (actual == expected or v4_products or old_groups or old_products):
+            raise DataError(f"Encabezados incorrectos en {path.name}; se esperan: {', '.join(expected_fields)}")
         rows = []
         for number, row in enumerate(reader, start=2):
             if None in row or any(value is None for value in row.values()):
@@ -1079,6 +1464,7 @@ def read_data_sections(path: Path) -> Iterator[tuple[str, int, dict[str, str]]]:
     path = Path(path)
     expected = iter(DATA_SECTIONS)
     section, header, count, previous = "", None, 0, 0
+    version = ""
     with path.open("r", encoding="utf-8-sig", newline="") as stream:
         reader = csv.reader(stream)
         for record in reader:
@@ -1099,7 +1485,7 @@ def read_data_sections(path: Path) -> Iterator[tuple[str, int, dict[str, str]]]:
             if not section:
                 raise DataError(f"{where}: el archivo debe comenzar con #manifest")
             if header is None:
-                fields = DATA_SECTIONS[section]
+                fields = PRODUCT_FIELDS_V4 if section == "productos" and version == "4" else DATA_SECTIONS[section]
                 if len(record) != len(fields) or set(record) != set(fields):
                     raise DataError(f"{where}: encabezados incorrectos en #{section}; se esperan: {', '.join(fields)}")
                 header = record
@@ -1109,8 +1495,11 @@ def read_data_sections(path: Path) -> Iterator[tuple[str, int, dict[str, str]]]:
             count += 1
             if count > MAX_CSV_ROWS:
                 raise DataError(f"{where}: demasiadas filas en #{section}")
-            yield section, line, {name: value[1:] if value.startswith("'") else value
-                                  for name, value in zip(header, record)}
+            row = {name: value[1:] if value.startswith("'") else value
+                   for name, value in zip(header, record)}
+            if section == "manifest":
+                version = row["version"]
+            yield section, line, row
     missing = next(expected, None)
     if missing is not None:
         raise DataError(f"{path.name}: falta la sección #{missing}")
@@ -1142,7 +1531,7 @@ def _load_file(path: Path) -> Repository:
                 manifests += 1
                 if manifests > 1:
                     raise DataError("Manifest con más de una fila")
-                if row["version"] != SCHEMA_VERSION:
+                if row["version"] not in FILE_VERSIONS:
                     raise DataError("Versión de datos incompatible")
             elif section in ALL_FIELDS:
                 repo.create(section, row, remember=False)
@@ -1317,7 +1706,7 @@ def cpp_executable(explicit: Path | None = None) -> Path:
     return binary
 
 
-CPP_PROTOCOL = "3"
+CPP_PROTOCOL = "4"
 
 
 class CppRepository:
@@ -1376,6 +1765,9 @@ class CppRepository:
     def _keys(key: str | tuple[str, str]) -> dict[str, str]:
         return {"key": key[0], "second": key[1]} if isinstance(key, tuple) else {"key": key, "second": ""}
 
+    def catalog(self) -> list[dict[str, Any]]:
+        return self._request("catalog")
+
     def rows(self, kind: str) -> list[dict[str, str]]:
         return self._request("rows", kind=kind)
 
@@ -1423,6 +1815,12 @@ class CppRepository:
                              start="" if start is None else str(start),
                              end="" if end is None else str(end),
                              status=status, offset=str(offset), limit=str(limit))
+
+    def indicator(self, kind: str, key: str, start: int | None = None,
+                  end: int | None = None, status: str = "") -> dict[str, Any]:
+        return self._request("indicator", kind=kind, key=key,
+                             start="" if start is None else str(start),
+                             end="" if end is None else str(end), status=status)
 
     def history_size(self) -> int:
         return self._history_size
@@ -1724,6 +2122,12 @@ def parse_web_page(text: str, url: str, format: str = "HTML") -> WebPreview:
                     related_products = tuple(item.row for item in products)
                     related_plan = parse_gruplac_plan(text, url, suggestion[1]["objetivos"])
                     related_authorships = tuple(match_gruplac_authors(products, members))
+                elif suggestion[0] == "investigadores":
+                    products = parse_cvlac_products(text, url)
+                    related_products = tuple(item.row for item in products)
+                    related_authorships = tuple(clean_row("autorias", {
+                        "producto_id": item.row["id"], "investigador_id": suggestion[1]["id"],
+                        "rol": "Producto listado en CvLAC"}) for item in products)
             except DataError:
                 pass
         if suggestion is None:
@@ -1944,8 +2348,16 @@ def parse_scienti_html(html: str, url: str) -> tuple[str, dict[str, str]]:
                 collected.append(line)
             return "\n".join(part for part in collected if part)
         formed = after("Año y mes de formación")
+        formation_date = ""
+        formation_match = re.fullmatch(r"(\d{4})\s*-\s*(\d{1,2})", formed)
+        if formation_match:
+            try:
+                formation_date = date(int(formation_match[1]), int(formation_match[2]), 1).isoformat()
+            except ValueError:
+                pass
         group = {
             "id": f"G-{code['nro'][0]}", "nombre": name,
+            "fecha_creacion": formation_date,
             "codigo_gruplac": code["nro"][0], "responsable": after("Líder"),
             "categoria": _gruplac_category(after("Clasificación")),
             "descripcion": block("Estado del arte", "Objetivos"),
@@ -2064,19 +2476,144 @@ def parse_gruplac_plan(html: str, url: str, objectives: str = "") -> dict[str, s
     })
 
 
-GRUPLAC_SECTIONS = (
-    ("Artículos publicados", "Libros publicados", "Producción bibliográfica"),
-    ("Libros publicados", "Capítulos de libro publicados", "Producción bibliográfica"),
-    ("Capítulos de libro publicados", "Documentos de trabajo", "Producción bibliográfica"),
-    ("Documentos de trabajo", "Otra publicación divulgativa", "Producción bibliográfica"),
-    ("Otra publicación divulgativa", "Otros artículos publicados", "Producción bibliográfica"),
-    ("Otros artículos publicados", "Libros de formación", "Producción bibliográfica"),
-    ("Libros de formación", "Libros de divulgación y/o Compilación de divulgación", "Producción bibliográfica"),
-    ("Otros Libros publicados", "Traducciones", "Producción bibliográfica"),
-    ("Otros productos tecnológicos", "Prototipos", "Producción técnica y tecnológica"),
-    ("Softwares", "Empresas de base tecnológica", "Producción técnica y tecnológica"),
-    ("Empresas de base tecnológica", "APROPIACIÓN SOCIAL Y DIVULGACIÓN PÚBLICA DE LA CIENCIA", "Producción técnica y tecnológica"),
+class GrupLACSection(NamedTuple):
+    heading: str
+    stop: str
+    family: str
+    year_rule: str
+    only_categorized: bool
+
+
+# Las secciones nuevas requieren una categoría reconocida; las anteriores conservan todo lo importable.
+# Encabezado, siguiente encabezado, familia, regla de año, categoría estimada por defecto.
+_GRUPLAC_NEW_SECTIONS = (
+    ("Libros de divulgación y/o Compilación de divulgación", "Manuales y Guías Especializadas", "Producción bibliográfica", "publication", "LIB_DIV"),
+    ("Manuales y Guías Especializadas", "Otros Libros publicados", "Producción bibliográfica", "publication", "MAN_GUI"),
+    ("Notas científicas", "PRODUCCIÓN TÉCNICA Y TECNOLÓGICA", "Producción bibliográfica", "publication", "N_D"),
+    ("Conceptos técnicos", "Diseños industriales", "Producción técnica y tecnológica", "publication", "CT"),
+    ("Diseños industriales", "Esquemas de trazados de circuito integrado", "Producción técnica y tecnológica", "publication", "DI_B"),
+    ("Esquemas de trazados de circuito integrado", "Informes técnicos", "Producción técnica y tecnológica", "publication", "ECI"),
+    ("Informes técnicos", "Innovaciones en Procesos y Procedimientos", "Producción técnica y tecnológica", "publication", "INF"),
+    ("Innovaciones en Procesos y Procedimientos", "Innovaciones generadas en la Gestión Empresarial", "Producción técnica y tecnológica", "publication", "IPP"),
+    ("Innovaciones generadas en la Gestión Empresarial", "Nuevas variedades animal", "Producción técnica y tecnológica", "publication", "IG_B2"),
+    ("Nuevas variedades animal", "Poblaciones mejoradas de razas pecuarias", "Producción técnica y tecnológica", "publication", "VA_A"),
+    ("Poblaciones mejoradas de razas pecuarias", "Nuevas variedades vegetal", "Producción técnica y tecnológica", "publication", "VA_B"),
+    ("Nuevas variedades vegetal", "Nuevos registros científicos", "Producción técnica y tecnológica", "publication", "VV_B4"),
+    ("Nuevos registros científicos", "Plantas piloto", "Producción técnica y tecnológica", "publication", "NRC_B"),
+    ("Plantas piloto", "Productos nutracéuticos", "Producción técnica y tecnológica", "publication", "PP"),
+    ("Productos nutracéuticos", "Otros productos tecnológicos", "Producción técnica y tecnológica", "publication", "PN"),
+    ("Prototipos", "Regulaciones y Normas", "Producción técnica y tecnológica", "publication", "PI"),
+    ("Regulaciones y Normas", "Protocolos de vigilancia epidemiológica", "Producción técnica y tecnológica", "publication", "RNT"),
+    ("Protocolos de vigilancia epidemiológica", "Reglamentos técnicos", "Producción técnica y tecnológica", "publication", "PVE"),
+    ("Reglamentos técnicos", "Guias de práctica clínica", "Producción técnica y tecnológica", "publication", "RNT"),
+    ("Guias de práctica clínica", "Proyectos de ley", "Producción técnica y tecnológica", "publication", "RNPC"),
+    ("Proyectos de ley", "Signos distintivos", "Producción técnica y tecnológica", "publication", "RNPL"),
+    ("Signos distintivos", "Softwares", "Producción técnica y tecnológica", "publication", "SD"),
+    ("Publicaciones editoriales no especializadas", "Producciones de contenido digital - Audiovisual", "Divulgación pública de la ciencia", "range", "PEE_C2"),
+    ("Producciones de contenido digital - Audiovisual", "Producciones de contenido digital - Sonoro", "Divulgación pública de la ciencia", "range", "PCD_C2"),
+    ("Producciones de contenido digital - Sonoro", "Producciones de contenido digital - Recursos gráficos", "Divulgación pública de la ciencia", "range", "PCD_C2"),
+    ("Producciones de contenido digital - Recursos gráficos", "Divulgación Pública de la Ciencia producción de estrategias y contenidos transmedia", "Divulgación pública de la ciencia", "range", "PCD_C2"),
+    ("Divulgación Pública de la Ciencia producción de estrategias y contenidos transmedia", "Desarrollo web", "Divulgación pública de la ciencia", "range", "TRM_C2"),
+    ("Desarrollo web", "Procesos de apropiación social del Conocimiento para el fortalecimiento o solución de asuntos de interés social", "Divulgación pública de la ciencia", "range", "DW_C2"),
+    ("Procesos de apropiación social del Conocimiento para el fortalecimiento o solución de asuntos de interés social", "Productos de apropiación social del conocimiento resultado del trabajo conjunto entre un Centro de Ciencia y un grupo de investigación", "Apropiación social del conocimiento", "range", "FIS"),
+    ("Productos de apropiación social del conocimiento resultado del trabajo conjunto entre un Centro de Ciencia y un grupo de investigación", "Proceso de Apropiación Social del Conocimiento para la generación de insumos de política pública y normatividad", "Apropiación social del conocimiento", "range", "TCCG_D"),
+    ("Proceso de Apropiación Social del Conocimiento para la generación de insumos de política pública y normatividad", "Proceso de apropiación social del Conocimiento para el fortalecimiento de cadenas productivas", "Apropiación social del conocimiento", "range", "GPP_C"),
+    ("Proceso de apropiación social del Conocimiento para el fortalecimiento de cadenas productivas", "Consultorías científico-tecnológicas", "Apropiación social del conocimiento", "range", "FCP_C"),
+    ("Consultorías científico-tecnológicas", "Ediciones", "Divulgación pública de la ciencia", "range", "CON_CT"),
+    ("Ediciones", "Eventos Científicos", "Divulgación pública de la ciencia", "range", "ERL"),
+    ("Eventos Científicos", "Informes de investigación", "Divulgación pública de la ciencia", "range", "EC_B"),
+    ("Informes de investigación", "Nuevas secuencias genéticas", "Divulgación pública de la ciencia", "range", "IFI"),
+    ("Nuevas secuencias genéticas", "Redes de Conocimiento Especializado", "Divulgación pública de la ciencia", "range", "NSG"),
+    ("Redes de Conocimiento Especializado", "Generaciónes de contenido de audio", "Divulgación pública de la ciencia", "range", "RC_B"),
+    ("Generaciónes de contenido de audio", "Generación de Contenido Impreso", "Divulgación pública de la ciencia", "range", "GC"),
+    ("Generación de Contenido Impreso", "Generación de Contenido Multimedia", "Divulgación pública de la ciencia", "range", "GC"),
+    ("Generación de Contenido Multimedia", "Generación de Contenido Virtual", "Divulgación pública de la ciencia", "range", "GC"),
+    ("Generación de Contenido Virtual", "Estrategias de Comunicación del Conocimiento", "Divulgación pública de la ciencia", "range", "GC"),
+    ("Obras o productos", "Industrias creativas y culturales", "Producción en arte, arquitectura y diseño", "range", "AAD_C"),
+    ("Industrias creativas y culturales", "Eventos Artísticos", "Producción en arte, arquitectura y diseño", "range", "ICC_B"),
+    ("Eventos Artísticos", "Talleres de Creación", "Producción en arte, arquitectura y diseño", "range", "ECA_B"),
+    ("Talleres de Creación", "ACTIVIDADES DE FORMACIÓN", "Producción en arte, arquitectura y diseño", "range", "TC_C"),
+    ("Asesorías al Programa Ondas", "Curso de Corta Duración Dictados", "Formación de recurso humano", "range", "APO"),
+    ("Trabajos dirigidos/turorías", "ACTIVIDADES COMO EVALUADOR", "Formación de recurso humano", "range", ""),
+    ("Proyectos", "", "Proyectos", "range", ""),
+    ("Programa académico de doctorado", "Programa académico de maestría", "Formación y extensión", "range", "AP_A"),
+    ("Programa académico de maestría", "Otro programa académico", "Formación y extensión", "range", "AP_B"),
+    ("Curso de doctorado", "Curso de maestría", "Formación y extensión", "range", "AP_C"),
+    ("Curso de maestría", "Curso especializado de extensión", "Formación y extensión", "range", "AP_D"),
 )
+GRUPLAC_SECTIONS = (
+    GrupLACSection("Artículos publicados", "Libros publicados", "Producción bibliográfica", "publication", False),
+    GrupLACSection("Libros publicados", "Capítulos de libro publicados", "Producción bibliográfica", "publication", False),
+    GrupLACSection("Capítulos de libro publicados", "Documentos de trabajo", "Producción bibliográfica", "publication", False),
+    GrupLACSection("Documentos de trabajo", "Otra publicación divulgativa", "Producción bibliográfica", "publication", False),
+    GrupLACSection("Otra publicación divulgativa", "Otros artículos publicados", "Producción bibliográfica", "publication", False),
+    GrupLACSection("Otros artículos publicados", "Libros de formación", "Producción bibliográfica", "publication", False),
+    GrupLACSection("Libros de formación", "Libros de divulgación y/o Compilación de divulgación", "Producción bibliográfica", "publication", False),
+    GrupLACSection("Otros Libros publicados", "Traducciones", "Producción bibliográfica", "publication", False),
+    GrupLACSection("Otros productos tecnológicos", "Prototipos", "Producción técnica y tecnológica", "publication", False),
+    GrupLACSection("Softwares", "Empresas de base tecnológica", "Producción técnica y tecnológica", "publication", False),
+    GrupLACSection("Empresas de base tecnológica", "APROPIACIÓN SOCIAL Y DIVULGACIÓN PÚBLICA DE LA CIENCIA", "Producción técnica y tecnológica", "publication", False),
+    *(GrupLACSection(heading, stop, family, rule, True) for heading, stop, family, rule, _ in _GRUPLAC_NEW_SECTIONS),
+)
+CATEGORY_ESTIMATES = {
+    ("Artículos publicados", "Publicado en revista especializada"): "ART_D",
+    ("Artículos publicados", "Corto (Resumen)"): "N_D",
+    ("Libros publicados", "Libro resultado de investigación"): "LIB_C",
+    ("*", "Libro pedagógico y/o de divulgación"): "LIB_DIV",
+    ("Capítulos de libro publicados", "Capítulo de libro"): "CAP_LIB_C",
+    ("Documentos de trabajo", "*"): "WP",
+    ("Otra publicación divulgativa", "*"): "PEE_C2",
+    # GrupLAC lista la prensa y la divulgación entre «Otros artículos publicados».
+    ("Otros artículos publicados", "Revista de divulgación"): "PEE_C2",
+    ("Otros artículos publicados", "Periódico de noticias"): "PEE_C2",
+    ("Otros artículos publicados", "Columna de opinión"): "PEE_C2",
+    ("Libros de formación", "*"): "LIB_FOR3",
+    ("Softwares", "*"): "SF",
+    ("Empresas de base tecnológica", "*"): "EBT_B",
+    ("Trabajos dirigidos/turorías", "Trabajos de grado de pregrado"): "TP_B",
+    ("Trabajos dirigidos/turorías", "Pregrado"): "TP_B",
+    ("Trabajos dirigidos/turorías", "Trabajo de grado de maestría o especialidad clínica"): "TM_B",
+    ("Trabajos dirigidos/turorías", "Maestría"): "TM_B",
+    ("Trabajos dirigidos/turorías", "Tesis de doctorado"): "TD_B",
+    ("Trabajos dirigidos/turorías", "Doctorado"): "TD_B",
+    ("Proyectos", "Investigación y desarrollo"): "PID_C",
+    ("Proyectos", "Investigación, desarrollo e innovación"): "PF_B",
+    ("Proyectos", "Investigación-creación"): "PIC_C",
+    ("Proyectos", "Extensión y responsabilidad social CTI"): "PE",
+    **{(heading, "*"): code for heading, _, _, _, code in _GRUPLAC_NEW_SECTIONS if code},
+}
+PEOPLE_PREFIXES = ("Autores:", "Tutor(es)/Cotutor(es):")
+
+
+def estimate_category(section: str, tipologia: str) -> str:
+    for key in ((section, tipologia), (section, "*"), ("*", tipologia)):
+        if key in CATEGORY_ESTIMATES:
+            return CATEGORY_ESTIMATES[key]
+    return ""
+
+
+def product_identity(title: str, year: str, doi: str, kind: str, article: bool) -> str:
+    identity = "doi:" + doi.casefold() if doi else "title:" + _name_key(title) + "|" + year
+    if not doi and not article:
+        identity += "|" + _name_key(kind)
+    return identity
+
+
+def product_id(identity: str) -> str:
+    return "P-GR-" + hashlib.sha1(identity.encode("utf-8")).hexdigest()[:12].upper()
+
+
+def _combine_product(previous: GrupLACProduct, current: GrupLACProduct) -> GrupLACProduct:
+    authors = list(previous.authors)
+    known = {_name_key(name) for name in authors}
+    for name in current.authors:
+        if _name_key(name) not in known:
+            authors.append(name)
+            known.add(_name_key(name))
+    row = previous.row
+    if not row["categoria"] and current.row["categoria"]:
+        row = {**row, "categoria": current.row["categoria"], "categoria_origen": "estimada"}
+    return previous._replace(row=row, authors=tuple(authors))
 
 
 def parse_gruplac_products(html: str, url: str) -> list[GrupLACProduct]:
@@ -2086,56 +2623,55 @@ def parse_gruplac_products(html: str, url: str) -> list[GrupLACProduct]:
     parser.feed(html)
     lines = parser.lines()
     by_identity: dict[str, GrupLACProduct] = {}
-    for section, stop, family in GRUPLAC_SECTIONS:
+    headings = {part for section in GRUPLAC_SECTIONS for part in (section.heading, section.stop) if part}
+    for section, stop, family, year_rule, only_categorized in GRUPLAC_SECTIONS:
         try:
             first = lines.index(section) + 1
         except ValueError:
             continue
-        last = next((i for i in range(first, len(lines)) if lines[i] == stop), len(lines))
+        last = next((i for i in range(first, len(lines)) if lines[i] in headings), len(lines)) if stop else len(lines)
         for index in range(first, last):
-            match = re.match(r"^\d+\.-\s*([^:]+?)\s*:\s*(.+)$", lines[index])
+            match = re.match(r"^\d+\.(?:-\s*|\s+)([^:]+?)\s*:\s*(.+)$", lines[index])
             if not match:
                 continue
             kind, title = match.group(1).strip(), match.group(2).strip()
+            category = estimate_category(section, kind)
+            if only_categorized and not category:
+                continue
             if not title:
                 continue
             details: list[str] = []
             authors: list[str] = []
-            for line in lines[index + 1:min(index + 16, last)]:
-                if re.match(r"^\d+\.-\s", line):
+            for line in lines[index + 1:last]:
+                if re.match(r"^\d+\.(?:-\s*|\s+)", line):
                     break
-                if line.startswith("Autores:"):
-                    authors.extend(name.strip() for name in line[8:].split(",") if name.strip())
+                prefix = next((prefix for prefix in PEOPLE_PREFIXES if line.startswith(prefix)), None)
+                if prefix:
+                    authors.extend(name.strip() for name in line[len(prefix):].split(",") if name.strip())
                     break
                 details.append(line)
             detail = " ".join(details)
-            year_match = re.search(r"(?<![\d-])((?:19|20)\d{2})(?=\s*(?:[,.;]|vol:|$))", detail)
-            if not year_match or not _publication_year(year_match.group(1)):
+            if year_rule == "range":
+                years = re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", " ".join(details[:2]))
+                year = years[-1] if years else ""
+            else:
+                year_match = re.search(r"(?<![\d-])((?:19|20)\d{2})(?=\s*(?:[,.;]|vol:|$))", detail)
+                year = year_match.group(1) if year_match else ""
+            if not _publication_year(year):
                 continue
-            year = year_match.group(1)
-            doi_match = re.search(r"\bDOI:\s*(10\.\S+)", detail, re.IGNORECASE)
-            doi = doi_match.group(1).rstrip(".,;)") if doi_match else ""
-            identity = "doi:" + doi.casefold() if doi else "title:" + _name_key(title) + "|" + year
-            if not doi and section != "Artículos publicados":
-                identity += "|" + _name_key(kind)
-            previous = by_identity.get(identity)
-            if previous:
-                combined = list(previous.authors)
-                known = {_name_key(name) for name in combined}
-                for name in authors:
-                    if _name_key(name) not in known:
-                        combined.append(name)
-                        known.add(_name_key(name))
-                by_identity[identity] = previous._replace(authors=tuple(combined))
-                continue
-            stable_id = "P-GR-" + hashlib.sha1(identity.encode("utf-8")).hexdigest()[:12].upper()
+            published, doi = _source_doi(detail)
+            identity = product_identity(title, year, published, kind, section == "Artículos publicados")
+            note = f"; DOI incompleto en la fuente: {published}" if published and not doi else ""
             row = clean_row("productos", {
-                "id": stable_id, "titulo": title, "anio": year,
+                "id": product_id(identity), "titulo": title, "anio": year,
                 "familia": family, "tipologia": kind,
+                "categoria": category, "categoria_origen": "estimada" if category else "",
                 "doi": doi, "url": _redact_url(url),
-                "fuente": f"GrupLAC, sección {section}, consultado {date.today().isoformat()}",
+                "fuente": f"GrupLAC, sección {section}, consultado {date.today().isoformat()}{note}",
             })
-            by_identity[identity] = GrupLACProduct(row, tuple(authors), section)
+            entry = GrupLACProduct(row, tuple(authors), section)
+            previous = by_identity.get(identity)
+            by_identity[identity] = _combine_product(previous, entry) if previous else entry
     return list(by_identity.values())
 
 
@@ -2161,16 +2697,68 @@ def match_gruplac_authors(products: list[GrupLACProduct],
     return relations
 
 
-# Campos que una ficha GrupLAC vuelve a traer al importarla de nuevo; solo esos se actualizan,
+# Campos que una ficha Scienti vuelve a traer al importarla de nuevo; solo esos se actualizan,
 # y solo con valores no vacíos. Las claves, la validación calculada, la observación de revisión
 # y la URL de un producto (cambia según el grupo consultado) nunca se reemplazan.
 REFRESH_FIELDS = {
-    "grupos": ("nombre", "responsable", "categoria", "descripcion", "objetivos", "vision", "lineas", "url"),
+    "grupos": ("nombre", "responsable", "categoria", "descripcion", "objetivos", "vision", "lineas", "url", "fecha_creacion"),
     "investigadores": ("nombre", "categoria", "url"),
     "planes": ("nombre", "objetivo", "actividad"),
-    "productos": ("familia", "tipologia"),
+    "productos": ("familia", "tipologia", "categoria", "categoria_origen"),
     "membresias": ("rol", "activo"),
 }
+
+
+def _merge_record(repository: Repository | CppRepository, kind: str, row: dict[str, str],
+                  key: str | tuple[str, str], counts: dict[str, Any], extra: dict[str, Any]) -> bool:
+    existing = repository.get(kind, key)
+    if existing is not None:
+        if kind == "grupos" and existing["codigo_gruplac"] != row["codigo_gruplac"]:
+            counts["errors"].append(f"{kind} {key}: ID ocupado por otro grupo")
+            return False
+        if kind == "investigadores" and existing["codigo_cvlac"] != row["codigo_cvlac"]:
+            counts["errors"].append(f"{kind} {key}: ID ocupado por otro perfil")
+            return False
+        if kind == "productos":
+            same_doi = bool(existing["doi"] and row.get("doi") and _doi_text(existing["doi"]) == _doi_text(row["doi"]))
+            # Las fichas repiten un título con o sin punto final; el ID no cambia por eso.
+            same_title_year = (_name_key(existing["titulo"]).rstrip(" .,;:") == _name_key(row["titulo"]).rstrip(" .,;:")
+                               and existing["anio"] == row["anio"])
+            if not same_doi and not same_title_year:
+                counts["errors"].append(f"{kind} {key}: ID ocupado por otro producto")
+                return False
+        changes = {name: row[name] for name in REFRESH_FIELDS.get(kind, ())
+                   if row.get(name) and row[name] != existing.get(name, "")}
+        if kind == "productos" and existing["categoria_origen"] == "manual":
+            changes.pop("categoria", None)
+            changes.pop("categoria_origen", None)
+        # Un DOI guardado con formato inválido se reemplaza por el de la fuente, aunque esta ya no traiga ninguno.
+        if (kind == "productos" and existing["doi"] and not _valid_doi(_doi_text(existing["doi"]))
+                and row.get("doi", "") != existing["doi"]):
+            changes["doi"] = row.get("doi", "")
+        elif kind == "productos" and "categoria" in changes:
+            # La categoría y su origen se envían juntos aunque el origen no cambie.
+            changes["categoria_origen"] = row.get("categoria_origen", "")
+        if not changes:
+            counts["existentes"] += 1
+            return True
+        # La fecha de consulta cambia en cada descarga: la fuente solo se renueva con el contenido.
+        if row.get("fuente"):
+            changes["fuente"] = row["fuente"]
+        try:
+            repository.update(kind, key, changes, **extra)
+        except (DataError, OSError, ValueError) as exc:
+            counts["errors"].append(f"{kind} {key}: {exc}")
+            return True
+        counts["actualizados"] += 1
+        return True
+    try:
+        repository.create(kind, row, **extra)
+    except (DataError, OSError, ValueError) as exc:
+        counts["errors"].append(f"{kind} {key}: {exc}")
+        return False
+    counts[kind] += 1
+    return True
 
 
 def import_gruplac_preview(repository: Repository | CppRepository, preview: WebPreview,
@@ -2194,39 +2782,7 @@ def import_gruplac_preview(repository: Repository | CppRepository, preview: WebP
     extra: dict[str, Any] = {} if remember else {"remember": False}
 
     def add(kind: str, row: dict[str, str], key: str | tuple[str, str]) -> bool:
-        existing = repository.get(kind, key)
-        if existing is not None:
-            if kind == "grupos" and existing["codigo_gruplac"] != source_group["codigo_gruplac"]:
-                counts["errors"].append(f"{kind} {key}: ID ocupado por otro grupo")
-                return False
-            if kind == "investigadores" and existing["codigo_cvlac"] != row["codigo_cvlac"]:
-                counts["errors"].append(f"{kind} {key}: ID ocupado por otro perfil")
-                return False
-            if kind == "productos" and (existing["titulo"] != row["titulo"] or existing["anio"] != row["anio"]):
-                counts["errors"].append(f"{kind} {key}: ID ocupado por otro producto")
-                return False
-            changes = {name: row[name] for name in REFRESH_FIELDS.get(kind, ())
-                       if row.get(name) and row[name] != existing.get(name, "")}
-            if not changes:
-                counts["existentes"] += 1
-                return True
-            # La fecha de consulta cambia en cada descarga: la fuente solo se renueva con el contenido.
-            if row.get("fuente"):
-                changes["fuente"] = row["fuente"]
-            try:
-                repository.update(kind, key, changes, **extra)
-            except (DataError, OSError, ValueError) as exc:
-                counts["errors"].append(f"{kind} {key}: {exc}")
-                return True
-            counts["actualizados"] += 1
-            return True
-        try:
-            repository.create(kind, row, **extra)
-        except (DataError, OSError, ValueError) as exc:
-            counts["errors"].append(f"{kind} {key}: {exc}")
-            return False
-        counts[kind] += 1
-        return True
+        return _merge_record(repository, kind, row, key, counts, extra)
 
     if not add("grupos", group, group_id):
         return counts
@@ -2254,6 +2810,115 @@ def import_gruplac_preview(repository: Repository | CppRepository, preview: WebP
         product_id, researcher_id = authorship["producto_id"], authorship["investigador_id"]
         if product_id in available_products and researcher_id in available_people:
             add("autorias", authorship, (product_id, researcher_id))
+    return counts
+
+
+CVLAC_SECTIONS = {
+    "Artículo": "Artículos publicados", "Libro": "Libros publicados",
+    "Capítulo de libro": "Capítulos de libro publicados", "Capitulo de libro": "Capítulos de libro publicados",
+    "Documento de trabajo (Working Paper)": "Documentos de trabajo",
+    "Otro artículo publicado": "Otra publicación divulgativa", "Softwares": "Softwares",
+    "Innovación de proceso o procedimiento": "Innovaciones en Procesos y Procedimientos",
+    "Empresas de base tecnológica": "Empresas de base tecnológica",
+    "Empresa de base tecnológica": "Empresas de base tecnológica",
+    "Trabajos de grado de pregrado": "Trabajos dirigidos/turorías",
+    "Trabajo de grado de maestría o especialidad clínica": "Trabajos dirigidos/turorías",
+}
+
+
+def parse_cvlac_products(html: str, url: str) -> list[GrupLACProduct]:
+    """Lee productos declarados en CvLAC; no incorpora eventos ni proyectos."""
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname != "scienti.minciencias.gov.co" or \
+            "/cvlac/" not in parsed.path or not parse_qs(parsed.query).get("cod_rh"):
+        raise DataError("La fuente debe ser una ficha CvLAC HTTPS con código de investigador")
+
+    class CvlacText(VisibleText):
+        def handle_endtag(self, tag: str) -> None:
+            super().handle_endtag(tag)
+            if tag == "blockquote":
+                self.parts.append("\n__CVLAC_END__\n")
+
+    parser = CvlacText()
+    parser.feed(html)
+    lines = parser.lines()
+    header = re.compile(r"^(Producción bibliográfica|Producción técnica|Trabajos dirigidos/Tutorías)\s+-\s+(.+)$")
+    headers = [(index, match) for index, line in enumerate(lines) if (match := header.match(line))]
+    by_identity: dict[str, GrupLACProduct] = {}
+    for position, (index, match) in enumerate(headers):
+        parts = re.split(r"\s+-\s+", match[2])
+        section = CVLAC_SECTIONS.get(parts[0])
+        if section is None:
+            continue
+        kind = parts[-1]
+        last = headers[position + 1][0] if position + 1 < len(headers) else len(lines)
+        last = next((i for i in range(index + 1, last) if lines[i] == "__CVLAC_END__"), last)
+        details = lines[index + 1:last]
+        cursor = 0
+        author_lines = []
+        while cursor < len(details) and details[cursor].endswith(",") and ":" not in details[cursor] \
+                and not details[cursor].startswith((".", ",")):
+            author_lines.append(details[cursor])
+            cursor += 1
+        quoted = next((found for line in details if (found := re.search(r'["“](.+?)["”]', line))), None)
+        if quoted:
+            title = quoted[1].strip()
+        elif cursor < len(details) and details[cursor].startswith(("Nombre comercial:", "contrato/registro:", ". En:")):
+            # En productos técnicos el título lleva coma final y precede a los metadatos.
+            title = author_lines.pop().rstrip(",").strip() if len(author_lines) > 1 else ""
+        else:
+            title = details[cursor].rstrip(",").strip() if cursor < len(details) else ""
+        if not title:
+            continue
+        detail = " ".join(details)
+        year_match = re.search(r"(?<!\d)((?:19|20)\d{2})(?=[,.])", detail)
+        if not year_match or not _publication_year(year_match[1]):
+            continue
+        year = year_match[1]
+        published, doi = _source_doi(detail)
+        note = f"; DOI incompleto en la fuente: {published}" if published and not doi else ""
+        category = estimate_category(section, kind)
+        identity = product_identity(title, year, published, kind, section == "Artículos publicados")
+        family = {"Trabajos dirigidos/Tutorías": "Formación de recurso humano",
+                  "Producción técnica": "Producción técnica y tecnológica"}.get(match[1], match[1])
+        row = clean_row("productos", {
+            "id": product_id(identity), "titulo": title, "anio": year, "tipologia": kind,
+            "familia": family,
+            "categoria": category, "categoria_origen": "estimada" if category else "",
+            "doi": doi, "url": _redact_url(url),
+            "fuente": f"CvLAC, sección {parts[0]}, consultado {date.today().isoformat()}{note}",
+        })
+        authors = tuple(name.strip() for line in author_lines for name in line.split(",") if name.strip())
+        entry = GrupLACProduct(row, authors, section)
+        previous = by_identity.get(identity)
+        by_identity[identity] = _combine_product(previous, entry) if previous else entry
+    return list(by_identity.values())
+
+
+def import_cvlac_preview(repository: Repository | CppRepository, preview: WebPreview,
+                         reviewed_person: dict[str, str] | None = None, *,
+                         remember: bool = True) -> dict[str, Any]:
+    """Fusiona el perfil, sus productos y autorías; conserva los vínculos existentes."""
+    if preview.suggested_kind != "investigadores" or not preview.suggested_row:
+        raise DataError("La vista previa no contiene una ficha de investigador")
+    person = clean_row("investigadores", reviewed_person or preview.suggested_row)
+    if person["codigo_cvlac"] != preview.suggested_row["codigo_cvlac"]:
+        raise DataError("El código CvLAC revisado no coincide con la fuente")
+    counts: dict[str, Any] = {kind: 0 for kind in (
+        "grupos", "investigadores", "membresias", "planes", "productos", "grupos_productos", "autorias")}
+    counts["existentes"] = counts["actualizados"] = 0
+    counts["errors"] = []
+    extra: dict[str, Any] = {} if remember else {"remember": False}
+    if not _merge_record(repository, "investigadores", person, person["id"], counts, extra):
+        return counts
+    for product in preview.related_products:
+        if not _merge_record(repository, "productos", product, product["id"], counts, extra):
+            continue
+        key = (product["id"], person["id"])
+        # «existentes» cuenta perfil y productos; una autoría presente no se vuelve a importar.
+        if repository.get("autorias", key) is None:
+            authorship = {"producto_id": key[0], "investigador_id": key[1], "rol": "Producto listado en CvLAC"}
+            _merge_record(repository, "autorias", authorship, key, counts, extra)
     return counts
 
 
@@ -2356,6 +3021,79 @@ def new_id(prefix: str) -> str:
     return prefix + "-" + uuid.uuid4().hex[:8].upper()
 
 
+# La interfaz usa CustomTkinter; el núcleo de datos, los scripts y las pruebas no lo necesitan.
+CTK_REQUIREMENT = "customtkinter==6.0.0"
+
+
+def _interactive() -> bool:
+    return bool(sys.stdin and sys.stdin.isatty())
+
+
+def _bootstrap_ask(text: str) -> bool:
+    """Pregunta antes de instalar: en consola con input; con el lanzador .pyw, con un aviso del sistema."""
+    if _interactive():
+        return input(f"{text} [S/n] ").strip().casefold() in ("", "s", "si", "sí", "y", "yes")
+    # Todavía no existe ninguna ventana CustomTkinter: única ventana Tk clásica del programa.
+    import tkinter as tk
+    from tkinter import messagebox
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        return messagebox.askyesno("PEA-i", text, parent=root)
+    finally:
+        root.destroy()
+
+
+def _bootstrap_notice(text: str) -> None:
+    if sys.stderr:
+        print(text, file=sys.stderr)
+    if _interactive():
+        return
+    import tkinter as tk
+    from tkinter import messagebox
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        messagebox.showerror("PEA-i", text, parent=root)
+    finally:
+        root.destroy()
+
+
+def ensure_customtkinter(*, ask: Callable[[str], bool] | None = None,
+                         run: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> bool:
+    """True si CustomTkinter puede importarse, instalándolo con pip cuando falta y el usuario acepta."""
+    if importlib.util.find_spec("customtkinter") is not None:
+        return True
+    manual = f"{Path(sys.executable).name} -m pip install {CTK_REQUIREMENT}"
+    question = (f"PEA-i necesita la biblioteca CustomTkinter ({CTK_REQUIREMENT}) para su interfaz. "
+                "¿Instalarla ahora con pip? Se necesita Internet una sola vez.")
+    if not (ask or _bootstrap_ask)(question):
+        _bootstrap_notice(f"PEA-i no puede abrir su interfaz sin CustomTkinter. Instálela con:\n{manual}")
+        return False
+    in_virtualenv = sys.prefix != sys.base_prefix
+    command = [sys.executable, "-m", "pip", "install", CTK_REQUIREMENT] + ([] if in_virtualenv else ["--user"])
+    result = run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        output = f"{result.stdout or ''}\n{result.stderr or ''}"
+        if "externally-managed-environment" in output:
+            _bootstrap_notice(
+                "El Python del sistema no admite instalar paquetes con pip (PEP 668). Use un entorno virtual "
+                "desde la carpeta del proyecto:\n"
+                "python3 -m venv .venv\n"
+                ".venv/bin/pip install -r requirements.txt\n"
+                ".venv/bin/python src/python/Taller2_REMR.py\n"
+                "En Windows use .venv\\Scripts\\pip y .venv\\Scripts\\python.")
+        else:
+            tail = "\n".join(output.strip().splitlines()[-20:])
+            _bootstrap_notice(f"No se pudo instalar CustomTkinter.\n{tail}\n\nInstálelo manualmente con:\n{manual}")
+        return False
+    if not in_virtualenv:
+        # Un directorio de usuario recién creado no está aún en sys.path de este proceso.
+        site.addsitedir(site.getusersitepackages())
+    importlib.invalidate_caches()
+    return importlib.util.find_spec("customtkinter") is not None
+
+
 def open_gui_repository(*, python_backend: bool = False,
                         cpp_binary: Path | None = None) -> tuple[Repository | CppRepository, str]:
     """Abre el motor disponible y devuelve un aviso si se usó el respaldo Python."""
@@ -2369,12 +3107,60 @@ def open_gui_repository(*, python_backend: bool = False,
         return Repository(), str(exc).splitlines()[0]
 
 
+# «Sierra y sabana»: verde institucional UPC; el amarillo solo marca lo pendiente.
+LIGHT_THEME = {
+    "page": "#f3f6f3", "surface": "#ffffff", "field": "#ffffff",
+    "sidebar": "#163a2e", "sidebar_fg": "#e3ece7", "sidebar_muted": "#a9c2b6",
+    "sidebar_hover": "#1f4a3b", "ink": "#1c2a24", "muted": "#5b6c64",
+    "line": "#dce4df", "line_strong": "#c3cfc8", "hover": "#eaf0ec",
+    "primary": "#1e6b50", "primary_hover": "#185a43", "primary_pressed": "#124636",
+    "on_primary": "#ffffff", "primary_soft": "#dcefe5", "stripe": "#f7faf8",
+    "thumb": "#c3cfc8", "thumb_active": "#9fb0a7",
+    "chart_grid": "#e7ece9", "chart_track": "#eef3f0", "chart_older": "#8fb8a5",
+    "pending": "#bb7e0e", "rejected": "#b5472f", "unknown": "#87938d",
+    "error": "#b42318", "disabled": "#9fb0a7",
+    # Clases del modelo 2024 en los gráficos de anillo y de mosaico.
+    "class_top": "#1e6b50", "class_a": "#4a9d78", "class_b": "#97c9ac", "class_asc": "#c48a1c",
+    "class_dpc": "#2f78a0", "class_frh_a": "#8659a6", "class_frh_b": "#c0634a", "class_none": "#bcc6c1",
+}
+
+DARK_THEME = {
+    "page": "#111714", "surface": "#18201c", "field": "#1d2621",
+    "sidebar": "#0b100e", "sidebar_fg": "#e3ece7", "sidebar_muted": "#8fa79b",
+    "sidebar_hover": "#16201b", "ink": "#e3ece7", "muted": "#94a69d",
+    "line": "#28332e", "line_strong": "#3a4842", "hover": "#222c27",
+    "primary": "#4db38c", "primary_hover": "#2f8a68", "primary_pressed": "#236b51",
+    "on_primary": "#ffffff", "primary_soft": "#1f3a30", "stripe": "#1b241f",
+    "thumb": "#34423b", "thumb_active": "#4a5b52",
+    "chart_grid": "#232d28", "chart_track": "#202a25", "chart_older": "#3f7d65",
+    "pending": "#e6b04a", "rejected": "#e07a62", "unknown": "#7d8c85",
+    "error": "#ffb4ab", "disabled": "#4f5f57",
+    "class_top": "#4db38c", "class_a": "#7ccaa6", "class_b": "#b7e2ca", "class_asc": "#e6b04a",
+    "class_dpc": "#62abd6", "class_frh_a": "#b78fd6", "class_frh_b": "#e48b73", "class_none": "#56645d",
+}
+# Botón primario: en oscuro el verde claro sirve para trazos, no como fondo de texto blanco.
+DARK_THEME["button"] = "#2a7a5c"
+LIGHT_THEME["button"] = LIGHT_THEME["primary"]
+STATUS_COLORS = {"validado": "primary", "rechazado": "rejected", "Sin dato": "unknown"}
+
+
 def build_gui(root: Any, repository: Repository | CppRepository,
               data_file: Path | None = None, *, load_on_start: bool = True) -> Any:
     """Construye la ventana; permite verificar sus flujos con un repositorio aislado."""
     import tkinter as tk
     import tkinter.font as tkfont
-    from tkinter import filedialog, messagebox, simpledialog, ttk
+    from tkinter import TclError, filedialog, ttk
+
+    from types import SimpleNamespace
+    import weakref
+
+    import customtkinter as ctk
+
+    catalog = repository.catalog()
+    catalog_by_code = {row["codigo"]: row for row in catalog}
+
+    def decimal(value: float, digits: int | None = None) -> str:
+        return (f"{value:g}" if digits is None else f"{value:.{digits}f}").replace(".", ",")
 
     available_fonts = set(tkfont.families(root))
 
@@ -2406,6 +3192,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
     TITLES = {"grupos": "Grupos", "investigadores": "Investigadores", "productos": "Productos",
               "planes": "Planes", "membresias": "Integrantes", "autorias": "Autorías",
               "grupos_productos": "Grupos y productos"}
+    SINGULAR = {"grupos": "Grupo", "investigadores": "Investigador", "productos": "Producto", "planes": "Plan"}
 
     def record_name(row: dict[str, str]) -> str:
         return row.get("nombre") or row.get("titulo") or row["id"]
@@ -2421,12 +3208,1261 @@ def build_gui(root: Any, repository: Repository | CppRepository,
         codes = auto_reason_codes(reason)
         if codes is None:
             return reason or "Sin motivo registrado"
-        rules = "; ".join(VALIDATION_RULES[code] for code in codes) or "rechazado"
+        rules = "; ".join(RULE_LABELS[code] for code in codes) or "rechazado"
         return rules if short else "Validación automática: " + rules
 
     def cell_value(field: str, value: str) -> str:
         """Texto de una celda de tabla: una línea y un guion discreto para lo vacío."""
         return " ".join(display_value(field, value).split()) if value or field == "activo" else "—"
+
+    def category_tone(row: dict[str, str]) -> str:
+        if not row.get("categoria"):
+            return "unknown"
+        return "pending" if row.get("categoria_origen") == "estimada" else "primary"
+
+    # Kit CustomTkinter: tokens de color, tipografía y componentes compartidos por todas las pantallas.
+    ctk.set_default_color_theme("green")
+    T = {name: (LIGHT_THEME[name], DARK_THEME[name]) for name in LIGHT_THEME}
+
+    def color(name: str) -> str:
+        """Color del token en la apariencia actual; los lienzos no cambian de tema por sí solos."""
+        return T[name][1 if ctk.get_appearance_mode() == "Dark" else 0]
+
+    def mix(first: str, second: str, amount: float) -> str:
+        start = [int(first[i:i + 2], 16) for i in (1, 3, 5)]
+        end = [int(second[i:i + 2], 16) for i in (1, 3, 5)]
+        return "#" + "".join(f"{round(a + (b - a) * amount):02x}" for a, b in zip(start, end))
+
+    def soft(tone: str) -> tuple[str, str]:
+        """Fondo tenue de un tono para chips y etiquetas de estado."""
+        return (mix(LIGHT_THEME["surface"], LIGHT_THEME[tone], 0.14),
+                mix(DARK_THEME["surface"], DARK_THEME[tone], 0.24))
+
+    def number(value: int) -> str:
+        return f"{value:,}".replace(",", ".")
+
+    FAMILY = first_font("Segoe UI Variable Text", "Segoe UI", "Inter", "Roboto") or "Roboto"
+    FONTS = {name: ctk.CTkFont(family=FAMILY, size=size, weight=weight) for name, (size, weight) in {
+        "display": (30, "bold"), "h1": (22, "bold"), "h2": (16, "bold"),
+        "body": (13, "normal"), "small": (12, "normal"), "caption": (11, "normal")}.items()}
+
+    def button(parent: Any, text: str, command: Callable[[], Any], variant: str = "secondary",
+               **options: Any) -> Any:
+        styles = {
+            "primary": {"fg_color": T["button"], "hover_color": T["primary_pressed"], "text_color": T["on_primary"]},
+            "secondary": {"fg_color": "transparent", "hover_color": T["hover"], "text_color": T["ink"],
+                          "border_width": 1, "border_color": T["line_strong"]},
+            "danger": {"fg_color": T["rejected"], "text_color": T["on_primary"],
+                       "hover_color": (mix(LIGHT_THEME["rejected"], "#000000", 0.15),
+                                       mix(DARK_THEME["rejected"], "#000000", 0.15))},
+            "ghost": {"fg_color": "transparent", "hover_color": T["sidebar_hover"],
+                      "text_color": T["sidebar_fg"], "anchor": "w"},
+        }[variant]
+        return ctk.CTkButton(parent, text=text, command=command,
+                             **{"height": 34, "corner_radius": 8, "font": FONTS["body"],
+                                "text_color_disabled": T["disabled"], **styles, **options})
+
+    class Card(ctk.CTkFrame):
+        """Superficie con borde fino; franja opcional del color de estado y título."""
+        def __init__(self, parent: Any, title: str | None = None, stripe: str | None = None, **options: Any):
+            super().__init__(parent, fg_color=T["surface"], border_color=T["line"], border_width=1,
+                             corner_radius=12, **options)
+            if stripe:
+                ctk.CTkFrame(self, height=3, corner_radius=0, fg_color=T[stripe]).pack(fill="x", padx=12, pady=(1, 0))
+            if title:
+                ctk.CTkLabel(self, text=title, font=FONTS["h2"], text_color=T["ink"], anchor="w").pack(
+                    fill="x", padx=16, pady=(12, 0))
+            self.body = ctk.CTkFrame(self, fg_color="transparent")
+            self.body.pack(fill="both", expand=True, padx=16, pady=(8, 14))
+
+    def segmented(parent: Any, variable: Any, values: list[str], command: Callable[[str], Any]) -> Any:
+        return ctk.CTkSegmentedButton(parent, variable=variable, values=values, command=command,
+                                      height=34, corner_radius=8, font=FONTS["body"], text_color=T["ink"],
+                                      fg_color=T["field"], selected_color=T["primary_soft"],
+                                      selected_hover_color=T["hover"], unselected_color=T["field"],
+                                      unselected_hover_color=T["hover"])
+
+    def tabview(parent: Any) -> Any:
+        return ctk.CTkTabview(parent, fg_color=T["page"], text_color=T["ink"], segmented_button_font=FONTS["body"],
+                              segmented_button_fg_color=T["field"], segmented_button_selected_color=T["primary_soft"],
+                              segmented_button_selected_hover_color=T["hover"],
+                              segmented_button_unselected_color=T["field"],
+                              segmented_button_unselected_hover_color=T["hover"])
+
+    class Kpi(Card):
+        def __init__(self, parent: Any, caption: str, tone: str, variable: Any, **options: Any):
+            super().__init__(parent, stripe=tone, **options)
+            self.value_label = ctk.CTkLabel(self.body, textvariable=variable, font=FONTS["display"],
+                                            text_color=T["ink"], anchor="w")
+            self.value_label.pack(fill="x")
+            ctk.CTkLabel(self.body, text=caption, font=FONTS["caption"], text_color=T["muted"], anchor="w").pack(fill="x")
+
+    class Chip(ctk.CTkLabel):
+        def __init__(self, parent: Any, text: str, tone: str, **options: Any):
+            super().__init__(parent, text=text, font=FONTS["caption"], corner_radius=10, height=22, padx=8, **options)
+            self.set(text, tone)
+
+        def set(self, text: str, tone: str) -> None:
+            self.configure(text=text, text_color=T[tone], fg_color=soft(tone))
+
+    class MenuButton(ctk.CTkOptionMenu):
+        """Menú de cabecera: muestra siempre su nombre y ejecuta la acción elegida."""
+        def __init__(self, parent: Any, label: str, items: list[tuple[str, Callable[[], Any]]], **options: Any):
+            self._label = label
+            self._actions = dict(items)
+            super().__init__(parent, values=[name for name, _ in items], command=self.choose,
+                             dynamic_resizing=False, width=options.pop("width", 118), height=32, corner_radius=8,
+                             font=FONTS["body"], dropdown_font=FONTS["body"], fg_color=T["page"],
+                             button_color=T["page"], button_hover_color=T["hover"], text_color=T["ink"],
+                             dropdown_fg_color=T["surface"], dropdown_hover_color=T["hover"],
+                             dropdown_text_color=T["ink"], **options)
+            self.set(label)
+
+        def choose(self, choice: str) -> None:
+            self.set(self._label)
+            action = self._actions.get(choice)
+            if action:
+                action()
+
+    class SearchField(ctk.CTkEntry):
+        """Campo de búsqueda: avisa una vez cuando se deja de escribir."""
+        def __init__(self, parent: Any, variable: Any, on_change: Callable[[], Any], delay: int = 250,
+                     **options: Any):
+            placeholder = options.pop("placeholder_text", "Buscar…")
+            super().__init__(parent, textvariable=variable, height=34, corner_radius=8, font=FONTS["body"],
+                             fg_color=T["field"], border_color=T["line_strong"], text_color=T["ink"], **options)
+            self._on_change, self._delay, self._timer = on_change, delay, None
+            self._variable = variable
+            # CTkEntry no muestra placeholder_text junto a textvariable. La pista es solo visual.
+            self._focused = False
+            self.hint = ctk.CTkLabel(self, text=placeholder, font=FONTS["body"], text_color=T["muted"],
+                                     fg_color=T["field"], anchor="w", height=24)
+            self.hint.bind("<Button-1>", lambda _event: self.focus_set())
+            self.bind("<FocusIn>", lambda _event: self._focus_hint(True), add="+")
+            self.bind("<FocusOut>", lambda _event: self._focus_hint(False), add="+")
+            self._trace = variable.trace_add("write", lambda *_: self._schedule())
+            self._show_hint()
+
+        def _focus_hint(self, focused: bool) -> None:
+            self._focused = focused
+            self._show_hint()
+
+        def _show_hint(self) -> None:
+            if not self._variable.get() and not self._focused:
+                self.hint.place(x=12, rely=0.5, anchor="w")
+            else:
+                self.hint.place_forget()
+
+        def _schedule(self) -> None:
+            self._show_hint()
+            if self._timer:
+                self.after_cancel(self._timer)
+            self._timer = self.after(self._delay, self._fire)
+
+        def _fire(self) -> None:
+            self._timer = None
+            self._on_change()
+
+        def cancel_pending(self) -> None:
+            if self._timer:
+                self.after_cancel(self._timer)
+                self._timer = None
+
+        def destroy(self) -> None:
+            if self._timer:
+                self.after_cancel(self._timer)
+            try:
+                self._variable.trace_remove("write", self._trace)
+            except TclError:
+                pass
+            super().destroy()
+
+    class Pager(ctk.CTkFrame):
+        def __init__(self, parent: Any, on_move: Callable[[int], Any], **options: Any):
+            super().__init__(parent, fg_color="transparent", **options)
+            self.previous = button(self, "Anterior", lambda: on_move(-1), width=96)
+            self.previous.pack(side="left")
+            self.label = ctk.CTkLabel(self, text="", font=FONTS["small"], text_color=T["muted"])
+            self.label.pack(side="left", padx=12)
+            self.next = button(self, "Siguiente", lambda: on_move(1), width=96)
+            self.next.pack(side="left")
+
+        def show(self, offset: int, shown: int, total: int) -> None:
+            self.label.configure(text=f"{offset + 1}–{offset + shown} de {number(total)}" if total else "Sin resultados")
+            self.previous.configure(state="normal" if offset > 0 else "disabled")
+            self.next.configure(state="normal" if offset + shown < total else "disabled")
+
+    class EmptyState(ctk.CTkFrame):
+        def __init__(self, parent: Any, title: str, hint: str = "", **options: Any):
+            super().__init__(parent, fg_color="transparent", **options)
+            ctk.CTkLabel(self, text=title, font=FONTS["h2"], text_color=T["muted"]).pack(pady=(24, 4))
+            if hint:
+                ctk.CTkLabel(self, text=hint, font=FONTS["small"], text_color=T["muted"], wraplength=420).pack()
+
+    def reason_chips(parent: Any, reason: str | None, per_row: int = 3) -> list[Any]:
+        """Motivo de una revisión: un chip por regla incumplida, o uno con el motivo escrito a mano."""
+        for child in parent.winfo_children():
+            child.destroy()
+        if reason is None:
+            return []
+        codes = auto_reason_codes(reason)
+        if codes is None:
+            text = reason.strip() or "Sin motivo registrado"
+            texts, tone = [text if len(text) <= 70 else text[:69] + "…"], "pending"
+        else:
+            texts, tone = [RULE_LABELS[code] for code in codes] or ["Rechazado"], "rejected"
+        chips = [Chip(parent, text, tone) for text in texts]
+        for index, chip in enumerate(chips):
+            chip.grid(row=index // per_row, column=index % per_row, sticky="w", padx=(0, 6), pady=(0, 4))
+        return chips
+
+    def appearance(pair: tuple[str, str]) -> str:
+        return pair[1 if ctk.get_appearance_mode() == "Dark" else 0]
+
+    def palette() -> dict[str, str]:
+        """Colores de la apariencia actual para lo que se dibuja en lienzos."""
+        return DARK_THEME if ctk.get_appearance_mode() == "Dark" else LIGHT_THEME
+
+    def scale_of(widget: Any) -> float:
+        """Escala de CustomTkinter; una ventana Tk clásica (aún sin migrar) usa la escala global."""
+        try:
+            return ctk.ScalingTracker.get_widget_scaling(widget)
+        except KeyError:
+            return ctk.ScalingTracker.widget_scaling
+
+    def chart_font(widget: Any, points: int, weight: str = "normal") -> tuple[Any, ...]:
+        """Fuente en píxeles escalados (un lienzo no se escala solo); points sigue la escala de las pantallas ttk."""
+        size = -round(points * 4 / 3 * scale_of(widget))
+        return (FAMILY, size, "bold") if weight != "normal" else (FAMILY, size)
+
+    def wheel_units(event: Any) -> int:
+        if getattr(event, "num", None) in (4, 5):
+            return -1 if event.num == 4 else 1
+        return -int(event.delta / 120) if abs(event.delta) >= 120 else -1 if event.delta > 0 else 1
+
+    scrollbar_updates: set[Any] = set()
+
+    def set_scrollbar(scroll: Any, first: str, last: str, *, autohide: bool = False) -> None:
+        """CTkScrollbar procesa eventos al dibujar: evita actualizaciones anidadas durante cambios de escala."""
+        if scroll in scrollbar_updates:
+            return
+        scrollbar_updates.add(scroll)
+        try:
+            values = (float(first), float(last))
+            if scroll.get() != values:
+                scroll.set(*values)
+            if autohide:
+                needed = values[0] > 0 or values[1] < 1
+                if needed != bool(scroll.winfo_manager()):
+                    scroll.grid() if needed else scroll.grid_remove()
+        finally:
+            scrollbar_updates.remove(scroll)
+
+    def cancel_widget_timers(window: Any) -> None:
+        """Cancela callbacks del árbol de widgets antes de destruir sus comandos Tcl."""
+        names: set[str] = set()
+        pending = [window]
+        while pending:
+            widget = pending.pop()
+            names.update(getattr(widget, "_tclCommands", None) or ())
+            pending.extend(widget.winfo_children())
+        for job in window.tk.call("after", "info"):
+            try:
+                script = str(window.tk.call("after", "info", job)[0])
+            except TclError:
+                continue
+            if any(name in script for name in names):
+                # after_cancel borraría también el comando, que destroy() elimina después.
+                window.tk.call("after", "cancel", job)
+
+    # Lienzos que se vuelven a dibujar al cambiar entre apariencia clara y oscura.
+    canvas_registry: weakref.WeakSet[Any] = weakref.WeakSet()
+
+    class ChartCanvas(ctk.CTkCanvas):
+        """Lienzo de gráfico sobre la superficie; se redibuja al cambiar de tamaño o de apariencia."""
+        def __init__(self, parent: Any, draw: Callable[[Any], Any] | None = None, **options: Any):
+            super().__init__(parent, highlightthickness=0, borderwidth=0, bg=color("surface"), **options)
+            self.draw = draw
+            canvas_registry.add(self)
+            self.bind("<Configure>", lambda _event: self.redraw())
+            for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                self.bind(sequence, self._wheel)
+
+        def _wheel(self, event: Any) -> str | None:
+            axis = "x" if event.state & 0x1 else "y"
+            view = self.xview() if axis == "x" else self.yview()
+            if view[1] - view[0] < 1:
+                command = self.xview_scroll if axis == "x" else self.yview_scroll
+                command(wheel_units(event), "units")
+                return "break"
+            return None
+
+        def redraw(self) -> None:
+            self.configure(bg=color("surface"))
+            if self.draw is not None:
+                self.draw(self)
+
+        def destroy(self) -> None:
+            canvas_registry.discard(self)
+            super().destroy()
+
+    class DataTable(ctk.CTkFrame):
+        """Tabla dibujada en un lienzo: solo las filas visibles, textos recortados con «…» y chips de estado.
+
+        Ofrece el subconjunto de ttk.Treeview que usan las pantallas (insert, delete, item, selection_set…),
+        teclado, rueda del ratón y una ayuda emergente con el texto completo de una celda recortada.
+        """
+        ROW, HEADER, OVERSCAN, PAD = 34, 36, 5, 12
+
+        def __init__(self, parent: Any, columns: tuple[str, ...], *, headings: dict[str, str],
+                     widths: dict[str, int], anchors: dict[str, str] | None = None,
+                     chips: dict[str, Callable[[str], str | None]] | None = None,
+                     row_chips: dict[str, Callable[[str, str], str | None]] | None = None,
+                     tooltips: dict[str, Callable[[str, str], str]] | None = None,
+                     height_rows: int = 12, open_on_click: bool = False, **options: Any):
+            super().__init__(parent, fg_color=T["surface"], border_color=T["line"], border_width=1,
+                             corner_radius=10, **options)
+            self._columns = tuple(columns)
+            self._display = self._columns
+            self._index = {name: position for position, name in enumerate(self._columns)}
+            self._headings = {name: headings.get(name, name) for name in self._columns}
+            self._widths = {name: widths.get(name, 120) for name in self._columns}
+            self._anchors = {name: (anchors or {}).get(name, "w") for name in self._columns}
+            self._chips = dict(chips or {})
+            self._row_chips = dict(row_chips or {})
+            self._tooltips = dict(tooltips or {})
+            self._height_rows = height_rows
+            self.open_on_click = open_on_click
+            self.empty_text = "Sin registros"
+            self._order: list[str] = []
+            self._items: dict[str, dict[str, tuple[Any, ...]]] = {}
+            self._selected: str | None = None
+            self._hover: int | None = None
+            self._pressed: int | None = None
+            self._select_callbacks: list[Callable[[str], Any]] = []
+            self._open_callbacks: list[Callable[[str], Any]] = []
+            self._col_x: list[int] = []
+            self._col_w: list[int] = []
+            self._content_width = 1
+            self._fitted: dict[tuple[str, int, str], str] = {}
+            self._font_scale = 0.0
+            self._pending: str | None = None
+            self._tip_job: str | None = None
+            self._tip_cell: tuple[int, str] | None = None
+            self.tooltip: Any = None
+            self.tooltip_label: Any = None
+            self._counter = 0
+            self.grid_columnconfigure(0, weight=1)
+            # Sin barra vertical, el lienzo deja libre el borde derecho del marco, como el izquierdo.
+            self.grid_columnconfigure(1, minsize=6)
+            self.grid_rowconfigure(1, weight=1)
+            self.header = ctk.CTkCanvas(self, highlightthickness=0, borderwidth=0)
+            self.body = ctk.CTkCanvas(self, highlightthickness=0, borderwidth=0, takefocus=1)
+            self.vbar = ctk.CTkScrollbar(self, orientation="vertical", height=0, command=self.body.yview)
+            self.hbar = ctk.CTkScrollbar(self, orientation="horizontal", width=0, command=self.body.xview)
+            self.header.grid(row=0, column=0, sticky="ew", padx=(6, 0), pady=(6, 0))
+            self.body.grid(row=1, column=0, sticky="nsew", padx=(6, 0), pady=(0, 6))
+            self.vbar.grid(row=1, column=1, sticky="ns", padx=(0, 4), pady=(0, 6))
+            self.hbar.grid(row=2, column=0, sticky="ew", padx=(6, 0), pady=(0, 4))
+            self.vbar.grid_remove()
+            self.hbar.grid_remove()
+            self.body.configure(yscrollcommand=self._yscrolled, xscrollcommand=self._xscrolled)
+            for sequence, handler in (("<Button-1>", self._press), ("<ButtonRelease-1>", self._release),
+                                      ("<Double-Button-1>", self._double), ("<Motion>", self._motion),
+                                      ("<Leave>", self._leave), ("<Key>", self._key),
+                                      ("<Configure>", lambda _event: self._schedule()),
+                                      ("<FocusIn>", lambda _event: self.configure(border_color=T["primary"])),
+                                      ("<FocusOut>", lambda _event: self.configure(border_color=T["line"]))):
+                self.body.bind(sequence, handler)
+            for widget in (self.body, self.header):
+                for sequence in ("<MouseWheel>", "<Shift-MouseWheel>", "<Button-4>", "<Button-5>",
+                                 "<Shift-Button-4>", "<Shift-Button-5>"):
+                    widget.bind(sequence, self._wheel)
+            canvas_registry.add(self)
+            self.redraw()
+
+        # Subconjunto de ttk.Treeview
+        def insert(self, parent: str, index: Any, iid: str | None = None, values: Any = (), tags: Any = (),
+                   **_options: Any) -> str:
+            if parent != "":
+                raise TclError("DataTable no admite filas anidadas")
+            if iid is None:
+                self._counter += 1
+                iid = f"I{self._counter:04d}"
+            if iid in self._items:
+                raise TclError(f"Item {iid} already exists")
+            self._items[iid] = {"values": tuple(values), "tags": tuple(tags)}
+            self._order.insert(len(self._order) if index == "end" else int(index), iid)
+            self._schedule()
+            return iid
+
+        def delete(self, *items: str) -> None:
+            selected = self._selected
+            for iid in items:
+                if iid in self._items:
+                    del self._items[iid]
+                    self._order.remove(iid)
+                    if self._selected == iid:
+                        self._selected = None
+            self._tip_cell = None
+            self._hide_tip()
+            if selected and self._selected is None:
+                self._notify_selection()
+            self._schedule()
+
+        def get_children(self, _item: str = "") -> tuple[str, ...]:
+            return tuple(self._order)
+
+        def exists(self, iid: str) -> bool:
+            return iid in self._items
+
+        def _entry(self, iid: str) -> dict[str, tuple[Any, ...]]:
+            if iid not in self._items:
+                raise TclError(f"Item {iid} not found")
+            return self._items[iid]
+
+        def item(self, iid: str, option: str | None = None, **changes: Any) -> Any:
+            entry = self._entry(iid)
+            if changes:
+                entry.update({name: tuple(value) for name, value in changes.items() if name in ("values", "tags")})
+                self._schedule()
+                return None
+            data = {"text": "", "values": entry["values"], "tags": entry["tags"]}
+            return data if option is None else data[option]
+
+        def selection(self) -> tuple[str, ...]:
+            return (self._selected,) if self._selected else ()
+
+        def selection_set(self, items: Any) -> None:
+            iid = items if isinstance(items, str) else (tuple(items)[0] if items else None)
+            if iid is None:
+                self._selected = None
+                self._draw_rows()
+                self._notify_selection()
+                return
+            self._entry(iid)
+            self._select(iid)
+            self.see(iid)
+
+        def focus(self, item: str | None = None) -> str | None:
+            if item is None:
+                return self._selected or ""
+            self._entry(item)
+            self._selected = item
+            self._draw_rows()
+            return None
+
+        def see(self, iid: str) -> None:
+            self._flush()
+            index, row = self._order.index(iid), self._row_h()
+            total = max(len(self._order) * row, 1)
+            top, height = self.body.canvasy(0), max(self.body.winfo_height(), row)
+            if index * row < top:
+                self.body.yview_moveto(index * row / total)
+            elif (index + 1) * row > top + height:
+                self.body.yview_moveto(((index + 1) * row - height) / total)
+
+        def identify_row(self, y: int) -> str:
+            self._flush()
+            index = self._row_at(y)
+            return self._order[index] if index is not None else ""
+
+        def bbox(self, iid: str, column: str | None = None) -> tuple[int, int, int, int] | str:
+            self._flush()
+            index, row = self._order.index(iid), self._row_h()
+            y = index * row - round(self.body.canvasy(0))
+            if y + row <= 0 or y >= self.body.winfo_height():
+                return ""
+            if column is None:
+                return (-round(self.body.canvasx(0)), y, self._content_width, row)
+            position = self._display.index(column)
+            return (self._col_x[position] - round(self.body.canvasx(0)), y, self._col_w[position], row)
+
+        def heading(self, column: str, option: str | None = None, text: str | None = None, **_options: Any) -> Any:
+            if text is not None:
+                self._headings[column] = text
+                self._schedule()
+                return None
+            data = {"text": self._headings[column]}
+            return data if option is None else data[option]
+
+        def column(self, column: str, option: str | None = None, width: int | None = None,
+                   anchor: str | None = None, **_options: Any) -> Any:
+            if width is not None or anchor is not None:
+                if width is not None:
+                    self._widths[column] = width
+                if anchor is not None:
+                    self._anchors[column] = anchor
+                self._schedule()
+                return None
+            data = {"width": self._widths[column], "anchor": self._anchors[column]}
+            return data if option is None else data[option]
+
+        def tag_configure(self, *_args: Any, **_options: Any) -> None:
+            """Las franjas alternas son automáticas; se acepta por compatibilidad con Treeview."""
+
+        def configure(self, require_redraw: bool = False, **options: Any) -> None:
+            if "displaycolumns" in options:
+                shown = options.pop("displaycolumns")
+                self._display = self._columns if tuple(shown) in (("#all",), ("#", "a", "l", "l")) \
+                    else tuple(shown)
+                self._schedule()
+            if options or require_redraw:
+                super().configure(require_redraw=require_redraw, **options)
+
+        def cget(self, attribute: str) -> Any:
+            if attribute == "displaycolumns":
+                return self._display
+            if attribute == "columns":
+                return self._columns
+            return super().cget(attribute)
+
+        def __getitem__(self, attribute: str) -> Any:
+            return self.cget(attribute)
+
+        # Selección y apertura
+        def on_select(self, callback: Callable[[str], Any]) -> None:
+            self._select_callbacks.append(callback)
+
+        def on_open(self, callback: Callable[[str], Any]) -> None:
+            self._open_callbacks.append(callback)
+
+        def click_row(self, iid: str, double: bool = False) -> None:
+            self._select(iid)
+            if double or self.open_on_click:
+                self._open(iid)
+
+        def column_width(self, column: str) -> int:
+            self._flush()
+            return self._col_w[self._display.index(column)]
+
+        def _select(self, iid: str) -> None:
+            changed = iid != self._selected
+            self._selected = iid
+            self._draw_rows()
+            if changed:
+                self._notify_selection()
+
+        def _notify_selection(self) -> None:
+            for callback in self._select_callbacks:
+                callback(self._selected or "")
+            if self.winfo_exists():
+                self.body.event_generate("<<TreeviewSelect>>")
+
+        def _open(self, iid: str) -> None:
+            for callback in self._open_callbacks:
+                callback(iid)
+            if self.winfo_exists():
+                self.body.event_generate("<<TableOpen>>")
+
+        # Dibujo
+        def _scale(self) -> float:
+            return scale_of(self)
+
+        def _row_h(self) -> int:
+            return round(self.ROW * self._scale())
+
+        def _schedule(self) -> None:
+            if self._pending is None and self.winfo_exists():
+                self._pending = self.after_idle(self.redraw)
+
+        def _flush(self) -> None:
+            if self._pending is not None:
+                self.after_cancel(self._pending)
+                self.redraw()
+
+        def redraw(self) -> None:
+            self._pending = None
+            scale = self._scale()
+            if scale != self._font_scale:
+                self._font_scale = scale
+                self._fitted.clear()
+                self._font = tkfont.Font(root=self, family=FAMILY, size=-round(12 * scale))
+                self._head_font = tkfont.Font(root=self, family=FAMILY, size=-round(12 * scale), weight="bold")
+                self._chip_font = tkfont.Font(root=self, family=FAMILY, size=-round(11 * scale))
+                row = self._row_h()
+                self.header.configure(height=round(self.HEADER * scale))
+                self.body.configure(height=self._height_rows * row, yscrollincrement=row)
+            for canvas in (self.header, self.body):
+                canvas.configure(bg=color("surface"))
+            self._layout()
+            self._draw_header()
+            self._draw_rows()
+
+        def _layout(self) -> None:
+            scale = self._scale()
+            available = max(1, self.body.winfo_width())
+            base = [max(1, round(self._widths[name] * scale)) for name in self._display]
+            total = sum(base)
+            widths = base
+            if base and total < available:
+                widths = [width + (available - total) * width // total for width in base]
+                widths[-1] += available - sum(widths)
+            self._col_x, self._col_w, left = [], [], 0
+            for width in widths:
+                self._col_x.append(left)
+                self._col_w.append(width)
+                left += width
+            self._content_width = max(left, 1)
+            height = max(len(self._order) * self._row_h(), 1)
+            self.body.configure(scrollregion=(0, 0, self._content_width, height))
+            self.header.configure(scrollregion=(0, 0, self._content_width, round(self.HEADER * scale)))
+
+        def _fit(self, text: str, width: int, font: Any) -> str:
+            key = (text, width, str(font))
+            if key not in self._fitted:
+                if len(self._fitted) > 20000:
+                    self._fitted.clear()
+                if width <= 0:
+                    fitted = ""
+                elif font.measure(text) <= width:
+                    fitted = text
+                else:
+                    low, high = 0, len(text)
+                    while low < high:
+                        middle = (low + high + 1) // 2
+                        if font.measure(text[:middle] + "…") <= width:
+                            low = middle
+                        else:
+                            high = middle - 1
+                    fitted = text[:low].rstrip() + "…"
+                self._fitted[key] = fitted
+            return self._fitted[key]
+
+        def _cell_text(self, index: int, column: str) -> str:
+            values = self._items[self._order[index]]["values"]
+            position = self._index[column]
+            return " ".join(str(values[position]).split()) if position < len(values) else ""
+
+        def cell_tone(self, iid: str, column: str) -> str | None:
+            values = self._entry(iid)["values"]
+            text = str(values[self._index[column]]) if self._index[column] < len(values) else ""
+            if column in self._row_chips:
+                return self._row_chips[column](iid, text)
+            return self._chips[column](text) if column in self._chips and text else None
+
+        def cell_tooltip(self, iid: str, column: str) -> str:
+            values = self._entry(iid)["values"]
+            text = str(values[self._index[column]]) if self._index[column] < len(values) else ""
+            return self._tooltips[column](iid, text) if column in self._tooltips else ""
+
+        def _draw_header(self) -> None:
+            scale, canvas = self._scale(), self.header
+            canvas.delete("all")
+            height, pad = round(self.HEADER * scale), round(self.PAD * scale)
+            canvas.create_line(0, height - 1, self._content_width, height - 1, fill=color("line"))
+            for name, left, width in zip(self._display, self._col_x, self._col_w):
+                anchor = self._anchors[name]
+                x = left + pad if anchor == "w" else left + width - pad
+                canvas.create_text(x, height // 2, text=self._fit(self._headings[name], width - 2 * pad, self._head_font),
+                                   anchor=anchor, font=self._head_font, fill=color("muted"))
+
+        def _draw_rows(self) -> None:
+            canvas, scale, row = self.body, self._scale(), self._row_h()
+            canvas.delete("row", "empty")
+            if not self._order:
+                canvas.create_text(max(canvas.winfo_width(), 1) // 2, round(row * 1.5), text=self.empty_text,
+                                   font=self._font, fill=color("muted"), tags=("empty",))
+                return
+            top = canvas.canvasy(0)
+            height = max(canvas.winfo_height(), row)
+            first = max(0, int(top // row) - self.OVERSCAN)
+            last = min(len(self._order), int((top + height) // row) + 1 + self.OVERSCAN)
+            pad, chip_height, chip_pad = round(self.PAD * scale), round(22 * scale), round(8 * scale)
+            for index in range(first, last):
+                iid, y = self._order[index], index * row
+                fill = ("primary_soft" if iid == self._selected else "hover" if index == self._hover
+                        else "stripe" if index % 2 else "surface")
+                canvas.create_rectangle(0, y, self._content_width, y + row, fill=color(fill), outline="", tags=("row",))
+                if iid == self._selected:
+                    canvas.create_rectangle(0, y, round(3 * scale), y + row, fill=color("primary"), outline="",
+                                            tags=("row",))
+                for name, left, width in zip(self._display, self._col_x, self._col_w):
+                    text, anchor = self._cell_text(index, name), self._anchors[name]
+                    tone = self.cell_tone(iid, name)
+                    if tone:
+                        label = self._fit(text, width - 2 * pad - 2 * chip_pad, self._chip_font)
+                        pill = self._chip_font.measure(label) + 2 * chip_pad
+                        x1 = left + pad if anchor == "w" else left + width - pad - pill
+                        y1 = y + (row - chip_height) / 2
+                        backdrop = color("surface") if iid == self._selected else appearance(soft(tone))
+                        self._pill(x1, y1, x1 + pill, y1 + chip_height, backdrop)
+                        canvas.create_text(x1 + pill / 2, y + row / 2, text=label, font=self._chip_font,
+                                           fill=color(tone), tags=("row", "chip_text"))
+                    else:
+                        x = left + pad if anchor == "w" else left + width - pad
+                        canvas.create_text(x, y + row / 2, text=self._fit(text, width - 2 * pad, self._font),
+                                           anchor=anchor, font=self._font, fill=color("ink"), tags=("row", "cell"))
+
+        def _pill(self, x1: float, y1: float, x2: float, y2: float, fill: str) -> None:
+            radius = (y2 - y1) / 2
+            points = (x1 + radius, y1, x2 - radius, y1, x2, y1, x2, y1 + radius, x2, y2 - radius, x2, y2,
+                      x2 - radius, y2, x1 + radius, y2, x1, y2, x1, y2 - radius, x1, y1 + radius, x1, y1)
+            self.body.create_polygon(points, smooth=True, fill=fill, outline="", tags=("row", "chip"))
+
+        # Desplazamiento
+        def _yscrolled(self, first: str, last: str) -> None:
+            set_scrollbar(self.vbar, first, last)
+            needed = len(self._order) * self._row_h() > self.body.winfo_height()
+            if needed != bool(self.vbar.winfo_manager()):
+                self.vbar.grid() if needed else self.vbar.grid_remove()
+            self._draw_rows()
+
+        def _xscrolled(self, first: str, last: str) -> None:
+            set_scrollbar(self.hbar, first, last)
+            # Las columnas se expanden al ancho disponible. Ese ancho anterior puede quedar obsoleto
+            # al aparecer la barra vertical: decide por los mínimos, no por el scrollregion transitorio.
+            minimum = sum(round(self._widths[name] * self._scale()) for name in self._display)
+            needed = minimum > self.body.winfo_width()
+            if needed != bool(self.hbar.winfo_manager()):
+                self.hbar.grid() if needed else self.hbar.grid_remove()
+            self.header.xview_moveto(self.body.xview()[0])
+
+        def _wheel(self, event: Any) -> str:
+            step = -3 if getattr(event, "num", None) == 4 else 3 if getattr(event, "num", None) == 5 else (
+                -3 if event.delta > 0 else 3)
+            if event.state & 0x1:
+                self.body.xview_scroll(step, "units")
+            else:
+                self.body.yview_scroll(step, "units")
+            return "break"
+
+        # Ratón y teclado
+        def _row_at(self, y: int) -> int | None:
+            index = int(self.body.canvasy(y) // self._row_h())
+            return index if 0 <= index < len(self._order) else None
+
+        def _column_at(self, x: int) -> str | None:
+            position = self.body.canvasx(x)
+            return next((name for name, left, width in zip(self._display, self._col_x, self._col_w)
+                         if left <= position < left + width), None)
+
+        def _press(self, event: Any) -> None:
+            self.body.focus_set()
+            self._pressed = self._row_at(event.y)
+            if self._pressed is not None:
+                self._select(self._order[self._pressed])
+
+        def _release(self, event: Any) -> None:
+            index = self._row_at(event.y)
+            if self.open_on_click and index is not None and index == self._pressed:
+                self._open(self._order[index])
+            self._pressed = None
+
+        def _double(self, event: Any) -> None:
+            index = self._row_at(event.y)
+            if index is not None and not self.open_on_click:
+                self._open(self._order[index])
+
+        def _key(self, event: Any) -> str | None:
+            if not self._order:
+                return None
+            if event.keysym in ("Return", "KP_Enter"):
+                if self._selected:
+                    self._open(self._selected)
+                return "break"
+            index = self._order.index(self._selected) if self._selected in self._items else -1
+            page = max(1, self.body.winfo_height() // self._row_h() - 1)
+            target = {"Up": index - 1, "Down": index + 1, "Home": 0, "End": len(self._order) - 1,
+                      "Prior": index - page, "Next": index + page}.get(event.keysym)
+            if target is None:
+                return None
+            iid = self._order[max(0, min(len(self._order) - 1, target))]
+            self._select(iid)
+            self.see(iid)
+            return "break"
+
+        def _motion(self, event: Any) -> None:
+            index = self._row_at(event.y)
+            if index != self._hover:
+                self._hover = index
+                self._draw_rows()
+            column = self._column_at(event.x)
+            cell = (index, column) if index is not None and column else None
+            if cell == self._tip_cell:
+                return
+            self._hide_tip()
+            self._tip_cell = cell
+            if cell:
+                text = self._cell_text(*cell)
+                hint = self.cell_tooltip(self._order[index], column)
+                width = self._col_w[self._display.index(column)] - 2 * round(self.PAD * self._scale())
+                if hint or self._fit(text, width, self._font) != text:
+                    self._tip_job = self.after(600, lambda: self._show_tip(hint or text))
+
+        def _leave(self, _event: Any) -> None:
+            self._hover = None
+            self._tip_cell = None
+            self._hide_tip()
+            self._draw_rows()
+
+        def _show_tip(self, text: str) -> None:
+            self._tip_job = None
+            tip = ctk.CTkToplevel(self)
+            tip.withdraw()
+            tip.overrideredirect(True)
+            label = ctk.CTkLabel(tip, text=text, wraplength=480, justify="left", font=FONTS["small"],
+                                 fg_color=T["ink"], text_color=T["surface"], corner_radius=6, padx=10, pady=6)
+            label.pack()
+            tip.geometry(f"+{self.winfo_pointerx() + 14}+{self.winfo_pointery() + 18}")
+            tip.deiconify()
+            tip.lift()
+            self.tooltip, self.tooltip_label = tip, label
+
+        def _hide_tip(self) -> None:
+            if self._tip_job:
+                self.after_cancel(self._tip_job)
+                self._tip_job = None
+            if self.tooltip is not None:
+                self.tooltip.destroy()
+                self.tooltip = self.tooltip_label = None
+
+        def destroy(self) -> None:
+            canvas_registry.discard(self)
+            if self._pending is not None:
+                self.after_cancel(self._pending)
+                self._pending = None
+            self._hide_tip()
+            super().destroy()
+
+    INDICATOR_TERMS = ("Nc.Top", "Nc.A", "Nc.B", "AP", "DPC", "Fr.A", "Fr.B", "Cohe", "Coop")
+
+    def draw_indicator(canvas: Any, result: dict[str, Any] | None) -> None:
+        """Una barra por término: el fondo es el coeficiente (máximo posible) y el relleno, el aporte."""
+        canvas.delete("all")
+        if not result:
+            return
+        c, scale = palette(), scale_of(canvas)
+
+        def px(value: float) -> int:
+            return round(value * scale)
+        width = max(px(360), canvas.winfo_width())
+        left, right = px(96), width - px(64)
+        terms = [*result["clases"], result["cohesion"], result["cooperacion"]]
+        unit = (right - left) / max(term["coeficiente"] for term in terms)
+        canvas.create_text(0, 0, anchor="nw", width=width, font=chart_font(canvas, 9), fill=c["muted"],
+                           text="Aporte al indicador · la barra gris es el peso máximo de cada término")
+        for index, (label, term) in enumerate(zip(INDICATOR_TERMS, terms)):
+            y = px(36) + index * px(24)
+            canvas.create_text(0, y, anchor="w", text=f"{label} · {decimal(term['coeficiente'])}",
+                               font=chart_font(canvas, 9), fill=c["ink"])
+            canvas.create_rectangle(left, y - px(5), left + term["coeficiente"] * unit, y + px(5),
+                                    fill=c["chart_track"], outline="", tags=("indicator:track",))
+            if term["aporte"] > 0:
+                canvas.create_rectangle(left, y - px(5), left + max(px(2), term["aporte"] * unit), y + px(5),
+                                        fill=c["primary"], outline="", tags=("indicator:fill",))
+            canvas.create_text(right + px(10), y, anchor="w", text=decimal(term["aporte"], 3),
+                               font=chart_font(canvas, 9), fill=c["muted"])
+
+    CLASS_TONES = {"TOP": "class_top", "A": "class_a", "B": "class_b", "ASC": "class_asc", "DPC": "class_dpc",
+                   "FRH_A": "class_frh_a", "FRH_B": "class_frh_b"}
+    CLASS_LABELS = {"TOP": "Nuevo conocimiento TOP", "A": "Nuevo conocimiento A", "B": "Nuevo conocimiento B",
+                    "ASC": "Apropiación social", "DPC": "Divulgación pública", "FRH_A": "Formación RH A",
+                    "FRH_B": "Formación RH B"}
+
+    def class_counts(categories: dict[str, int]) -> dict[str, int]:
+        """Productos por clase del modelo a partir del conteo por código de categoría."""
+        counts: dict[str, int] = {}
+        for code, count in categories.items():
+            category = catalog_by_code.get(code)
+            name = category["clase"] if category else "Sin categoría"
+            counts[name] = counts.get(name, 0) + count
+        return {name: counts[name] for name in (*MODEL_CLASSES, "Sin categoría") if counts.get(name)}
+
+    def class_color(name: str) -> str:
+        return color(CLASS_TONES.get(name, "class_none"))
+
+    def text_on(fill: str) -> str:
+        """Tinta legible sobre un relleno: blanca sobre los colores oscuros."""
+        red, green, blue = (int(fill[index:index + 2], 16) for index in (1, 3, 5))
+        return "#ffffff" if 0.299 * red + 0.587 * green + 0.114 * blue < 150 else LIGHT_THEME["ink"]
+
+    def percent(part: int, total: int) -> str:
+        return decimal(100 * part / total, 1) + " %" if total else "0 %"
+
+    def chart_start(canvas: Any, title: str, subtitle: str = "") -> tuple[dict[str, str], Callable[[float], int], int, int]:
+        """Limpia el lienzo, escribe título y subtítulo; devuelve colores, escala, ancho y alto."""
+        canvas.delete("all")
+        c, scale = palette(), scale_of(canvas)
+
+        def px(value: float) -> int:
+            return round(value * scale)
+        canvas.create_text(px(12), px(14), anchor="w", text=title, font=chart_font(canvas, 10, "strong"), fill=c["ink"])
+        if subtitle:
+            canvas.create_text(px(12), px(34), anchor="w", text=subtitle, font=chart_font(canvas, 9), fill=c["muted"])
+        return c, px, max(canvas.winfo_width(), px(320)), max(canvas.winfo_height(), px(200))
+
+    def chart_empty(canvas: Any, text: str, width: int, height: int) -> None:
+        scale = scale_of(canvas)
+        canvas.create_text(round(12 * scale), round(80 * scale), anchor="w", text=text, font=chart_font(canvas, 10),
+                           fill=palette()["muted"])
+        canvas.configure(scrollregion=(0, 0, width, height))
+
+    def draw_donut(canvas: Any, title: str, subtitle: str, items: list[tuple[str, str, int, str]], caption: str,
+                   empty: str = "Sin productos para estos filtros") -> None:
+        """Anillo: una porción por elemento (clave, rótulo, cantidad, color) y su leyenda a la derecha."""
+        c, px, width, height = chart_start(canvas, title, subtitle)
+        items = [item for item in items if item[2] > 0]
+        total = sum(item[2] for item in items)
+        if not total:
+            chart_empty(canvas, empty, width, height)
+            return
+        top = px(54)
+        size = max(px(120), min(height - top - px(14), round(width * 0.42), px(250)))
+        # En lienzos anchos, el anillo y su leyenda (hasta 440 px) quedan centrados.
+        x0 = max(px(18), (width - size - px(30) - px(440)) // 2)
+        y0 = top + max(0, (height - top - px(14) - size) // 2)
+        start = 90.0
+        for key, _label, count, fill in items:
+            tags = ("donut:slice", f"slice:{key}", f"count:{count}")
+            if len(items) == 1:
+                canvas.create_oval(x0, y0, x0 + size, y0 + size, fill=fill, outline="", tags=tags)
+                break
+            extent = -360 * count / total
+            canvas.create_arc(x0, y0, x0 + size, y0 + size, start=start, extent=extent, style="pieslice", fill=fill,
+                              outline=c["surface"], width=max(1, px(2)), tags=tags)
+            start += extent
+        inset = size * 0.2
+        canvas.create_oval(x0 + inset, y0 + inset, x0 + size - inset, y0 + size - inset, fill=c["surface"], outline="")
+        middle_x, middle_y = x0 + size / 2, y0 + size / 2
+        canvas.create_text(middle_x, middle_y - px(8), text=number(total), font=chart_font(canvas, 16, "strong"),
+                           fill=c["ink"])
+        canvas.create_text(middle_x, middle_y + px(14), text=caption, font=chart_font(canvas, 8), fill=c["muted"])
+        left = x0 + size + px(30)
+        right = min(width - px(14), left + px(440))
+        # Con poco espacio la leyenda muestra solo la clave (por ejemplo «DPC»).
+        full = right - left >= px(300)
+        row = max(px(18), min(px(28), (height - top - px(8)) // len(items)))
+        y = y0 + max(row / 2, (size - row * (len(items) - 1)) / 2)
+        for key, label, count, fill in items:
+            canvas.create_oval(left, y - px(5), left + px(10), y + px(5), fill=fill, outline="")
+            canvas.create_text(left + px(18), y, anchor="w", text=label if full else key, font=chart_font(canvas, 9),
+                               fill=c["ink"])
+            canvas.create_text(right, y, anchor="e", text=f"{number(count)} · {percent(count, total)}",
+                               font=chart_font(canvas, 8), fill=c["muted"])
+            y += row
+        canvas.configure(scrollregion=(0, 0, width, max(height, round(y - row / 2 + px(8)))))
+
+    def squarify(values: list[float], x: float, y: float, width: float, height: float) -> list[tuple[float, ...]]:
+        """Mosaico «squarified» (Bruls et al.): rectángulos casi cuadrados con área proporcional al valor."""
+        total = sum(values)
+        areas = [value * width * height / total for value in values]
+        rectangles: list[tuple[float, ...]] = []
+
+        def worst(row: list[float], side: float) -> float:
+            size = sum(row)
+            return max(max(side * side * area / (size * size), size * size / (side * side * area)) for area in row)
+        while areas:
+            side = max(min(width, height), 1e-9)
+            row = [areas[0]]
+            while len(row) < len(areas) and worst(row + [areas[len(row)]], side) <= worst(row, side):
+                row.append(areas[len(row)])
+            size = sum(row)
+            if width >= height:
+                column = size / max(height, 1e-9)
+                top = y
+                for area in row:
+                    rectangles.append((x, top, column, area / max(column, 1e-9)))
+                    top += area / max(column, 1e-9)
+                x, width = x + column, width - column
+            else:
+                band = size / max(width, 1e-9)
+                left = x
+                for area in row:
+                    rectangles.append((left, y, area / max(band, 1e-9), band))
+                    left += area / max(band, 1e-9)
+                y, height = y + band, height - band
+            areas = areas[len(row):]
+        return rectangles
+
+    def draw_treemap(canvas: Any, title: str, subtitle: str, items: list[tuple[str, int, str]], limit: int = 30,
+                     empty: str = "Sin productos para estos filtros") -> None:
+        """Mosaico: un rectángulo por elemento (rótulo, cantidad, color) con área proporcional a la cantidad."""
+        c, px, width, height = chart_start(canvas, title, subtitle)
+        items = sorted((item for item in items if item[1] > 0), key=lambda item: (-item[1], item[0]))
+        if not items:
+            chart_empty(canvas, empty, width, height)
+            return
+        if len(items) > limit:
+            rest = items[limit - 1:]
+            items = items[:limit - 1] + [(f"Otras {len(rest)}", sum(item[1] for item in rest), c["class_none"])]
+        total = sum(item[1] for item in items)
+        legend = [name for name in (*MODEL_CLASSES, "Sin categoría")
+                  if any(fill == class_color(name) for _label, _count, fill in items)]
+        x = px(12)
+        for name in legend:
+            canvas.create_rectangle(x, px(52), x + px(10), px(62), fill=class_color(name), outline="")
+            label = canvas.create_text(x + px(14), px(57), anchor="w", text=name, font=chart_font(canvas, 8),
+                                       fill=c["muted"])
+            x = canvas.bbox(label)[2] + px(14)
+        top = px(72) if legend else px(52)
+        cells = squarify([float(item[1]) for item in items], px(12), top, width - px(24), height - top - px(12))
+        for (label, count, fill), (left, cell_top, cell_width, cell_height) in zip(items, cells):
+            canvas.create_rectangle(left, cell_top, left + cell_width, cell_top + cell_height, fill=fill,
+                                    outline=c["surface"], width=max(1, px(2)),
+                                    tags=("treemap:cell", f"cell:{label}", f"count:{count}"))
+            # Cada rótulo aparece solo si cabe entero en su celda.
+            ink, bottom = text_on(fill), cell_top + px(6)
+            for text, font in ((label, chart_font(canvas, 9, "strong")),
+                               (f"{number(count)} · {percent(count, total)}", chart_font(canvas, 8))):
+                item = canvas.create_text(left + px(7), bottom, anchor="nw", text=text, font=font, fill=ink)
+                box = canvas.bbox(item)
+                if box[2] > left + cell_width - px(3) or box[3] > cell_top + cell_height - px(3):
+                    canvas.delete(item)
+                    break
+                bottom = box[3] + px(1)
+        canvas.configure(scrollregion=(0, 0, width, height))
+
+    def draw_trend(canvas: Any, values: dict[str, int], bounds: tuple[int | None, int | None] = (None, None)) -> None:
+        """Línea de productos por año (área bajo la curva) y su media móvil de tres años."""
+        numeric = {int(key): value for key, value in values.items() if key.isdigit()}
+        missing = values.get("Sin dato", 0)
+        first = bounds[0] if bounds[0] is not None else min(numeric, default=0)
+        last = bounds[1] if bounds[1] is not None else max(numeric, default=0)
+        cutoff = date.today().year - 20
+        older = sum(count for year, count in numeric.items() if first <= year <= min(cutoff, last))
+        years = list(range(max(first, cutoff + 1), last + 1))
+        notes = [f"{number(sum(values.values()))} productos", f"{number(missing)} sin año"]
+        if older:
+            notes.append(f"{number(older)} de {cutoff} o antes (fuera de la línea)")
+        c, px, width, height = chart_start(canvas, "Tendencia anual · productos por año", " · ".join(notes))
+        if len(years) < 2:
+            chart_empty(canvas, "Se necesitan al menos dos años para trazar la tendencia", width, height)
+            return
+        counts = [numeric.get(year, 0) for year in years]
+        average = [sum(counts[max(0, index - 2):index + 1]) / len(counts[max(0, index - 2):index + 1])
+                   for index in range(len(counts))]
+        left, right, top, bottom = px(48), width - px(18), px(88), height - px(36)
+        maximum = max(1, max(counts))
+        for tick in sorted({round(maximum * step / 4) for step in range(5)}):
+            y = bottom - (bottom - top) * tick / maximum
+            canvas.create_line(left, y, right, y, fill=c["chart_grid"] if tick else c["line_strong"])
+            canvas.create_text(left - px(8), y, anchor="e", text=number(tick), font=chart_font(canvas, 8), fill=c["muted"])
+        step = (right - left) / (len(years) - 1)
+        points = [(left + index * step, bottom - (bottom - top) * count / maximum) for index, count in enumerate(counts)]
+        canvas.create_polygon(left, bottom, *[value for point in points for value in point], right, bottom,
+                              fill=appearance(soft("primary")), outline="", tags=("trend:area",))
+        canvas.create_line(*[value for point in points for value in point], fill=c["primary"], width=max(2, px(2.5)),
+                           smooth=False, tags=("trend:line",))
+        canvas.create_line(*[value for index, mean in enumerate(average)
+                             for value in (left + index * step, bottom - (bottom - top) * mean / maximum)],
+                           fill=c["pending"], width=max(1, px(2)), dash=(6, 4), tags=("trend:average",))
+        label_every = max(1, math.ceil(px(40) / step))
+        for index, ((x, y), year, count) in enumerate(zip(points, years, counts)):
+            radius = px(3.5)
+            canvas.create_oval(x - radius, y - radius, x + radius, y + radius, fill=c["surface"], outline=c["primary"],
+                               width=max(1, px(2)), tags=("trend:point", f"year:{year}", f"count:{count}"))
+            if index % label_every == 0 or index == len(years) - 1:
+                canvas.create_text(x, bottom + px(16), text=str(year), font=chart_font(canvas, 8), fill=c["muted"])
+        peak = max(range(len(counts)), key=counts.__getitem__)
+        if counts[peak]:
+            canvas.create_text(points[peak][0], points[peak][1] - px(12), text=f"máx. {number(counts[peak])}",
+                               font=chart_font(canvas, 8, "strong"), fill=c["ink"])
+        legend_x = width - px(14)
+        for text, fill, dash in (("Media móvil 3 años", c["pending"], (6, 4)), ("Productos del año", c["primary"], None)):
+            label = canvas.create_text(legend_x, px(56), anchor="e", text=text, font=chart_font(canvas, 8), fill=c["muted"])
+            box = canvas.bbox(label)
+            canvas.create_line(box[0] - px(26), px(56), box[0] - px(6), px(56), fill=fill, width=max(2, px(2)), dash=dash)
+            legend_x = box[0] - px(40)
+        canvas.configure(scrollregion=(0, 0, width, height))
+
+    def draw_gauge(canvas: Any, value: float | None, left: int, top: int, size: int) -> None:
+        """Semicírculo de 0 a 10 con el valor del indicador en el centro."""
+        c, scale = palette(), scale_of(canvas)
+        ring = max(4, round(size * 0.12))
+        box = (left + ring / 2, top + ring / 2, left + size - ring / 2, top + size - ring / 2)
+        canvas.create_arc(*box, start=180, extent=-180, style="arc", outline=c["chart_track"], width=ring,
+                          tags=("gauge:track",))
+        if value is None:
+            return
+        canvas.create_arc(*box, start=180, extent=-180 * min(max(value, 0), 10) / 10, style="arc", outline=c["primary"],
+                          width=ring, tags=("gauge:value",))
+        middle, points = left + size / 2, max(12, round(size / scale / 9))
+        canvas.create_text(middle, top + size * 0.34, text=decimal(value, 2), font=chart_font(canvas, points, "strong"),
+                           fill=c["ink"])
+        canvas.create_text(middle, top + size * 0.34 + round(points * 1.6 * scale), text="de 10",
+                           font=chart_font(canvas, 8), fill=c["muted"])
+        for mark, anchor in ((0, "n"), (10, "n")):
+            canvas.create_text(left + ring / 2 if mark == 0 else left + size - ring / 2, top + size / 2 + round(6 * scale),
+                               anchor=anchor, text=str(mark), font=chart_font(canvas, 8), fill=c["muted"])
+
+    def draw_radar(canvas: Any, result: dict[str, Any], middle_x: float, middle_y: float, radius: float) -> None:
+        """Radar de los nueve términos: índice relativo (aporte / coeficiente) de 0 a 1 en cada eje."""
+        c = palette()
+        terms = [*result["clases"], result["cohesion"], result["cooperacion"]]
+        angles = [math.pi / 2 - 2 * math.pi * index / len(terms) for index in range(len(terms))]
+
+        def point(angle: float, fraction: float) -> tuple[float, float]:
+            return middle_x + radius * fraction * math.cos(angle), middle_y - radius * fraction * math.sin(angle)
+        for fraction in (0.25, 0.5, 0.75, 1):
+            canvas.create_polygon(*[value for angle in angles for value in point(angle, fraction)],
+                                  fill="", outline=c["chart_grid"] if fraction < 1 else c["line_strong"])
+        for angle, label in zip(angles, INDICATOR_TERMS):
+            canvas.create_line(middle_x, middle_y, *point(angle, 1), fill=c["chart_grid"], tags=("radar:axis",))
+            x, y = point(angle, 1.16)
+            canvas.create_text(x, y, text=label, font=chart_font(canvas, 8), fill=c["muted"],
+                               anchor="center" if abs(math.cos(angle)) < 0.3 else "w" if math.cos(angle) > 0 else "e")
+        values = [min(1.0, term["aporte"] / term["coeficiente"]) if term["coeficiente"] else 0.0 for term in terms]
+        shape = [value for angle, fraction in zip(angles, values) for value in point(angle, fraction)]
+        canvas.create_polygon(*shape, fill=appearance(soft("primary")), outline=c["primary"],
+                              width=max(1, round(2 * scale_of(canvas))), tags=("radar:value",))
+        for index in range(0, len(shape), 2):
+            canvas.create_oval(shape[index] - 3, shape[index + 1] - 3, shape[index] + 3, shape[index + 1] + 3,
+                               fill=c["primary"], outline="")
+
+    def draw_indicator_profile(canvas: Any, result: dict[str, Any] | None) -> None:
+        """Valor del indicador en un semicírculo y perfil de sus términos en un radar."""
+        c, px, width, height = chart_start(canvas, "Perfil del indicador",
+                                           "Semicírculo: valor de 0 a 10 · radar: índice relativo de cada término (0 a 1)")
+        if result is None:
+            chart_empty(canvas, "Seleccione un grupo o investigador activo en los filtros del Dashboard para ver su indicador.",
+                        width, height)
+            return
+        size = min(px(240), max(px(150), round(width * 0.3)))
+        draw_gauge(canvas, result["indicador"], px(24), px(64), size)
+        canvas.create_text(px(24) + size / 2, px(64) + size / 2 + px(30), text=f"Corte {result['corte']}",
+                           font=chart_font(canvas, 9), fill=c["muted"])
+        radius = max(px(60), min((height - px(110)) / 2, (width - size - px(140)) / 2.6))
+        draw_radar(canvas, result, px(24) + size + (width - size - px(24)) / 2, px(56) + (height - px(56)) / 2, radius)
+        canvas.configure(scrollregion=(0, 0, width, height))
+
+    class IndicatorPanel(Card):
+        """Indicador de producción: valor sobre 10, contexto en chips y una barra por término de la fórmula."""
+        def __init__(self, parent: Any, on_details: Callable[[], Any], pack_options: dict[str, Any] | None = None,
+                     **options: Any):
+            super().__init__(parent, **options)
+            self._pack_options = pack_options or {"fill": "x"}
+            self.result: dict[str, Any] | None = None
+            self.value = ctk.StringVar(master=self, value="")
+            self.note = ctk.StringVar(master=self, value="")
+            self.body.grid_columnconfigure(1, weight=1)
+            summary = ctk.CTkFrame(self.body, fg_color="transparent")
+            summary.grid(row=0, column=0, sticky="nw", padx=(0, 28))
+            ctk.CTkLabel(summary, text="INDICADOR DE PRODUCCIÓN · MINCIENCIAS 2024", font=FONTS["caption"],
+                         text_color=T["muted"], anchor="w").pack(anchor="w")
+            # El valor (sobre 10) se dibuja en el semicírculo; value conserva el texto para quien lo consulte.
+            self.gauge = ChartCanvas(summary, draw=self._draw_gauge, width=round(220 * scale_of(parent)),
+                                     height=round(136 * scale_of(parent)))
+            self.gauge.pack(anchor="w", pady=(6, 4))
+            self.entity = ctk.CTkLabel(summary, text="", font=FONTS["h2"], text_color=T["ink"], anchor="w",
+                                       justify="left", wraplength=300)
+            self.entity.pack(anchor="w", pady=(0, 10))
+            chips = ctk.CTkFrame(summary, fg_color="transparent")
+            chips.pack(anchor="w")
+            self.chips = [Chip(chips, "", "muted") for _ in range(4)]
+            for index, chip in enumerate(self.chips):
+                chip.grid(row=index // 2, column=index % 2, sticky="w", padx=(0, 6), pady=(0, 6))
+            ctk.CTkLabel(summary, textvariable=self.note, font=FONTS["caption"], text_color=T["muted"], anchor="w",
+                         justify="left", wraplength=300).pack(anchor="w", pady=(2, 12))
+            self.details_button = button(summary, "Detalle por subtipo", on_details)
+            self.details_button.pack(anchor="w")
+            self.canvas = ChartCanvas(self.body, draw=lambda canvas: draw_indicator(canvas, self.result),
+                                      height=round(250 * scale_of(parent)), width=360)
+            self.canvas.grid(row=0, column=1, sticky="nsew")
+
+        def _draw_gauge(self, canvas: Any) -> None:
+            canvas.delete("all")
+            scale = scale_of(canvas)
+            draw_gauge(canvas, self.result["indicador"] if self.result else None, round(4 * scale), round(4 * scale),
+                       round(212 * scale))
+
+        def show(self, result: dict[str, Any] | None, entity_label: str) -> None:
+            self.result = result
+            if result is None:
+                self.value.set("")
+                self.note.set("")
+                self.entity.configure(text="")
+                self.pack_forget()
+                return
+            population = "grupos activos" if result["tipo"] == "grupos" else "investigadores activos"
+            self.value.set(decimal(result["indicador"], 2))
+            self.entity.configure(text=entity_label)
+            for chip, (text, tone) in zip(self.chips, (
+                    (f"Corte {result['corte']}", "primary"),
+                    (f"{number(result['productos'])} contados", "primary"),
+                    (f"{number(result['estimadas'])} estimadas", "pending" if result["estimadas"] else "muted"),
+                    (f"{number(result['sin_categoria'])} sin categoría",
+                     "unknown" if result["sin_categoria"] else "muted"))):
+                chip.set(text, tone)
+            self.note.set(f"Índices relativos al máximo entre {number(result['poblacion'])} {population} cargados; "
+                          "no es una clasificación oficial de Minciencias.")
+            if not self.winfo_manager():
+                self.pack(**self._pack_options)
+            self.canvas.redraw()
+            self.gauge.redraw()
+
+    dialog_state: dict[str, Any] = {"last": None}
+
+    class Dialog(ctk.CTkToplevel):
+        """Ventana modal centrada sobre su origen; Escape la cierra y devuelve el foco modal anterior."""
+        def __init__(self, parent: Any, title: str, width: int = 460, height: int | None = None):
+            super().__init__(parent)
+            self.withdraw()
+            self.title(title)
+            self.configure(fg_color=T["page"])
+            try:
+                # X11: los gestores de ventanas en mosaico dejan flotar los diálogos con su tamaño pedido.
+                self.wm_attributes("-type", "dialog")
+            except TclError:
+                pass
+            self._origin, self._size, self._previous_grab = parent, (width, height), None
+            self.buttons: dict[str, Any] = {}
+            self.body = ctk.CTkFrame(self, fg_color="transparent")
+            self.body.pack(fill="both", expand=True, padx=22, pady=(20, 10))
+            self.footer = ctk.CTkFrame(self, fg_color="transparent")
+            self.footer.pack(fill="x", padx=22, pady=(0, 18))
+            self.bind("<Escape>", lambda _event: self.close())
+            self.protocol("WM_DELETE_WINDOW", self.close)
+
+        def present(self, wait: bool = True, focus: Any = None) -> None:
+            dialog_state["last"] = self
+            self._previous_grab = self.grab_current()
+            host = self._origin.winfo_toplevel()
+            # Un diálogo transitorio de una ventana oculta también quedaría oculto.
+            if host.winfo_viewable():
+                self.transient(host)
+            self._place(host)
+            self.deiconify()
+            self.lift()
+            try:
+                self.wait_visibility()
+                self.grab_set()
+            except TclError:
+                if self.winfo_exists():
+                    self.after(20, self.grab_set)
+            # Mientras se espera la ventana, un evento pendiente puede haberla cerrado ya.
+            if not self.winfo_exists():
+                return
+            (focus or self).focus_force()
+            if wait:
+                self.wait_window()
+
+        def _place(self, host: Any) -> None:
+            """Tamaño del contenido (o el fijado) y posición centrada sobre la ventana de origen."""
+            self.update_idletasks()
+            width = max(self._size[0], self._reverse_window_scaling(self.winfo_reqwidth()))
+            height = self._size[1] or self._reverse_window_scaling(self.winfo_reqheight())
+            width = round(min(width, self._reverse_window_scaling(host.winfo_screenwidth() - 40)))
+            height = round(min(height, self._reverse_window_scaling(host.winfo_screenheight() - 80)))
+            pixels_w, pixels_h = self._apply_window_scaling(width), self._apply_window_scaling(height)
+            x = max(0, min(host.winfo_rootx() + (host.winfo_width() - pixels_w) // 2, host.winfo_screenwidth() - pixels_w))
+            y = max(0, min(host.winfo_rooty() + (host.winfo_height() - pixels_h) // 2, host.winfo_screenheight() - pixels_h))
+            self.geometry(f"{width}x{height}+{x}+{y}")
+
+        def _cancel_timers(self) -> None:
+            """CTkTextbox repite un temporizador propio; al cerrar se cancela para no llamar a un widget destruido."""
+            cancel_widget_timers(self)
+
+        def close(self) -> None:
+            previous = self._previous_grab
+            if self.winfo_exists():
+                self._cancel_timers()
+                self.destroy()
+            if previous is not None and previous.winfo_exists():
+                try:
+                    previous.grab_set()
+                except TclError:
+                    pass
 
     def show_columns(table: ttk.Treeview, columns: tuple[str, ...], usage: dict[str, int],
                      keep: tuple[str, ...] = ()) -> None:
@@ -2475,137 +4511,174 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                 self._shown = needed
             super().set(first, last)
 
-    class ScrolledPage(ttk.Frame):
-        def __init__(self, parent: tk.Misc):
-            super().__init__(parent)
-            self.columnconfigure(0, weight=1)
-            self.rowconfigure(0, weight=1)
-            self.scroll_canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0)
-            scroll = AutoScrollbar(self, command=self.scroll_canvas.yview, style="Page.Vertical.TScrollbar")
-            self.scroll_canvas.configure(yscrollcommand=scroll.set)
-            self.scroll_canvas.grid(row=0, column=0, sticky="nsew")
-            scroll.grid(row=0, column=1, sticky="ns")
-            self.body = ttk.Frame(self.scroll_canvas, padding=PAGE_PADDING)
-            window = self.scroll_canvas.create_window((0, 0), window=self.body, anchor="nw")
-            self.body.bind("<Configure>", lambda _e: self.scroll_canvas.configure(
-                scrollregion=self.scroll_canvas.bbox("all")))
-            self.scroll_canvas.bind("<Configure>", lambda event: self.scroll_canvas.itemconfigure(
-                window, width=event.width))
-
-    class ChoiceDialog(tk.Toplevel):
+    class ChoiceDialog(Dialog):
         def __init__(self, parent: tk.Misc, title: str, prompt: str,
                      options: dict[str, str], default: str = ""):
-            super().__init__(parent)
-            self.title(title)
-            place_dialog(self, parent, 530, 220)
-            self.minsize(400, 200)
+            super().__init__(parent, title, 530)
             self.result: str | None = None
             self.options = options
-            self.columnconfigure(0, weight=1)
-            ttk.Label(self, text=prompt, wraplength=480, padding=12).grid(row=0, column=0, sticky="ew")
+            ctk.CTkLabel(self.body, text=prompt, wraplength=480, justify="left", anchor="w",
+                         font=FONTS["body"], text_color=T["ink"]).pack(fill="x", pady=(0, 12))
             self.value = tk.StringVar(value=next((label for label, value in options.items() if value == default), next(iter(options))))
-            self.box = ttk.Combobox(self, textvariable=self.value, values=list(options), state="readonly")
-            self.box.grid(row=1, column=0, sticky="ew", padx=12)
-            footer = ttk.Frame(self, padding=12)
-            footer.grid(row=2, column=0, sticky="ew")
-            ttk.Button(footer, text="Continuar", style="Accent.TButton", command=self.accept).pack(side="right")
-            ttk.Button(footer, text="Cancelar", command=self.destroy).pack(side="right", padx=6)
-            self.bind("<Escape>", lambda _e: self.destroy())
-            self.bind("<Return>", lambda _e: self.accept())
-            previous = self.grab_current()
-            self.grab_set()
-            self.box.focus_set()
-            self.wait_window()
-            if previous is not None and previous.winfo_exists():
-                previous.grab_set()
+            self.box = ctk.CTkOptionMenu(self.body, variable=self.value, values=list(options), height=34,
+                                         font=FONTS["body"], dropdown_font=FONTS["body"], fg_color=T["field"],
+                                         button_color=T["field"], button_hover_color=T["hover"], text_color=T["ink"],
+                                         dropdown_fg_color=T["surface"], dropdown_text_color=T["ink"],
+                                         dropdown_hover_color=T["hover"])
+            self.box.pack(fill="x")
+            button(self.footer, "Continuar", self.accept, variant="primary", width=112).pack(side="right")
+            button(self.footer, "Cancelar", self.close, width=112).pack(side="right", padx=(0, 8))
+            self.bind("<Return>", lambda _event: self.accept())
+            self.present()
 
         def accept(self) -> None:
             self.result = self.options[self.value.get()]
-            self.destroy()
+            self.close()
 
-    class RecordPicker(tk.Toplevel):
+    # Fichas públicas de ejemplo del enunciado del Parcial 2.
+    EXAMPLE_URLS = {
+        "Ejemplo GrupLAC": "https://scienti.minciencias.gov.co/gruplac/jsp/visualiza/visualizagr.jsp?nro=00000000002099",
+        "Ejemplo CvLAC": "https://scienti.minciencias.gov.co/cvlac/visualizador/generarCurriculoCv.do?cod_rh=0000494917",
+    }
+
+    class UrlDialog(Dialog):
+        """Consulta de una URL pública: la descarga corre en segundo plano con el diálogo abierto.
+
+        result es la URL consultada y preview su vista previa; ambos quedan en None si se cancela.
+        """
+        def __init__(self, parent: Any, app: "App | None" = None, initial: str = "", start: bool = False):
+            super().__init__(parent, "Consultar URL pública", 600)
+            self.result: str | None = None
+            self.preview: WebPreview | None = None
+            self._results: queue.Queue[WebPreview | Exception] | None = None
+            ctk.CTkLabel(self.body, text="Pegue una URL pública HTTP o HTTPS: una ficha GrupLAC o CvLAC, o la página "
+                         "de un artículo.", font=FONTS["body"], text_color=T["ink"], anchor="w", justify="left",
+                         wraplength=550).pack(fill="x", pady=(0, 8))
+            self.entry = ctk.CTkEntry(self.body, height=36, corner_radius=8, font=FONTS["body"], fg_color=T["field"],
+                                      border_color=T["line_strong"], text_color=T["ink"], placeholder_text="https://…")
+            if initial:
+                self.entry.insert(0, initial)
+            self.entry.pack(fill="x")
+            examples = ctk.CTkFrame(self.body, fg_color="transparent")
+            examples.pack(fill="x", pady=(8, 0))
+            self.examples = {}
+            for label, url in EXAMPLE_URLS.items():
+                control = ctk.CTkButton(examples, text=label, command=lambda value=url: self._use(value), width=0,
+                                        height=24, corner_radius=12, font=FONTS["caption"], fg_color=soft("primary"),
+                                        hover_color=T["primary_soft"], text_color=T["primary"])
+                control.pack(side="left", padx=(0, 6))
+                self.examples[label] = control
+            self.progress = ctk.CTkProgressBar(self.body, mode="indeterminate", height=6, fg_color=T["chart_track"],
+                                               progress_color=T["primary"])
+            self.error = tk.StringVar()
+            self.error_label = ctk.CTkLabel(self.body, textvariable=self.error, font=FONTS["small"],
+                                            text_color=T["rejected"], anchor="w", justify="left", wraplength=550)
+            self.error_label.pack(fill="x", pady=(8, 0))
+            self.consult = button(self.footer, "Consultar", self.accept, variant="primary", width=120)
+            self.consult.pack(side="right")
+            button(self.footer, "Cancelar", self.close, width=112).pack(side="right", padx=(0, 8))
+            self.bind("<Return>", lambda _event: self.accept())
+            if start and initial:
+                self.after(50, self.accept)
+            self.present(focus=self.entry)
+
+        def _use(self, url: str) -> None:
+            self.entry.delete(0, "end")
+            self.entry.insert(0, url)
+            self.error.set("")
+
+        def _busy(self, busy: bool) -> None:
+            for control in (self.consult, self.entry, *self.examples.values()):
+                control.configure(state="disabled" if busy else "normal")
+            if busy:
+                self.progress.pack(fill="x", pady=(12, 0), before=self.error_label)
+                self.progress.start()
+            else:
+                self.progress.stop()
+                self.progress.pack_forget()
+
+        def accept(self) -> None:
+            if self._results is not None:
+                return
+            url = self.entry.get().strip()
+            if not url:
+                self.error.set("Escriba o pegue una URL.")
+                return
+            self.error.set("")
+            self._busy(True)
+            results = self._results = queue.Queue(maxsize=1)
+
+            def fetch() -> None:
+                try:
+                    results.put(fetch_web_page(url))
+                except Exception as exc:
+                    results.put(exc)
+            threading.Thread(target=fetch, daemon=True).start()
+            self.after(100, lambda: self._check(url))
+
+        def _check(self, url: str) -> None:
+            try:
+                result = self._results.get_nowait()  # type: ignore[union-attr]
+            except queue.Empty:
+                self.after(100, lambda: self._check(url))
+                return
+            self._results = None
+            self._busy(False)
+            if isinstance(result, Exception):
+                self.error.set(str(result))
+                return
+            self.result, self.preview = url, result
+            self.close()
+
+    class RecordPicker(Dialog):
         """Consulta paginada: el límite por página no limita las opciones disponibles."""
         def __init__(self, parent: tk.Misc, repo: Repository | CppRepository,
                      kind: str, current: str = ""):
-            super().__init__(parent)
-            self.title("Seleccionar " + TITLES[kind].lower())
-            place_dialog(self, parent, 740, 530)
-            self.minsize(500, 350)
+            super().__init__(parent, "Seleccionar " + TITLES[kind].lower(), 760, 560)
+            self.minsize(540, 400)
             self.repo, self.kind = repo, kind
             self.result: str | None = None
             self.offset = 0
-            self._timer: str | None = None
             self.search = tk.StringVar()
-            self.columnconfigure(0, weight=1)
-            self.rowconfigure(1, weight=1)
-            top = ttk.Frame(self, padding=12)
-            top.grid(row=0, column=0, sticky="ew")
-            top.columnconfigure(1, weight=1)
-            ttk.Label(top, text="Buscar nombre o ID").grid(row=0, column=0, padx=(0, 10))
-            self.search_entry = ttk.Entry(top, textvariable=self.search)
-            self.search_entry.grid(row=0, column=1, sticky="ew")
             self.search.trace_add("write", self._search_changed)
-            body = ttk.Frame(self, padding=(12, 0))
-            body.grid(row=1, column=0, sticky="nsew")
-            body.columnconfigure(0, weight=1)
-            body.rowconfigure(0, weight=1)
-            self.table = ttk.Treeview(body, columns=("nombre", "id", "activo"),
-                                      show="headings", selectmode="browse")
-            for field, title, width in (("nombre", "Nombre / título", 380), ("id", "ID", 180),
-                                         ("activo", "Estado", 90)):
-                self.table.heading(field, anchor="w", text=title)
-                self.table.column(field, width=width, minwidth=80)
-            scroll = AutoScrollbar(body, command=self.table.yview)
-            self.table.configure(yscrollcommand=scroll.set)
-            self.table.grid(row=0, column=0, sticky="nsew")
-            scroll.grid(row=0, column=1, sticky="ns")
-            footer = ttk.Frame(self, padding=12)
-            footer.grid(row=2, column=0, sticky="ew")
-            pager = ttk.Frame(footer)
-            pager.pack(fill="x", pady=(0, 6))
-            self.previous = ttk.Button(pager, text="Anterior", command=lambda: self.move(-1))
-            self.previous.pack(side="left")
+            ctk.CTkLabel(self.body, text="Buscar nombre o ID", font=FONTS["h2"],
+                         text_color=T["ink"], anchor="w").pack(fill="x", pady=(0, 8))
+            self.search_entry = SearchField(self.body, self.search, self.refresh, placeholder_text="Buscar…")
+            self.search_entry.pack(fill="x", pady=(0, 12))
+            self.table = DataTable(self.body, ("nombre", "id", "activo"),
+                                   headings={"nombre": "Nombre / título", "id": "ID", "activo": "Estado"},
+                                   widths={"nombre": 330, "id": 180, "activo": 100}, height_rows=9,
+                                   chips={"activo": lambda value: "primary" if value == "Activo" else "muted"})
+            self.table.pack(fill="both", expand=True)
+            self.pager = Pager(self.body, self.move)
+            self.pager.pack(fill="x", pady=(10, 0))
+            self.previous, self.next = self.pager.previous, self.pager.next
             self.count = tk.StringVar()
-            ttk.Label(pager, textvariable=self.count).pack(side="left", padx=10)
-            self.next = ttk.Button(pager, text="Siguiente", command=lambda: self.move(1))
-            self.next.pack(side="left")
-            self.choose = ttk.Button(footer, text="Seleccionar", style="Accent.TButton", command=self.accept)
+            self.choose = button(self.footer, "Seleccionar", self.accept, variant="primary", width=120)
             self.choose.pack(side="right")
-            ttk.Button(footer, text="Cancelar", command=self.destroy).pack(side="right", padx=6)
-            self.table.bind("<<TreeviewSelect>>", lambda _e: self.choose.configure(
-                state="normal" if self.table.selection() else "disabled"))
-            self.table.bind("<Double-1>", lambda _e: self.accept())
-            self.table.bind("<Return>", lambda _e: self.accept())
-            self.bind("<Escape>", lambda _e: self.destroy())
+            button(self.footer, "Cancelar", self.close, width=112).pack(side="right", padx=(0, 8))
+            self.table.on_select(lambda _iid: self.choose.configure(state="normal" if self.table.selection() else "disabled"))
+            self.table.on_open(lambda _iid: self.accept())
             self.refresh()
             if current and self.table.exists(current):
                 self.table.selection_set(current)
-            previous_grab = self.grab_current()
-            self.grab_set()
-            self.search_entry.focus_set()
-            self.wait_window()
-            if previous_grab is not None and previous_grab.winfo_exists():
-                previous_grab.grab_set()
+            self.present(focus=self.search_entry)
 
         def _search_changed(self, *_: Any) -> None:
-            if self._timer:
-                self.after_cancel(self._timer)
             self.offset = 0
-            self._timer = self.after(200, self.refresh)
 
         def refresh(self) -> None:
-            if self._timer:
-                self.after_cancel(self._timer)
-                self._timer = None
+            self.search_entry.cancel_pending()
             page = self.repo.page(self.kind, self.offset, PAGE_SIZE, self.search.get())
+            if self.offset and self.offset >= page["total"]:
+                self.offset = max(0, (page["total"] - 1) // PAGE_SIZE * PAGE_SIZE)
+                page = self.repo.page(self.kind, self.offset, PAGE_SIZE, self.search.get())
             self.table.delete(*self.table.get_children())
             for row in page["rows"]:
                 self.table.insert("", "end", iid=row["id"],
                                   values=(record_name(row), row["id"], display_value("activo", row["activo"])))
-            first = self.offset + 1 if page["total"] else 0
-            self.count.set(f"{first}–{self.offset + len(page['rows'])} de {page['total']}")
-            self.previous.configure(state="normal" if self.offset else "disabled")
-            self.next.configure(state="normal" if self.offset + PAGE_SIZE < page["total"] else "disabled")
+            self.pager.show(self.offset, len(page["rows"]), page["total"])
+            self.count.set(self.pager.label.cget("text"))
             self.choose.configure(state="disabled")
 
         def move(self, direction: int) -> None:
@@ -2616,28 +4689,24 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             selected = self.table.selection()
             if selected:
                 self.result = selected[0]
-                self.destroy()
+                self.close()
 
-        def destroy(self) -> None:
-            if self._timer:
-                self.after_cancel(self._timer)
-                self._timer = None
-            super().destroy()
 
-    class ReferenceInput(ttk.Frame):
+    class ReferenceInput(ctk.CTkFrame):
         def __init__(self, parent: tk.Misc, repo: Repository | CppRepository, kind: str, value: str = "",
-                     variable: tk.StringVar | None = None, command: Callable[[], Any] | None = None,
-                     style: str = "TFrame"):
-            super().__init__(parent, style=style)
+                     variable: tk.StringVar | None = None, command: Callable[[], Any] | None = None):
+            super().__init__(parent, fg_color="transparent")
             self.repo, self.kind, self.command = repo, kind, command
             self.value = variable if variable is not None else tk.StringVar()
             self.label = tk.StringVar()
             self._trace = self.value.trace_add("write", lambda *_: self._update_label())
             self.columnconfigure(0, weight=1)
-            self.entry = ttk.Entry(self, textvariable=self.label, state="readonly")
+            self.entry = ctk.CTkEntry(self, textvariable=self.label, state="readonly", height=34,
+                                      font=FONTS["body"], fg_color=T["field"], text_color=T["ink"],
+                                      border_color=T["line_strong"], corner_radius=8)
             self.entry.grid(row=0, column=0, sticky="ew")
-            self.button = ttk.Button(self, text="Elegir…", command=self.select)
-            self.button.grid(row=0, column=1, padx=(6, 0))
+            self.button = button(self, "Elegir…", self.select, width=88)
+            self.button.grid(row=0, column=1, padx=(8, 0))
             self.set(value)
 
         def get(self) -> str:
@@ -2660,40 +4729,150 @@ def build_gui(root: Any, repository: Repository | CppRepository,
 
         def set_enabled(self, enabled: bool) -> None:
             self.button.configure(state="normal" if enabled else "disabled")
+            self.entry.configure(state="readonly" if enabled else "disabled")
 
         def destroy(self) -> None:
             self.value.trace_remove("write", self._trace)
             super().destroy()
 
-    class RecordDialog(tk.Toplevel):
+    class CategoryCatalog(ctk.CTkFrame):
+        """Catálogo de referencia compartido por el selector y la página del modelo."""
+        def __init__(self, parent: Any):
+            super().__init__(parent, fg_color="transparent")
+            self.search = tk.StringVar()
+            self.class_filter = tk.StringVar(value="Todas")
+            self.search_entry = SearchField(self, self.search, self.refresh, placeholder_text="Buscar código o descripción…")
+            self.search_entry.pack(fill="x", pady=(0, 8))
+            self.class_control = segmented(self, self.class_filter, ["Todas", *MODEL_CLASSES], lambda _value: self.refresh())
+            self.class_control.pack(fill="x", pady=(0, 12))
+            columns = ("codigo", "descripcion", "clase", "peso_relativo", "peso_global", "ventana")
+            self.table = DataTable(self, columns,
+                                   headings={"codigo": "Código", "descripcion": "Descripción", "clase": "Clase",
+                                             "peso_relativo": "Peso relativo", "peso_global": "Puntos", "ventana": "Ventana (años)"},
+                                   widths={"codigo": 120, "descripcion": 300, "clase": 85,
+                                           "peso_relativo": 110, "peso_global": 100, "ventana": 120},
+                                   anchors={field: "e" for field in columns[3:]}, chips={"clase": lambda _value: "primary"},
+                                   height_rows=10)
+            self.table.empty_text = "Sin categorías para estos filtros."
+            self.table.pack(fill="both", expand=True)
+            self.count = ctk.CTkLabel(self, text="", font=FONTS["caption"], text_color=T["muted"], anchor="w")
+            self.count.pack(side="bottom", fill="x", pady=(6, 0), before=self.table)
+            self.refresh()
+
+        def refresh(self) -> None:
+            self.search_entry.cancel_pending()
+            current = self.table.selection()
+            needle = self.search.get().strip().casefold()
+            rows = [row for row in catalog if (self.class_filter.get() == "Todas" or row["clase"] == self.class_filter.get())
+                    and (not needle or needle in f"{row['codigo']} {row['descripcion']}".casefold())]
+            self.table.delete(*self.table.get_children())
+            for row in rows:
+                self.table.insert("", "end", iid=row["codigo"], values=(
+                    row["codigo"], row["descripcion"], row["clase"], decimal(row["peso_relativo"]),
+                    decimal(row["peso_global"]), row["ventana"]))
+            if current and self.table.exists(current[0]):
+                self.table.selection_set(current[0])
+            self.count.configure(text=f"{number(len(rows))} de {number(len(catalog))} categorías")
+
+    class CategoryPicker(Dialog):
+        def __init__(self, parent: Any, app: "App | None" = None, current: str = ""):
+            super().__init__(parent, "Seleccionar categoría · Modelo 2024", 880, 620)
+            self.minsize(640, 440)
+            self.result: str | None = None
+            self.catalog_view = CategoryCatalog(self.body)
+            self.catalog_view.pack(fill="both", expand=True)
+            self.search = self.catalog_view.search
+            self.class_filter = self.catalog_view.class_filter
+            self.class_control = self.catalog_view.class_control
+            self.table = self.catalog_view.table
+            self.choose = button(self.footer, "Seleccionar", self.accept, variant="primary", width=120, state="disabled")
+            self.choose.pack(side="right")
+            button(self.footer, "Cancelar", self.close, width=112).pack(side="right", padx=(0, 8))
+            button(self.footer, "Sin categoría", self.clear, width=120).pack(side="left")
+            self.table.on_select(lambda _iid: self._selection_changed())
+            self.table.on_open(lambda _iid: self.accept())
+            if current and self.table.exists(current):
+                self.table.selection_set(current)
+            self.present(focus=self.catalog_view.search_entry)
+
+        def _selection_changed(self) -> None:
+            self.choose.configure(state="normal" if self.table.selection() else "disabled")
+
+        def refresh(self) -> None:
+            self.catalog_view.refresh()
+            self._selection_changed()
+
+        def accept(self) -> None:
+            selected = self.table.selection()
+            if selected:
+                self.result = selected[0]
+                self.close()
+
+        def clear(self) -> None:
+            self.result = ""
+            self.close()
+
+    class CategoryInput(ctk.CTkFrame):
+        def __init__(self, parent: Any, app: "App | None" = None, value: str = ""):
+            super().__init__(parent, fg_color="transparent")
+            self.app = app
+            self.value = tk.StringVar()
+            self.label = tk.StringVar()
+            self.info = tk.StringVar()
+            self.grid_columnconfigure(0, weight=1)
+            self.entry = ctk.CTkEntry(self, textvariable=self.label, state="readonly", height=34,
+                                      font=FONTS["body"], fg_color=T["field"], text_color=T["ink"],
+                                      border_color=T["line_strong"], corner_radius=8)
+            self.entry.grid(row=0, column=0, sticky="ew")
+            self.button = button(self, "Elegir…", self.select, width=88)
+            self.button.grid(row=0, column=1, padx=(8, 0))
+            self.info_label = ctk.CTkLabel(self, textvariable=self.info, font=FONTS["caption"], text_color=T["muted"],
+                                          anchor="w", justify="left", wraplength=440)
+            self.info_label.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+            self.bind("<Configure>", lambda event: self.info_label.configure(wraplength=max(200, event.width / scale_of(self) - 8)), add="+")
+            self.set(value)
+
+        def get(self) -> str:
+            return self.value.get()
+
+        def set(self, value: str) -> None:
+            code = value.partition(" — ")[0].strip().upper()
+            self.value.set(code)
+            category = catalog_by_code.get(code)
+            self.label.set(f"{code} — {category['descripcion']}" if category else code)
+            self.info.set(f"Clase {category['clase']} · peso relativo {decimal(category['peso_relativo'])} · "
+                          f"{decimal(category['peso_global'])} puntos · ventana {category['ventana']} años"
+                          if category else "Sin categoría asignada")
+
+        def select(self) -> None:
+            picker = CategoryPicker(self, self.app, self.get())
+            if picker.result is not None:
+                self.set(picker.result)
+
+        def set_enabled(self, enabled: bool) -> None:
+            self.entry.configure(state="readonly" if enabled else "disabled")
+            self.button.configure(state="normal" if enabled else "disabled")
+
+
+    class RecordDialog(Dialog):
         def __init__(self, parent: tk.Misc, kind: str, initial: dict[str, str] | None = None,
                      suggested_id: str = "", external: bool = False,
                      repo: Repository | CppRepository | None = None,
                      on_save: Callable[[dict[str, str]], Any] | None = None,
                      is_new: bool = False, locked_fields: tuple[str, ...] = ()):
-            super().__init__(parent)
-            self.title(("Revisar " if external else "Crear " if is_new or initial is None else "Editar ")
-                       + TITLES[kind].lower())
-            place_dialog(self, parent, 760, 650)
-            self.resizable(True, True)
+            title = ("Revisar " if external else "Crear " if is_new or initial is None else "Editar ") + TITLES[kind].lower()
+            super().__init__(parent, title, 720, 760)
             self.minsize(540, 420)
             self.result: dict[str, str] | None = None
             self.kind, self.on_save = kind, on_save
             self.inputs: dict[str, Any] = {}
             self.error = tk.StringVar()
-            self.columnconfigure(0, weight=1)
-            self.rowconfigure(0, weight=1)
-            canvas = tk.Canvas(self, highlightthickness=0, background=ttk.Style().lookup("TFrame", "background"))
-            self.scroll_canvas = canvas
-            scrollbar = AutoScrollbar(self, orient="vertical", command=canvas.yview)
-            canvas.configure(yscrollcommand=scrollbar.set)
-            canvas.grid(row=0, column=0, sticky="nsew")
-            scrollbar.grid(row=0, column=1, sticky="ns")
-            body = ttk.Frame(canvas, padding=(18, 12))
-            window = canvas.create_window((0, 0), window=body, anchor="nw")
-            body.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
-            canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=event.width))
-            body.columnconfigure(1, weight=1)
+            self.scroller = ctk.CTkScrollableFrame(self.body, fg_color="transparent", corner_radius=0,
+                                                   scrollbar_button_color=T["line_strong"],
+                                                   scrollbar_button_hover_color=T["muted"])
+            self.scroller.pack(fill="both", expand=True)
+            self.scroll_canvas = self.scroller._parent_canvas
+            self.scroll_canvas.configure(yscrollcommand=lambda first, last: set_scrollbar(self.scroller._scrollbar, first, last))
             sections = {
                 "grupos": (("Identificación", ("id", "nombre", "codigo_gruplac", "fecha_creacion", "unidad", "responsable", "categoria", "activo")),
                            ("Perfil de investigación", ("descripcion", "objetivos", "mision", "vision", "lineas")),
@@ -2701,147 +4880,155 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                 "investigadores": (("Información personal pública", ("id", "nombre", "afiliacion", "contacto", "activo")),
                                     ("Clasificación", ("codigo_cvlac", "categoria")), ("Procedencia", ("url", "fuente"))),
                 "productos": (("Producto", ("id", "titulo", "anio", "fecha", "doi", "activo")),
-                               ("Clasificación y revisión", ("familia", "tipologia", "observacion")),
+                               ("Clasificación y revisión", ("familia", "tipologia", "categoria", "observacion")),
                                ("Procedencia", ("url", "fuente"))),
                 "planes": (("Plan del grupo", ("id", "grupo_id", "nombre", "inicio", "fin", "activo")),
                             ("Objetivos y actividades", ("objetivo", "indicador", "meta", "actividad"))),
             }.get(kind, (("Asociación", ALL_FIELDS[kind]),))
-            fields = [field for _, group in sections for field in group]
-            headings = {group[0]: title for title, group in sections}
-            index = 0
-            for field in fields:
-                if field in headings:
-                    ttk.Label(body, text=headings[field], style="Section.TLabel").grid(
-                        row=index, column=0, columnspan=2, sticky="w", padx=4, pady=(10, 6))
-                    index += 1
-                required = field in REQUIRED.get(kind, ()) or field.endswith("_id")
-                label = LABELS.get(field, field).replace(" (ID)", "") + (" *" if required else "")
-                ttk.Label(body, text=label).grid(row=index, column=0, sticky="nw", padx=4, pady=6)
-                value = initial.get(field, "") if initial else ""
-                if field == "activo" and not initial:
-                    value = "1"
-                if field == "id" and not value:
-                    value = suggested_id
-                if field in LONG_FIELDS:
-                    widget = text_field(body, height=3, width=40)
-                    widget.insert("1.0", value)
-                elif field == "activo":
-                    widget = ttk.Combobox(body, values=("Activo", "Inactivo"), state="readonly", width=30)
-                    widget.set(display_value(field, value or "1"))
-                elif field.endswith("_id") and repo is not None:
-                    ref_kind = {"grupo_id": "grupos", "investigador_id": "investigadores", "producto_id": "productos"}[field]
-                    widget = ReferenceInput(body, repo, ref_kind, value)
-                else:
-                    widget = ttk.Entry(body, width=40)
-                    widget.insert(0, value)
-                widget.grid(row=index, column=1, sticky="ew", padx=4, pady=3)
-                stable = initial and not external and not is_new and (field == "id" or field in RELATION_ENDS.get(kind, ())[:2])
-                if stable or field in locked_fields:
-                    if isinstance(widget, ReferenceInput):
-                        widget.set_enabled(False)
+            self.section_cards = []
+            for title, fields in sections:
+                card = Card(self.scroller, title=title)
+                card.pack(fill="x", padx=(0, 8), pady=(0, 12))
+                self.section_cards.append(card)
+                card.body.grid_columnconfigure(1, weight=1)
+                for index, field in enumerate(fields):
+                    required = field in REQUIRED.get(kind, ()) or field.endswith("_id")
+                    label = LABELS.get(field, field).replace(" (ID)", "") + (" *" if required else "")
+                    ctk.CTkLabel(card.body, text=label, font=FONTS["small"], text_color=T["muted"],
+                                 justify="left", anchor="w", wraplength=112, width=112).grid(
+                                     row=index, column=0, sticky="nw", padx=(0, 16), pady=(8, 4))
+                    value = initial.get(field, "") if initial else ""
+                    if field == "activo" and not initial:
+                        value = "1"
+                    if field == "id" and not value:
+                        value = suggested_id
+                    if field in LONG_FIELDS:
+                        widget = ctk.CTkTextbox(card.body, height=80, width=220, wrap="word", font=FONTS["body"],
+                                               fg_color=T["field"], text_color=T["ink"], border_width=1,
+                                               border_color=T["line_strong"], corner_radius=8,
+                                               scrollbar_button_color=T["line_strong"], scrollbar_button_hover_color=T["muted"])
+                        widget.insert("1.0", value)
+                    elif field == "activo":
+                        state = tk.StringVar(value=display_value(field, value or "1"))
+                        widget = segmented(card.body, state, ["Activo", "Inactivo"], lambda _value: None)
+                    elif kind == "productos" and field == "categoria":
+                        widget = CategoryInput(card.body, value=value)
+                        self.category_info = widget.info
+                    elif field.endswith("_id") and repo is not None:
+                        ref_kind = {"grupo_id": "grupos", "investigador_id": "investigadores", "producto_id": "productos"}[field]
+                        widget = ReferenceInput(card.body, repo, ref_kind, value)
                     else:
-                        widget.configure(state="readonly")
-                self.inputs[field] = widget
-                index += 1
+                        widget = ctk.CTkEntry(card.body, width=220, height=34, font=FONTS["body"],
+                                              fg_color=T["field"], text_color=T["ink"], border_color=T["line_strong"],
+                                              corner_radius=8,
+                                              placeholder_text="AAAA-MM-DD" if field in ("fecha", "fecha_creacion", "inicio", "fin") else "")
+                        widget.insert(0, value)
+                    widget.grid(row=index, column=1, sticky="ew", pady=4)
+                    stable = initial and not external and not is_new and (field == "id" or field in RELATION_ENDS.get(kind, ())[:2])
+                    if stable or field in locked_fields:
+                        if isinstance(widget, (ReferenceInput, CategoryInput)):
+                            widget.set_enabled(False)
+                        elif isinstance(widget, (ctk.CTkTextbox, ctk.CTkSegmentedButton)):
+                            widget.configure(state="disabled")
+                        else:
+                            widget.configure(state="readonly")
+                    self.inputs[field] = widget
             help_text = "* Campo obligatorio. Fechas: AAAA-MM-DD. Ctrl+Enter guarda."
             if kind == "productos":
                 help_text += ("\nLa validación es automática y se recalcula al guardar: requiere año, tipología, "
-                              "un autor y un grupo activos, y una URL o un DOI válido.")
-            ttk.Label(body, text=help_text, style="Muted.TLabel", wraplength=500).grid(
-                row=index, column=0, columnspan=2, sticky="w", pady=8)
-            footer = ttk.Frame(self, padding=12)
-            footer.grid(row=1, column=0, columnspan=2, sticky="ew")
-            footer.columnconfigure(0, weight=1)
-            self.error_label = ttk.Label(footer, textvariable=self.error, style="Error.TLabel", wraplength=600)
-            self.error_label.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
-            ttk.Button(footer, text="Guardar", style="Accent.TButton", command=self.accept).grid(row=1, column=1)
-            ttk.Button(footer, text="Cancelar", command=self.destroy).grid(row=1, column=0, sticky="e", padx=8)
-            self.bind("<Escape>", lambda _event: self.destroy())
+                              "un autor o un grupo activos, y una URL o un DOI válido.")
+            ctk.CTkLabel(self.scroller, text=help_text, font=FONTS["caption"], text_color=T["muted"],
+                         justify="left", anchor="w", wraplength=580).pack(fill="x", padx=(0, 8), pady=(0, 8))
+            self.error_label = ctk.CTkLabel(self.footer, textvariable=self.error, font=FONTS["small"],
+                                            text_color=T["rejected"], anchor="w", justify="left", wraplength=650)
+            self.error_label.pack(fill="x", pady=(0, 8))
+            self.buttons["save"] = button(self.footer, "Guardar", self.accept, variant="primary", width=112)
+            self.buttons["save"].pack(side="right")
+            self.buttons["cancel"] = button(self.footer, "Cancelar", self.close, width=112)
+            self.buttons["cancel"].pack(side="right", padx=(0, 8))
             self.bind("<Control-Return>", lambda _event: self.accept())
-            self.error_label.bind("<Configure>", lambda event: self.error_label.configure(wraplength=max(220, event.width - 10)))
-            previous_grab = self.grab_current()
-            self.grab_set()
-            focus = self.inputs.get("nombre") or self.inputs.get("titulo")
-            if focus is not None:
-                focus.focus_set()
-            self.wait_window()
-            if previous_grab is not None and previous_grab.winfo_exists():
-                previous_grab.grab_set()
+            self.error_label.bind("<Configure>", lambda event: self.error_label.configure(
+                wraplength=max(220, event.width / scale_of(self) - 10)), add="+")
+            self.present(focus=self.inputs.get("nombre") or self.inputs.get("titulo"))
 
         def accept(self) -> None:
             result = {}
             for field, widget in self.inputs.items():
-                if isinstance(widget, tk.Text):
-                    result[field] = widget.get("1.0", "end-1c").strip()
-                else:
-                    result[field] = widget.get().strip()
+                result[field] = (widget.get("1.0", "end-1c") if isinstance(widget, ctk.CTkTextbox) else widget.get()).strip()
                 if field == "activo":
                     result[field] = "1" if result[field] == "Activo" else "0"
             try:
                 result = clean_row(self.kind, result)
+                if self.kind == "productos":
+                    result.pop("categoria_origen", None)
                 if self.on_save:
                     self.on_save(result)
             except (DataError, OSError, ValueError) as exc:
                 self.error.set(str(exc))
                 return
             self.result = result
-            self.destroy()
+            self.close()
 
-    class ReviewDialog(tk.Toplevel):
+
+    class ReviewDialog(Dialog):
         """Revisión del frente de la cola: corregir el producto y cerrar con una nota."""
-        def __init__(self, parent: tk.Misc, app: "App", job: dict[str, str]):
-            super().__init__(parent)
-            self.title("Revisar siguiente producto")
-            place_dialog(self, parent, 680, 540)
-            self.minsize(480, 420)
+        def __init__(self, parent: Any, app: "App", job: dict[str, str]):
+            super().__init__(parent, "Revisar siguiente producto", 680, 600)
+            self.minsize(500, 460)
             self.app, self.job = app, job
             self.result: dict[str, str] | None = None
-            self.columnconfigure(0, weight=1)
-            self.rowconfigure(5, weight=1)
             product = app.repo.get("productos", job["producto_id"])
-            ttk.Label(self, text=record_name(product), style="Title.TLabel", wraplength=620,
-                      padding=(18, 16, 18, 4)).grid(row=0, column=0, sticky="ew")
-            ttk.Label(self, text="Motivo: " + reason_text(job["motivo"]), style="Muted.TLabel", wraplength=620,
-                      padding=(18, 0)).grid(row=1, column=0, sticky="ew")
-            state = ttk.Frame(self, style="Card.TFrame", padding=(14, 10))
-            state.grid(row=2, column=0, sticky="ew", padx=18, pady=12)
-            state.columnconfigure(0, weight=1)
+            ctk.CTkLabel(self.body, text="SIGUIENTE EN LA COLA", font=FONTS["caption"], text_color=T["muted"],
+                         anchor="w").pack(fill="x")
+            ctk.CTkLabel(self.body, text=record_name(product), font=FONTS["h2"], text_color=T["ink"], anchor="w",
+                         justify="left", wraplength=620).pack(fill="x", pady=(2, 8))
+            reasons = ctk.CTkFrame(self.body, fg_color="transparent")
+            reasons.pack(fill="x")
+            self.reason_chips = reason_chips(reasons, job["motivo"])
+            state = Card(self.body, title="Estado del producto")
+            state.pack(fill="x", pady=12)
+            state.body.grid_columnconfigure(0, weight=1)
+            self.validation_chip = Chip(state.body, "", "muted")
+            self.validation_chip.grid(row=0, column=0, sticky="w")
+            button(state.body, "Editar producto", self.edit_product, width=136).grid(
+                row=0, column=1, rowspan=2, sticky="ne", padx=(12, 0))
             self.state_text = tk.StringVar()
-            self.state_label = ttk.Label(state, textvariable=self.state_text, style="Card.TLabel",
-                                         wraplength=520, justify="left")
-            self.state_label.grid(row=0, column=0, sticky="ew")
-            ttk.Button(state, text="Editar producto", command=self.edit_product).grid(row=0, column=1, sticky="ne", padx=(10, 0))
-            ttk.Label(self, text="Nota de la revisión *", padding=(18, 0)).grid(row=4, column=0, sticky="w")
-            self.observation = text_field(self, height=5, width=40)
-            self.observation.grid(row=5, column=0, sticky="nsew", padx=18, pady=6)
+            self.state_label = ctk.CTkLabel(state.body, textvariable=self.state_text, font=FONTS["body"],
+                                            text_color=T["ink"], anchor="w", justify="left", wraplength=470)
+            self.state_label.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+            ctk.CTkLabel(self.body, text="Nota de la revisión *", font=FONTS["small"], text_color=T["muted"],
+                         anchor="w").pack(fill="x")
+            self.observation = ctk.CTkTextbox(self.body, height=110, wrap="word", font=FONTS["body"],
+                                              fg_color=T["field"], text_color=T["ink"], border_width=1,
+                                              border_color=T["line_strong"], corner_radius=8,
+                                              scrollbar_button_color=T["line_strong"],
+                                              scrollbar_button_hover_color=T["muted"])
+            self.observation.pack(fill="both", expand=True, pady=(4, 0))
             self.error = tk.StringVar()
-            ttk.Label(self, textvariable=self.error, style="Error.TLabel", wraplength=620,
-                      padding=(18, 0)).grid(row=6, column=0, sticky="ew")
-            footer = ttk.Frame(self, padding=(18, 12))
-            footer.grid(row=7, column=0, sticky="ew")
-            ttk.Button(footer, text="Ver ficha", command=lambda: app.open_detail("productos", product["id"], self)).pack(side="left")
-            ttk.Button(footer, text="Cerrar revisión", style="Accent.TButton", command=self.accept).pack(side="right")
-            ttk.Button(footer, text="Cancelar", command=self.destroy).pack(side="right", padx=6)
+            ctk.CTkLabel(self.footer, textvariable=self.error, font=FONTS["small"], text_color=T["rejected"],
+                         anchor="w", justify="left", wraplength=620).pack(fill="x", pady=(0, 8))
+            button(self.footer, "Ver ficha", lambda: app.open_detail("productos", product["id"], self),
+                   width=112).pack(side="left")
+            self.buttons["accept"] = button(self.footer, "Cerrar revisión", self.accept, variant="primary", width=136)
+            self.buttons["accept"].pack(side="right")
+            self.buttons["cancel"] = button(self.footer, "Cancelar", self.close, width=112)
+            self.buttons["cancel"].pack(side="right", padx=(0, 8))
+            self.bind("<Control-Return>", lambda _event: self.accept())
             self._update_state()
-            self.bind("<Escape>", lambda _e: self.destroy())
-            self.bind("<Control-Return>", lambda _e: self.accept())
-            previous = self.grab_current()
-            self.grab_set()
-            self.observation.focus_set()
-            self.wait_window()
-            if previous is not None and previous.winfo_exists():
-                previous.grab_set()
+            self.present(focus=self.observation)
 
         def _update_state(self) -> None:
             product = self.app.repo.get("productos", self.job["producto_id"])
             issues = self.app.repo.product_issues(self.job["producto_id"])
-            if product["validacion"] == "validado":
+            validated = product["validacion"] == "validado"
+            self.validation_chip.set(display_value("validacion", product["validacion"]),
+                                     STATUS_COLORS.get(product["validacion"], "unknown"))
+            if validated:
                 self.state_text.set("Validado: el producto cumple todas las reglas.")
-                self.state_label.configure(style="Card.TLabel")
             else:
                 self.state_text.set("Rechazado. Corrija el producto o explique en la nota por qué no es posible:\n"
-                                    + "\n".join("• " + VALIDATION_RULES[code] for code in issues))
-                self.state_label.configure(style="Rejected.Card.TLabel")
+                                    + "\n".join("• " + RULE_LABELS[code] for code in issues))
+            self.state_label.configure(text_color=T["ink"] if validated else T["rejected"])
 
         def edit_product(self) -> None:
             self.app.edit_record("productos", key=self.job["producto_id"], parent=self)
@@ -2853,84 +5040,86 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             except (DataError, OSError, ValueError) as exc:
                 self.error.set(str(exc))
                 return
-            self.destroy()
+            self.close()
 
-    class EntityTab(ttk.Frame):
+    class EntityTab(ctk.CTkFrame):
         def __init__(self, parent: tk.Misc, app: "App", kind: str):
-            super().__init__(parent, padding=PAGE_PADDING)
+            super().__init__(parent, fg_color=T["page"], corner_radius=0)
             self.app, self.kind = app, kind
             self.search = tk.StringVar()
             self.state_filter = tk.StringVar(value="Todos")
             self.offset = 0
             self._search_timer: str | None = None
-            heading = ttk.Frame(self)
+            self._rows: dict[str, dict[str, str]] = {}
+            body = ctk.CTkFrame(self, fg_color="transparent")
+            body.pack(fill="both", expand=True, padx=24, pady=20)
+            heading = ctk.CTkFrame(body, fg_color="transparent")
             heading.pack(fill="x", pady=(0, 14))
-            ttk.Label(heading, text=TITLES[kind], style="Heading.TLabel").pack(side="left")
-            ttk.Button(heading, text="Nuevo", style="Accent.TButton", command=self.create).pack(side="right")
-            toolbar = ttk.Frame(self)
+            ctk.CTkLabel(heading, text=TITLES[kind], font=FONTS["h1"], text_color=T["ink"]).pack(side="left")
+            self.count_chip = Chip(heading, "0 registros", "muted")
+            self.count_chip.pack(side="left", padx=12)
+            button(heading, "Nuevo", self.create, variant="primary", width=112).pack(side="right")
+            toolbar = ctk.CTkFrame(body, fg_color="transparent")
             toolbar.pack(fill="x")
-            ttk.Label(toolbar, text="Buscar", style="Muted.TLabel").pack(side="left")
-            ttk.Entry(toolbar, textvariable=self.search, width=20).pack(side="left", padx=8, fill="x", expand=True)
-            state_box = ttk.Combobox(toolbar, textvariable=self.state_filter, values=("Todos", "Activos", "Inactivos"),
-                                    state="readonly", width=10)
-            state_box.pack(side="left")
-            state_box.bind("<<ComboboxSelected>>", lambda _e: self._search_changed())
-            self.search.trace_add("write", lambda *_: self._search_changed())
-            actions = ttk.Frame(self)
-            actions.pack(fill="x", pady=(10, 0))
+            self.search_entry = SearchField(toolbar, self.search, self.refresh, placeholder_text="Buscar nombre, ID o datos…", width=180)
+            self.search_entry.pack(side="left", fill="x", expand=True, padx=(0, 12))
+            self.search.trace_add("write", lambda *_: setattr(self, "offset", 0))
+            self.state_control = segmented(toolbar, self.state_filter, ["Todos", "Activos", "Inactivos"],
+                                           lambda _value: self._filter_changed())
+            self.state_control.pack(side="left")
+            self.source_button = None
+            if kind in ("grupos", "investigadores"):
+                self.source_button = button(toolbar, "Consultar fuente", self.open_source, width=132, state="disabled")
+                self.source_button.pack(side="left", padx=(12, 0))
+            actions = ctk.CTkFrame(body, fg_color="transparent")
+            actions.pack(fill="x", pady=(12, 0))
             self.selection_buttons = []
             for label, action in (("Abrir ficha", self.open_detail), ("Editar", self.edit),
                                   ("Desactivar", self.toggle), ("Eliminar", self.delete)):
-                button = ttk.Button(actions, text=label, command=action,
-                                    style="Danger.TButton" if label == "Eliminar" else "TButton")
-                button.pack(side="left", padx=(0, 6))
-                self.selection_buttons.append(button)
+                control = button(actions, label, action, variant="danger" if label == "Eliminar" else "secondary",
+                                 width=112, state="disabled")
+                control.pack(side="left", padx=(0, 8))
+                self.selection_buttons.append(control)
                 if label == "Desactivar":
-                    self.toggle_button = button
-            # La categoría solo se muestra en el módulo de grupos. Las columnas sin datos se ocultan al refrescar.
-            visible = {
+                    self.toggle_button = control
+            self.visible = {
                 "grupos": ("nombre", "categoria", "responsable", "activo", "id"),
                 "investigadores": ("nombre", "afiliacion", "contacto", "activo", "id"),
-                "productos": ("titulo", "anio", "tipologia", "validacion", "activo", "id"),
+                "productos": ("titulo", "anio", "tipologia", "categoria", "validacion", "activo", "id"),
                 "planes": ("grupo_id", "nombre", "objetivo", "inicio", "fin", "activo", "id"),
             }[kind]
-            table_frame = ttk.Frame(self)
-            table_frame.pack(fill="both", expand=True, pady=(10, 0))
-            table_frame.columnconfigure(0, weight=1)
-            table_frame.rowconfigure(0, weight=1)
-            self.table = ttk.Treeview(table_frame, columns=visible, show="headings", selectmode="browse", height=14)
-            self.table.tag_configure("stripe", background=self.app.colors["stripe"])
-            for field in visible:
-                self.table.heading(field, anchor="w", text="Estado" if field == "activo" else LABELS[field].replace(" (ID)", ""))
-                width = (360 if field == "objetivo" else 300 if field in ("titulo", "nombre", "grupo_id") else
-                         220 if field in ("responsable", "tipologia", "afiliacion") else
-                         180 if field in ("id", "contacto") else 110)
-                self.table.column(field, width=width, minwidth=65, stretch=True)
-            table_y = AutoScrollbar(table_frame, orient="vertical", command=self.table.yview)
-            table_x = AutoScrollbar(table_frame, orient="horizontal", command=self.table.xview)
-            self.table.configure(yscrollcommand=table_y.set, xscrollcommand=table_x.set)
-            self.table.grid(row=0, column=0, sticky="nsew")
-            table_y.grid(row=0, column=1, sticky="ns")
-            table_x.grid(row=1, column=0, sticky="ew")
-            if kind == "productos":
-                self.table.bind("<ButtonRelease-1>", lambda event: self.open_detail() if self.table.identify_row(event.y) else None)
-            else:
-                self.table.bind("<Double-1>", lambda _event: self.open_detail())
-            self.table.bind("<Return>", lambda _event: self.open_detail())
-            self.table.bind("<<TreeviewSelect>>", lambda _event: self._selection_changed())
-            self.empty_state = ttk.Label(table_frame, text="Sin registros. Cree uno nuevo o cambie la búsqueda.",
-                                          style="Muted.TLabel", wraplength=400)
-            pager = ttk.Frame(self, padding=(0, 10, 0, 0))
-            pager.pack(side="bottom", fill="x", before=table_frame)
-            self.previous = ttk.Button(pager, text="Anterior", command=lambda: self._move(-1))
-            self.previous.pack(side="left")
+            widths = {field: (280 if field in ("titulo", "nombre", "grupo_id", "objetivo") else
+                              160 if field in ("responsable", "tipologia", "afiliacion", "contacto", "id") else
+                              60 if field == "anio" else 96) for field in self.visible}
+            self.table = DataTable(body, self.visible,
+                                   headings={field: "Estado" if field == "activo" else LABELS[field].replace(" (ID)", "")
+                                             for field in self.visible}, widths=widths, anchors={"anio": "e"},
+                                   chips={"activo": lambda value: "primary" if value == "Activo" else "muted",
+                                          "validacion": lambda value: STATUS_COLORS.get(value.lower(), "unknown"),
+                                          "categoria": lambda value: "unknown" if value == "—" else "primary"},
+                                   row_chips={"categoria": lambda iid, _value: category_tone(self._rows.get(iid, {}))},
+                                   tooltips={"categoria": self._category_hint}, height_rows=12, open_on_click=kind == "productos")
+            self.table.empty_text = "Sin registros. Cree uno nuevo o cambie la búsqueda."
+            self.table.on_open(lambda _iid: self.open_detail())
+            self.table.on_select(lambda _iid: self._selection_changed())
+            # El paginador se empaqueta antes que la tabla para no quedar recortado en ventanas bajas.
+            self.pager = Pager(body, self._move)
+            self.pager.pack(side="bottom", fill="x", pady=(10, 0))
+            self.table.pack(fill="both", expand=True, pady=(12, 0))
+            self.previous, self.next = self.pager.previous, self.pager.next
             self.page_label = tk.StringVar()
-            ttk.Label(pager, textvariable=self.page_label).pack(side="left", padx=10)
-            self.next = ttk.Button(pager, text="Siguiente", command=lambda: self._move(1))
-            self.next.pack(side="left")
-            if kind in ("grupos", "investigadores"):
-                ttk.Button(pager, text="Consultar fuente", command=self.open_source).pack(side="right")
-            self.visible = visible
+
+        def _category_hint(self, iid: str, text: str) -> str:
+            row = self._rows.get(iid, {})
+            category = catalog_by_code.get(row.get("categoria", "")) if self.kind == "productos" else None
+            if row.get("categoria_origen") == "estimada":
+                return text + " · Estimada por tipología" + (f"\n{category['descripcion']}" if category else "")
+            return f"{text} — {category['descripcion']}" if category else ""
+
+        def _filter_changed(self) -> None:
+            self.offset = 0
+            self.refresh()
+
 
         def selected(self) -> str | None:
             selection = self.table.selection()
@@ -2940,6 +5129,11 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             key = self.selected()
             for button in self.selection_buttons:
                 button.configure(state="normal" if key else "disabled")
+            self.selection_buttons[-1].configure(fg_color=T["rejected"] if key else T["field"],
+                                                  border_width=0 if key else 1, border_color=T["line_strong"],
+                                                  text_color_disabled=T["disabled"])
+            if self.source_button is not None:
+                self.source_button.configure(state="normal" if key else "disabled")
             row = self.app.record(self.kind, key) if key else None
             self.toggle_button.configure(text="Activar" if row and row["activo"] == "0" else "Desactivar")
 
@@ -2961,29 +5155,27 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             if self._search_timer is not None:
                 self.after_cancel(self._search_timer)
                 self._search_timer = None
+            self.search_entry.cancel_pending()
             current = self.selected()
             self.table.delete(*self.table.get_children())
             page = self.app.entity_page(self.kind, self.offset, self.search.get(), self.state_filter.get())
             if self.offset and self.offset >= page["total"]:
                 self.offset = max(0, (page["total"] - 1) // PAGE_SIZE * PAGE_SIZE)
                 page = self.app.entity_page(self.kind, self.offset, self.search.get(), self.state_filter.get())
+            self._rows = {row["id"]: row for row in page["rows"]}
+            self.count_chip.set(f"{number(page['total'])} registros", "muted")
             for index, row in enumerate(page["rows"]):
                 self.app._record_cache[(self.kind, row["id"])] = row
                 values = [self.app.reference_label("grupos", row[field]) if field == "grupo_id" else cell_value(field, row[field])
                           for field in self.visible]
                 self.table.insert("", "end", iid=row["id"], values=values,
                                   tags=("stripe",) if index % 2 else ())
-            self.page_label.set(f"{self.offset + 1 if page['total'] else 0}–{self.offset + len(page['rows'])} de {page['total']}")
+            self.pager.show(self.offset, len(page["rows"]), page["total"])
+            self.page_label.set(self.pager.label.cget("text"))
             show_columns(self.table, self.visible, self.app.usage(self.kind), keep=("nombre", "titulo", "activo", "id"))
             if current and self.table.exists(current):
                 self.table.selection_set(current)
             self._selection_changed()
-            self.previous.configure(state="normal" if self.offset else "disabled")
-            self.next.configure(state="normal" if self.offset + PAGE_SIZE < page["total"] else "disabled")
-            if page["total"]:
-                self.empty_state.place_forget()
-            else:
-                self.empty_state.place(relx=0.5, rely=0.45, anchor="center")
 
         def open_detail(self) -> None:
             key = self.selected()
@@ -3006,7 +5198,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                 if row and row["url"]:
                     self.app.import_url(row["url"])
                 else:
-                    messagebox.showinfo("Sin fuente", "Este registro no tiene URL de origen", parent=self)
+                    self.app.inform("Sin fuente", "Este registro no tiene URL de origen", parent=self)
 
         def toggle(self) -> None:
             key = self.selected()
@@ -3016,53 +5208,64 @@ def build_gui(root: Any, repository: Repository | CppRepository,
         def delete(self) -> None:
             key = self.selected()
             row = self.app.record(self.kind, key) if key else None
-            if row and messagebox.askyesno("Eliminar", f"¿Eliminar {record_name(row)} definitivamente?\nPuede deshacer este cambio antes de vaciar el historial.", parent=self):
+            if row and self.app.confirm("Eliminar", f"¿Eliminar {record_name(row)} definitivamente?\nPuede deshacer este cambio antes de vaciar el historial.", parent=self):
                 self.app.mutate(lambda: self.app.repo.delete(self.kind, key))
 
         def restyle(self) -> None:
-            self.table.tag_configure("stripe", background=self.app.colors["stripe"])
+            self.table.redraw()
 
-    class RelationTab(ttk.Frame):
+    class RelationTab(ctk.CTkFrame):
         def __init__(self, parent: tk.Misc, app: "App", kind: str):
-            super().__init__(parent, padding=(14, 14, 14, 10))
+            super().__init__(parent, fg_color=T["page"], corner_radius=0)
             self.app, self.kind = app, kind
             self.offset = 0
             self.search = tk.StringVar()
             self._search_timer: str | None = None
-            search_bar = ttk.Frame(self)
-            search_bar.pack(fill="x", pady=(0, 10))
-            ttk.Label(search_bar, text="Buscar nombres, IDs o datos del vínculo", style="Muted.TLabel").pack(side="left")
-            ttk.Entry(search_bar, textvariable=self.search, width=30).pack(side="left", padx=8, fill="x", expand=True)
-            ttk.Button(search_bar, text="Vincular", style="Accent.TButton", command=self.create).pack(side="right", padx=(8, 0))
-            self.search.trace_add("write", self._search_changed)
-            actions = ttk.Frame(self)
+            body = ctk.CTkFrame(self, fg_color="transparent")
+            body.pack(fill="both", expand=True, padx=8, pady=12)
+            search_bar = ctk.CTkFrame(body, fg_color="transparent")
+            search_bar.pack(fill="x", pady=(0, 12))
+            self.search_entry = SearchField(search_bar, self.search, self.refresh,
+                                             placeholder_text="Buscar nombres, IDs o datos del vínculo…")
+            self.search_entry.pack(side="left", fill="x", expand=True, padx=(0, 12))
+            button(search_bar, "Nuevo vínculo", self.create, variant="primary", width=132).pack(side="right")
+            self.search.trace_add("write", lambda *_: setattr(self, "offset", 0))
+            actions = ctk.CTkFrame(body, fg_color="transparent")
             actions.pack(fill="x")
-            for label, action in (("Editar", self.edit),
-                                  ("Activar/desactivar", self.toggle), ("Desvincular", self.delete)):
-                ttk.Button(actions, text=label, command=action,
-                           style="Danger.TButton" if label == "Desvincular" else "TButton").pack(side="left", padx=(0, 6))
+            self.selection_buttons = []
+            for label, action in (("Editar", self.edit), ("Desactivar", self.toggle), ("Desvincular", self.delete)):
+                control = button(actions, label, action, variant="danger" if label == "Desvincular" else "secondary",
+                                 width=112, state="disabled")
+                control.pack(side="left", padx=(0, 8))
+                self.selection_buttons.append(control)
+            self.toggle_button = self.selection_buttons[1]
+            self._rows: dict[str, dict[str, str]] = {}
             self.fields = RELATION_FIELDS[kind]
-            table_frame = ttk.Frame(self)
-            table_frame.pack(fill="both", expand=True, pady=10)
-            table_frame.columnconfigure(0, weight=1)
-            table_frame.rowconfigure(0, weight=1)
-            self.table = ttk.Treeview(table_frame, columns=self.fields, show="headings", selectmode="browse")
-            self.table.tag_configure("stripe", background=self.app.colors["stripe"])
-            for field in self.fields:
-                self.table.heading(field, anchor="w", text=LABELS.get(field, field).replace(" (ID)", ""))
-                self.table.column(field, width=260 if field.endswith("_id") else 130)
-            table_y = AutoScrollbar(table_frame, orient="vertical", command=self.table.yview)
-            table_x = AutoScrollbar(table_frame, orient="horizontal", command=self.table.xview)
-            self.table.configure(yscrollcommand=table_y.set, xscrollcommand=table_x.set)
-            self.table.grid(row=0, column=0, sticky="nsew")
-            table_y.grid(row=0, column=1, sticky="ns")
-            table_x.grid(row=1, column=0, sticky="ew")
-            pager = ttk.Frame(self)
-            pager.pack(fill="x")
-            ttk.Button(pager, text="Anterior", command=lambda: self._move(-1)).pack(side="left")
+            self.table = DataTable(body, self.fields,
+                                   headings={field: "Estado" if field == "activo" else LABELS.get(field, field).replace(" (ID)", "")
+                                             for field in self.fields},
+                                   widths={field: 260 if field.endswith("_id") else 130 for field in self.fields},
+                                   anchors={"orden": "e"}, height_rows=12,
+                                   chips={"activo": lambda value: "primary" if value == "Activo" else "muted"})
+            self.table.empty_text = "Sin vínculos. Cree uno nuevo o cambie la búsqueda."
+            self.table.on_open(lambda _iid: self.edit())
+            self.table.on_select(lambda _iid: self._selection_changed())
+            self.pager = Pager(body, self._move)
+            self.pager.pack(side="bottom", fill="x", pady=(10, 0))
+            self.table.pack(fill="both", expand=True, pady=(12, 0))
+            self.previous, self.next = self.pager.previous, self.pager.next
             self.page_label = tk.StringVar()
-            ttk.Label(pager, textvariable=self.page_label).pack(side="left", padx=10)
-            ttk.Button(pager, text="Siguiente", command=lambda: self._move(1)).pack(side="left")
+
+        def _selection_changed(self) -> None:
+            selection = self.table.selection()
+            for control in self.selection_buttons:
+                control.configure(state="normal" if selection else "disabled")
+            self.selection_buttons[-1].configure(fg_color=T["rejected"] if selection else T["field"],
+                                                  border_width=0 if selection else 1, border_color=T["line_strong"],
+                                                  text_color_disabled=T["disabled"])
+            row = self._rows.get(selection[0], {}) if selection else {}
+            self.toggle_button.configure(text="Activar" if row.get("activo") == "0" else "Desactivar")
+
 
         def _search_changed(self, *_: Any) -> None:
             self.offset = 0
@@ -3084,6 +5287,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             if self._search_timer:
                 self.after_cancel(self._search_timer)
                 self._search_timer = None
+            self.search_entry.cancel_pending()
             current = self.table.selection()
             self.table.delete(*self.table.get_children())
             left, right = RELATION_ENDS[self.kind][:2]
@@ -3092,16 +5296,20 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                 self.offset = max(0, (page["total"] - 1) // PAGE_SIZE * PAGE_SIZE)
                 page = self.app.relationship_page(self.kind, self.offset, self.search.get())
             left_kind, right_kind = RELATION_ENDS[self.kind][2:]
+            self._rows.clear()
             for index, row in enumerate(page["rows"]):
                 pair = json.dumps((row[left], row[right]))
+                self._rows[pair] = row
                 values = [self.app.reference_label(left_kind if field == left else right_kind, row[field])
                           if field in (left, right) else cell_value(field, row[field]) for field in self.fields]
                 self.table.insert("", "end", iid=pair, values=values,
                                   tags=("stripe",) if index % 2 else ())
-            self.page_label.set(f"{self.offset + 1 if page['total'] else 0}–{self.offset + len(page['rows'])} de {page['total']}")
+            self.pager.show(self.offset, len(page["rows"]), page["total"])
+            self.page_label.set(self.pager.label.cget("text"))
             show_columns(self.table, self.fields, self.app.usage(self.kind), keep=(left, right, "activo"))
             if current and self.table.exists(current[0]):
                 self.table.selection_set(current[0])
+            self._selection_changed()
 
         def create(self) -> None:
             self.app.edit_record(self.kind, parent=self)
@@ -3119,78 +5327,74 @@ def build_gui(root: Any, repository: Repository | CppRepository,
 
         def delete(self) -> None:
             key = self.selected()
-            if key and messagebox.askyesno("Desvincular", "¿Eliminar esta relación?", parent=self):
+            if key and self.app.confirm("Desvincular", "¿Eliminar esta relación?", parent=self):
                 self.app.mutate(lambda: self.app.repo.delete(self.kind, key))
 
         def restyle(self) -> None:
-            self.table.tag_configure("stripe", background=self.app.colors["stripe"])
+            self.table.redraw()
 
-    class ContextTab(ttk.Frame):
-        def __init__(self, parent: tk.Misc, detail: "DetailDialog", source: str, side: str,
+    class ContextTab(ctk.CTkFrame):
+        def __init__(self, parent: Any, detail: "DetailDialog", source: str, side: str,
                      target_kind: str, columns: tuple[str, ...]):
-            super().__init__(parent, padding=10)
+            super().__init__(parent, fg_color="transparent")
             self.detail, self.app = detail, detail.app
             self.source, self.side, self.target_kind = source, side, target_kind
             self.columns = columns
             self.offset = 0
             self.search = tk.StringVar()
-            self._timer: str | None = None
+            self.state_filter = tk.StringVar(value="Todos")
             self.items: dict[str, tuple[dict[str, str], dict[str, str]]] = {}
-            toolbar = ttk.Frame(self)
-            toolbar.pack(fill="x", pady=(0, 5))
-            ttk.Label(toolbar, text="Buscar").pack(side="left")
-            ttk.Entry(toolbar, textvariable=self.search, width=25).pack(side="left", padx=6)
-            self.search.trace_add("write", self._search_changed)
-            ttk.Button(toolbar, text="Nuevo plan" if source == "planes" else "Vincular…",
-                       style="Accent.TButton", command=self.create).pack(side="right")
-            actions = ttk.Frame(self)
-            actions.pack(fill="x", pady=(0, 6))
+            toolbar = ctk.CTkFrame(self, fg_color="transparent")
+            toolbar.pack(fill="x", pady=(4, 10))
+            self.search_entry = SearchField(toolbar, self.search, self.refresh, placeholder_text="Buscar en esta ficha…",
+                                            width=180)
+            self.search_entry.pack(side="left", fill="x", expand=True, padx=(0, 12))
+            self.search.trace_add("write", lambda *_: setattr(self, "offset", 0))
+            self.state_control = segmented(toolbar, self.state_filter, ["Todos", "Activos"],
+                                           lambda _value: self._filter_changed())
+            self.state_control.pack(side="left")
+            button(toolbar, "Nuevo plan" if source == "planes" else "Vincular…", self.create, variant="primary",
+                   width=120).pack(side="left", padx=(12, 0))
+            actions = ctk.CTkFrame(self, fg_color="transparent")
+            actions.pack(fill="x", pady=(0, 10))
             self.selection_buttons = []
             for label, command in (("Abrir ficha", self.open_record), ("Editar registro", self.edit_record),
                                     ("Editar vínculo" if source != "planes" else "Editar plan", self.edit_link),
-                                    ("Activar/desactivar", self.toggle),
+                                    ("Desactivar", self.toggle),
                                     ("Desvincular" if source != "planes" else "Eliminar plan", self.delete)):
                 if source == "planes" and label == "Editar registro":
                     continue
-                button = ttk.Button(actions, text=label, command=command,
-                                    style="Danger.TButton" if label in ("Desvincular", "Eliminar plan") else "TButton")
-                button.pack(side="left", padx=(0, 6))
-                self.selection_buttons.append(button)
-            frame = ttk.Frame(self)
-            frame.pack(fill="both", expand=True)
-            frame.columnconfigure(0, weight=1)
-            frame.rowconfigure(0, weight=1)
-            self.table = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse")
-            for field in columns:
-                label = {"_link_active": "Vínculo", "_record_active": "Registro"}.get(field, LABELS.get(field, field))
-                self.table.heading(field, anchor="w", text=label)
-                self.table.column(field, width=270 if field in ("nombre", "titulo") else 120, minwidth=70)
-            yscroll = AutoScrollbar(frame, command=self.table.yview)
-            xscroll = AutoScrollbar(frame, orient="horizontal", command=self.table.xview)
-            self.table.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
-            self.table.grid(row=0, column=0, sticky="nsew")
-            yscroll.grid(row=0, column=1, sticky="ns")
-            xscroll.grid(row=1, column=0, sticky="ew")
-            self.table.bind("<<TreeviewSelect>>", lambda _e: self._selection_changed())
-            if target_kind == "productos":
-                self.table.bind("<ButtonRelease-1>", lambda event: self.open_record() if self.table.identify_row(event.y) else None)
-            else:
-                self.table.bind("<Double-1>", lambda _e: self.open_record())
-            self.table.bind("<Return>", lambda _e: self.open_record())
-            pager = ttk.Frame(self)
-            pager.pack(side="bottom", fill="x", pady=(5, 0), before=frame)
-            self.previous = ttk.Button(pager, text="Anterior", command=lambda: self.move(-1))
-            self.previous.pack(side="left")
+                control = button(actions, label, command, width=112, state="disabled",
+                                 variant="danger" if label in ("Desvincular", "Eliminar plan") else "secondary")
+                control.pack(side="left", padx=(0, 8))
+                self.selection_buttons.append(control)
+                if label == "Desactivar":
+                    self.toggle_button = control
+            state_tone = lambda value: "primary" if value == "Activo" else "muted"
+            self.table = DataTable(self, columns, height_rows=8, open_on_click=target_kind == "productos",
+                                   headings={field: {"_link_active": "Vínculo", "_record_active": "Registro"}.get(
+                                       field, LABELS.get(field, field).replace(" (ID)", "")) for field in columns},
+                                   widths={field: 280 if field in ("nombre", "titulo") else
+                                           65 if field in ("anio", "orden") else 110 for field in columns},
+                                   anchors={"anio": "e", "orden": "e"},
+                                   chips={"_link_active": state_tone, "_record_active": state_tone,
+                                          "validacion": lambda value: STATUS_COLORS.get(value.lower(), "unknown"),
+                                          "categoria": lambda value: "unknown" if value == "—" else "primary"},
+                                   row_chips={"categoria": lambda iid, _value: category_tone(
+                                       self.items.get(iid, ({}, {}))[0])})
+            self.table.empty_text = "Sin datos asociados. Vincule un registro o cambie la búsqueda."
+            self.table.on_select(lambda _iid: self._selection_changed())
+            self.table.on_open(lambda _iid: self.open_record())
+            # El paginador se empaqueta antes que la tabla para no quedar recortado en ventanas bajas.
+            self.pager = Pager(self, self.move)
+            self.pager.pack(side="bottom", fill="x", pady=(10, 0))
+            self.table.pack(fill="both", expand=True)
+            self.previous, self.next = self.pager.previous, self.pager.next
             self.count = tk.StringVar()
-            ttk.Label(pager, textvariable=self.count).pack(side="left", padx=8)
-            self.next = ttk.Button(pager, text="Siguiente", command=lambda: self.move(1))
-            self.next.pack(side="left")
 
-        def _search_changed(self, *_: Any) -> None:
-            if self._timer:
-                self.after_cancel(self._timer)
+        def _filter_changed(self) -> None:
             self.offset = 0
-            self._timer = self.after(250, self.refresh)
+            self.refresh()
 
         def move(self, direction: int) -> None:
             self.offset = max(0, self.offset + direction * PAGE_SIZE)
@@ -3201,14 +5405,16 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             return self.items.get(selected[0]) if selected else None
 
         def _selection_changed(self) -> None:
-            state = "normal" if self.selected() else "disabled"
-            for button in self.selection_buttons:
-                button.configure(state=state)
+            item = self.selected()
+            for control in self.selection_buttons:
+                control.configure(state="normal" if item else "disabled")
+            self.selection_buttons[-1].configure(fg_color=T["rejected"] if item else T["field"],
+                                                  border_width=0 if item else 1, border_color=T["line_strong"],
+                                                  text_color_disabled=T["disabled"])
+            self.toggle_button.configure(text="Activar" if item and item[1]["activo"] == "0" else "Desactivar")
 
         def refresh(self) -> None:
-            if self._timer:
-                self.after_cancel(self._timer)
-                self._timer = None
+            self.search_entry.cancel_pending()
             selected = self.table.selection()
             page = self.detail.page_for(self, self.offset, self.search.get())
             if self.offset and self.offset >= page["total"]:
@@ -3216,22 +5422,19 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                 page = self.detail.page_for(self, self.offset, self.search.get())
             self.items.clear()
             self.table.delete(*self.table.get_children())
-            self.table.tag_configure("stripe", background=self.app.colors["stripe"])
             for index, (row, link) in enumerate(page["rows"]):
                 self.items[row["id"]] = (row, link)
                 combined = {**row, **link, "_link_active": link["activo"], "_record_active": row["activo"]}
                 values = [cell_value("activo" if field.startswith("_") else field, combined.get(field, ""))
                           for field in self.columns]
                 self.table.insert("", "end", iid=row["id"], values=values, tags=("stripe",) if index % 2 else ())
+            usage = {**self.app.usage(self.target_kind), **self.app.usage(self.source)}
+            show_columns(self.table, self.columns, usage, keep=("nombre", "titulo"))
+            self.pager.show(self.offset, len(page["rows"]), page["total"])
+            self.count.set(self.pager.label.cget("text"))
             if selected and self.table.exists(selected[0]):
                 self.table.selection_set(selected[0])
             self._selection_changed()
-            usage = {**self.app.usage(self.target_kind), **self.app.usage(self.source)}
-            show_columns(self.table, self.columns, usage, keep=("nombre", "titulo"))
-            first = self.offset + 1 if page["total"] else 0
-            self.count.set(f"{first}–{self.offset + len(page['rows'])} de {page['total']}" if page["total"] else "Sin datos asociados")
-            self.previous.configure(state="normal" if self.offset else "disabled")
-            self.next.configure(state="normal" if self.offset + PAGE_SIZE < page["total"] else "disabled")
 
         def create(self) -> None:
             field = "grupo_id" if self.source == "planes" else RELATION_ENDS[self.source][0 if self.side == "left" else 1]
@@ -3263,90 +5466,121 @@ def build_gui(root: Any, repository: Repository | CppRepository,
 
         def delete(self) -> None:
             item = self.selected()
-            if item and messagebox.askyesno("Eliminar asociación" if self.source != "planes" else "Eliminar plan",
+            if item and self.app.confirm("Eliminar asociación" if self.source != "planes" else "Eliminar plan",
                                             f"¿Eliminar {record_name(item[0])} de esta ficha?", parent=self.detail):
                 row, link = item
                 key = row["id"] if self.source == "planes" else tuple(link[field] for field in RELATION_ENDS[self.source][:2])
                 self.app.mutate(lambda: self.app.repo.delete(self.source, key))
 
-        def destroy(self) -> None:
-            if self._timer:
-                self.after_cancel(self._timer)
-                self._timer = None
-            super().destroy()
+    class DetailDialog(Dialog):
+        """Ficha de un registro: resumen, vínculos con sus acciones, indicador y estadísticas."""
+        # Ventanas del indicador: años hasta el corte (el año actual); None usa todos los años.
+        INDICATOR_WINDOWS = {"Completa": None, "Últimos 5 años": 5, "Últimos 2 años": 2}
 
-    class DetailDialog(tk.Toplevel):
-        def __init__(self, parent: tk.Misc, app: "App", kind: str, key: str):
-            super().__init__(parent)
+        def __init__(self, parent: Any, app: "App", kind: str, key: str, tab: str | None = None):
+            super().__init__(parent, "Ficha · " + TITLES[kind], 1040, 700)
+            self.minsize(720, 500)
             self.app, self.kind, self.key = app, kind, key
-            self.title("Ficha · " + TITLES[kind])
-            place_dialog(self, parent, 1000, 670)
-            self.minsize(700, 480)
-            self.columnconfigure(0, weight=1)
-            self.rowconfigure(1, weight=1)
-            header = ttk.Frame(self, padding=(20, 16, 20, 12))
-            header.grid(row=0, column=0, sticky="ew")
-            header.columnconfigure(0, weight=1)
-            self.heading = tk.StringVar()
-            ttk.Label(header, textvariable=self.heading, style="Title.TLabel", wraplength=700).grid(row=0, column=0, sticky="w")
-            ttk.Button(header, text="Editar ficha", style="Accent.TButton", command=lambda: app.edit_record(
-                kind, key=key, parent=self)).grid(row=0, column=1, padx=(12, 0))
-            self.notebook = ttk.Notebook(self)
-            self.notebook.grid(row=1, column=0, sticky="nsew", padx=20)
-            information = ttk.Frame(self.notebook, padding=10)
-            self.notebook.add(information, text="Resumen")
-            self.info = tk.Text(information, wrap="word", font=font(10), state="disabled",
-                                padx=18, pady=10, borderwidth=0, relief="flat", highlightthickness=1)
-            scroll = ttk.Scrollbar(information, command=self.info.yview)
-            self.info.configure(yscrollcommand=scroll.set)
-            self.info.pack(side="left", fill="both", expand=True)
-            scroll.pack(side="right", fill="y")
-            # Categorías solo dentro de los grupos: la del grupo y la de sus integrantes.
+            self.body.pack_configure(pady=(16, 8))
+            header = ctk.CTkFrame(self.body, fg_color="transparent")
+            header.pack(fill="x", pady=(0, 6))
+            header.grid_columnconfigure(0, weight=1)
+            self.eyebrow = ctk.CTkLabel(header, text="", font=FONTS["caption"], text_color=T["muted"], anchor="w")
+            self.eyebrow.grid(row=0, column=0, sticky="w")
+            self.title_label = ctk.CTkLabel(header, text="", font=FONTS["h1"], text_color=T["ink"], anchor="w",
+                                            justify="left", wraplength=780)
+            self.title_label.grid(row=1, column=0, sticky="ew")
+            self.state_chips = ctk.CTkFrame(header, fg_color="transparent")
+            self.state_chips.grid(row=2, column=0, sticky="w", pady=(6, 0))
+            button(header, "Editar ficha", lambda: app.edit_record(kind, key=key, parent=self), variant="primary",
+                   width=120).grid(row=0, column=1, rowspan=3, sticky="ne", padx=(12, 0))
+            header.bind("<Configure>", lambda event: self.title_label.configure(
+                wraplength=max(260, event.width / scale_of(header) - 150)), add="+")
+            self.tabs = tabview(self.body)
+            self.tabs.pack(fill="both", expand=True)
+            summary_tab = self.tabs.add("Resumen")
+            self.summary = ctk.CTkScrollableFrame(summary_tab, fg_color="transparent", corner_radius=0,
+                                                  scrollbar_button_color=T["line_strong"],
+                                                  scrollbar_button_hover_color=T["muted"])
+            self.summary.pack(fill="both", expand=True)
+            self.summary._parent_canvas.configure(yscrollcommand=lambda first, last: set_scrollbar(
+                self.summary._scrollbar, first, last))
+            self.summary.grid_columnconfigure(1, weight=1)
+            self._wrap = 700
+            self._wrapped: list[Any] = []
+            summary_tab.bind("<Configure>", self._summary_width, add="+")
+            # La clasificación de productos se muestra también en sus vínculos.
             specifications = {
                 "grupos": (("Integrantes", "membresias", "left", "investigadores", ("nombre", "categoria", "rol", "inicio", "fin", "_link_active", "_record_active")),
                            ("Planes", "planes", "left", "planes", ("nombre", "inicio", "fin", "objetivo", "_record_active")),
-                           ("Productos", "grupos_productos", "left", "productos", ("titulo", "anio", "tipologia", "validacion", "_link_active", "_record_active"))),
+                           ("Productos", "grupos_productos", "left", "productos", ("titulo", "anio", "tipologia", "categoria", "validacion", "_link_active", "_record_active"))),
                 "investigadores": (("Grupos", "membresias", "right", "grupos", ("nombre", "rol", "inicio", "fin", "_link_active", "_record_active")),
-                                    ("Productos", "autorias", "right", "productos", ("titulo", "anio", "tipologia", "validacion", "orden", "rol", "_link_active", "_record_active"))),
+                                    ("Productos", "autorias", "right", "productos", ("titulo", "anio", "tipologia", "categoria", "validacion", "orden", "rol", "_link_active", "_record_active"))),
                 "productos": (("Autores", "autorias", "left", "investigadores", ("nombre", "orden", "rol", "_link_active", "_record_active")),
                                ("Grupos", "grupos_productos", "right", "grupos", ("nombre", "origen", "_link_active", "_record_active"))),
                 "planes": (),
             }
             self.link_tabs = {}
             for title, source, side, target, columns in specifications[kind]:
-                tab = ContextTab(self.notebook, self, source, side, target, columns)
-                self.link_tabs[source] = tab
-                self.notebook.add(tab, text=title)
+                tab_view = ContextTab(self.tabs.add(title), self, source, side, target, columns)
+                tab_view.pack(fill="both", expand=True)
+                self.link_tabs[source] = tab_view
+            self.indicator_panel = None
+            if kind in ("grupos", "investigadores"):
+                indicator = self.tabs.add("Indicador")
+                self.indicator_window = tk.StringVar(value="Completa")
+                window_bar = ctk.CTkFrame(indicator, fg_color="transparent")
+                window_bar.pack(fill="x", pady=(4, 12))
+                ctk.CTkLabel(window_bar, text="Ventana", font=FONTS["small"], text_color=T["muted"]).pack(
+                    side="left", padx=(0, 10))
+                self.indicator_control = segmented(window_bar, self.indicator_window, list(self.INDICATOR_WINDOWS),
+                                                   lambda _value: self.refresh_indicator())
+                self.indicator_control.pack(side="left")
+                self.indicator_message = ctk.CTkLabel(indicator, text="", font=FONTS["body"], text_color=T["muted"],
+                                                      anchor="w", justify="left", wraplength=700)
+                self.indicator_panel = IndicatorPanel(
+                    indicator, lambda: app.show_indicator_details(self.indicator_panel.result, parent=self),
+                    bg_color=T["page"])
             self.stats_canvas = None
             if kind != "planes":
-                stats = ttk.Frame(self.notebook, padding=10)
-                self.notebook.add(stats, text="Estadísticas")
+                stats = self.tabs.add("Estadísticas")
                 self.stats_note = tk.StringVar()
-                ttk.Label(stats, textvariable=self.stats_note, wraplength=800).pack(fill="x", pady=(0, 6))
-                panel, self.stats_canvas = app._chart_panel(stats, 280)
-                panel.pack(fill="both", expand=True)
-                self.stats_canvas.bind("<Configure>", lambda _e: self._draw_statistics())
-                ttk.Button(stats, text="Explorar en Dashboard con filtros", command=self.show_statistics).pack(anchor="e", pady=6)
-            footer = ttk.Frame(self, padding=(20, 12))
-            footer.grid(row=2, column=0, sticky="ew")
+                ctk.CTkLabel(stats, textvariable=self.stats_note, font=FONTS["small"], text_color=T["muted"],
+                             anchor="w", justify="left", wraplength=800).pack(fill="x", pady=(4, 8))
+                button(stats, "Explorar en Dashboard con filtros", self.show_statistics, width=240).pack(
+                    side="bottom", anchor="e", pady=(10, 0))
+                charts = ctk.CTkFrame(stats, fg_color="transparent")
+                charts.pack(fill="both", expand=True)
+                charts.grid_columnconfigure(0, weight=3, uniform="statistics")
+                charts.grid_columnconfigure(1, weight=2, uniform="statistics")
+                charts.grid_rowconfigure(0, weight=1)
+                panel, self.stats_canvas = app._chart_panel(charts, 280, draw=lambda _canvas: self._draw_statistics())
+                panel.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+                panel, self.class_canvas = app._chart_panel(charts, 280, draw=self._draw_classes)
+                panel.grid(row=0, column=1, sticky="nsew")
             if kind == "productos":
-                ttk.Button(footer, text="Enviar a revisión", command=lambda: app.enqueue(key, parent=self)).pack(side="left")
+                button(self.footer, "Enviar a revisión", lambda: app.enqueue(key, parent=self), width=140).pack(
+                    side="left", padx=(0, 8))
             elif kind == "planes":
-                ttk.Button(footer, text="Abrir grupo", command=lambda: app.open_detail(
-                    "grupos", app.repo.get(kind, key)["grupo_id"], self)).pack(side="left")
-            self.source_button = ttk.Button(footer, text="Consultar fuente", command=self.open_source)
+                button(self.footer, "Abrir grupo", lambda: app.open_detail(
+                    "grupos", app.repo.get(kind, key)["grupo_id"], self), width=120).pack(side="left", padx=(0, 8))
+            self.source_button = button(self.footer, "Consultar fuente", self.open_source, width=140)
             if kind != "planes":
-                self.source_button.pack(side="left", padx=6)
-            ttk.Button(footer, text="Cerrar", command=self.destroy).pack(side="right")
-            self.bind("<Escape>", lambda _e: self.destroy())
-            self._previous_grab = self.grab_current()
+                self.source_button.pack(side="left")
+            button(self.footer, "Cerrar", self.close, width=112).pack(side="right")
             self.refresh()
+            if tab is not None:
+                try:
+                    self.tabs.set(tab)
+                except ValueError:
+                    pass
             app.details.add(self)
-            self.grab_set()
+            self.present(wait=False)
 
         def page_for(self, tab: ContextTab, offset: int, query: str) -> dict[str, Any]:
             needle = query.strip().casefold()
-            if tab.source != "planes" and not needle:
+            active_only = tab.state_filter.get() == "Activos"
+            if tab.source != "planes" and not needle and not active_only:
                 page = self.app.repo.related_page(tab.source, self.key, tab.side, offset, PAGE_SIZE)
                 field = RELATION_ENDS[tab.source][1 if tab.side == "left" else 0]
                 return {"total": page["total"], "rows": [(self.app.record(tab.target_kind, link[field]), link) for link in page["rows"]]}
@@ -3364,6 +5598,8 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                     else:
                         field = RELATION_ENDS[tab.source][1 if tab.side == "left" else 0]
                         row = self.app.record(tab.target_kind, link[field])
+                    if active_only and link["activo"] != "1":
+                        continue
                     if needle and needle not in " ".join((*row.values(), *link.values())).casefold():
                         continue
                     if offset <= total < offset + PAGE_SIZE:
@@ -3374,55 +5610,140 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                     break
             return {"total": total, "rows": rows}
 
-        def refresh(self) -> None:
-            row = self.app.repo.get(self.kind, self.key)
-            if row is None:
-                self.destroy()
-                return
-            self.heading.set(f"{record_name(row)} · {display_value('activo', row['activo'])}")
-            colors = self.app.colors
-            self.info.configure(state="normal", background=colors["surface"], foreground=colors["ink"],
-                                selectbackground=colors["primary_soft"], highlightbackground=colors["line"])
-            self.info.tag_configure("label", font=font(9, "strong"), foreground=colors["muted"], spacing1=12)
-            self.info.tag_configure("value", font=font(10), foreground=colors["ink"], spacing1=2, lmargin1=0)
-            self.info.tag_configure("missing", font=font(9), foreground=colors["muted"], spacing1=16)
-            self.info.tag_configure("issue", font=font(10), foreground=colors["rejected"], spacing1=2)
-            self.info.delete("1.0", "end")
+        def _summary_width(self, event: Any) -> None:
+            self._wrap = max(240, round(event.width / scale_of(self)) - 230)
+            for label in self._wrapped:
+                label.configure(wraplength=self._wrap)
+
+        def _summary_row(self, line: int, label: str, value: str, tone: str = "ink") -> None:
+            ctk.CTkLabel(self.summary, text=label, font=FONTS["small"], text_color=T["muted"], anchor="nw",
+                         justify="left", width=170, wraplength=160).grid(row=line, column=0, sticky="nw",
+                                                                         padx=(0, 16), pady=(8, 0))
+            shown = ctk.CTkLabel(self.summary, text=value, font=FONTS["body"], text_color=T[tone], anchor="nw",
+                                 justify="left", wraplength=self._wrap)
+            shown.grid(row=line, column=1, sticky="ew", pady=(8, 0))
+            self._wrapped.append(shown)
+
+        def _fill_summary(self, row: dict[str, str]) -> None:
+            for child in self.summary.winfo_children():
+                child.destroy()
+            self._wrapped = []
             # Solo campos con datos; los vacíos se resumen en una línea. La categoría de
-            # un investigador se consulta desde los integrantes de su grupo.
-            hidden = {"investigadores": {"categoria"}}.get(self.kind, set())
+            # un investigador se consulta desde los integrantes de su grupo; la de un producto tiene su tarjeta.
+            hidden = {"investigadores": {"categoria"}, "productos": {"categoria", "categoria_origen"}}.get(self.kind, set())
             missing = []
-            first = True
+            line = 0
             for field in ENTITY_FIELDS[self.kind]:
                 if field in hidden:
                     continue
                 if field != "validacion" and not row[field]:
                     missing.append(LABELS[field])
                     continue
-                self.info.insert("end", ("" if first else "\n") + LABELS[field] + "\n", "label")
-                first = False
                 if field == "validacion":
                     issues = self.app.repo.product_issues(self.key)
-                    self.info.insert("end", "Validado: cumple todas las reglas" if not issues else "Rechazado", "value")
-                    for code in issues:
-                        self.info.insert("end", "\n• " + VALIDATION_RULES[code], "issue")
+                    self._summary_row(line, LABELS[field], "Validado: cumple todas las reglas" if not issues else
+                                      "Rechazado" + "".join("\n• " + RULE_LABELS[code] for code in issues),
+                                      "ink" if not issues else "rejected")
                 else:
-                    self.info.insert("end", display_value(field, row[field]), "value")
+                    self._summary_row(line, LABELS[field], display_value(field, row[field]))
+                line += 1
+            if self.kind == "productos":
+                self._category_card(row).grid(row=line, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+                line += 1
             if missing:
-                self.info.insert("end", "\nSin registrar: " + ", ".join(missing), "missing")
-            self.info.configure(state="disabled")
+                note = ctk.CTkLabel(self.summary, text="Sin registrar: " + ", ".join(missing), font=FONTS["caption"],
+                                    text_color=T["muted"], anchor="w", justify="left", wraplength=self._wrap + 180)
+                note.grid(row=line, column=0, columnspan=2, sticky="ew", pady=(16, 4))
+
+        def _category_card(self, row: dict[str, str]) -> Any:
+            card = Card(self.summary, title="Clasificación del modelo", bg_color=T["page"])
+            category = catalog_by_code.get(row["categoria"])
+            estimated = row["categoria_origen"] == "estimada"
+            top = ctk.CTkFrame(card.body, fg_color="transparent")
+            top.pack(fill="x")
+            self.category_chip = Chip(top, row["categoria"] or "Sin categoría", category_tone(row))
+            self.category_chip.pack(side="left")
+            description = ctk.CTkLabel(top, text=category["descripcion"] if category else
+                                       "Sin categoría del modelo 2024" if not row["categoria"] else "Código fuera del catálogo",
+                                       font=FONTS["body"], text_color=T["ink"], anchor="w", justify="left",
+                                       wraplength=self._wrap)
+            description.pack(side="left", fill="x", expand=True, padx=(10, 0))
+            self._wrapped.append(description)
+            facts = ctk.CTkFrame(card.body, fg_color="transparent")
+            facts.pack(fill="x", pady=(10, 0))
+            values = [("Origen", "Estimada por tipología" if estimated else "Manual" if row["categoria"] else "—")]
+            if category:
+                values = [("Clase", category["clase"]), ("Peso relativo", decimal(category["peso_relativo"])),
+                          ("Valor en puntos", decimal(category["peso_global"])),
+                          ("Ventana de observación", f"{category['ventana']} años"), *values]
+            for index, (label, value) in enumerate(values):
+                cell = ctk.CTkFrame(facts, fg_color="transparent")
+                cell.grid(row=index // 3, column=index % 3, sticky="w", padx=(0, 28), pady=(0, 8))
+                ctk.CTkLabel(cell, text=label, font=FONTS["caption"], text_color=T["muted"], anchor="w").pack(anchor="w")
+                ctk.CTkLabel(cell, text=value, font=FONTS["body"], text_color=T["ink"], anchor="w").pack(anchor="w")
+            if estimated:
+                ctk.CTkLabel(card.body, text="Confirme o cambie la categoría con Editar ficha.", font=FONTS["small"],
+                             text_color=T["pending"], anchor="w").pack(fill="x")
+            return card
+
+        def refresh(self) -> None:
+            row = self.app.repo.get(self.kind, self.key)
+            if row is None:
+                self.destroy()
+                return
+            self.eyebrow.configure(text=f"{SINGULAR[self.kind].upper()} · {self.key}")
+            self.title_label.configure(text=record_name(row))
+            chips = [(display_value("activo", row["activo"]), "primary" if row["activo"] == "1" else "muted")]
+            if self.kind == "productos":
+                chips.append((display_value("validacion", row["validacion"]),
+                              STATUS_COLORS.get(row["validacion"], "unknown")))
+            elif self.kind == "grupos" and row["categoria"]:
+                chips.append((f"Categoría {row['categoria']}", "primary"))
+            for child in self.state_chips.winfo_children():
+                child.destroy()
+            for text, tone in chips:
+                Chip(self.state_chips, text, tone).pack(side="left", padx=(0, 6))
+            self._fill_summary(row)
             self.source_button.configure(state="normal" if row.get("url") else "disabled")
             for tab in self.link_tabs.values():
                 tab.refresh()
+            self.refresh_indicator()
             if self.stats_canvas is not None:
                 self.statistics = self.app.repo.statistics({"grupos": "Grupo", "investigadores": "Investigador", "productos": "Producto"}[self.kind], self.key, limit=0)
                 self.stats_note.set(f"{self.statistics['total']} productos activos únicos de esta ficha · Todos los años. Los vínculos inactivos se excluyen.")
-                self._draw_statistics()
+                self.stats_canvas.redraw()
+                self.class_canvas.redraw()
+
+        def refresh_indicator(self) -> None:
+            """Indicador de la ficha en la ventana elegida; solo los registros activos tienen indicador."""
+            if self.indicator_panel is None:
+                return
+            row = self.app.repo.get(self.kind, self.key)
+            years = self.INDICATOR_WINDOWS[self.indicator_window.get()]
+            end = date.today().year if years else None
+            result, message = None, ""
+            if row is None or row["activo"] != "1":
+                message = "El indicador se calcula solo para registros activos. Active la ficha para verlo."
+            else:
+                try:
+                    result = self.app.repo.indicator(self.kind, self.key, end - years + 1 if years else None, end)
+                except DataError as exc:
+                    message = str(exc)
+            self.indicator_panel.show(result, record_name(row) if result else "")
+            self.indicator_message.configure(text=message)
+            if message:
+                self.indicator_message.pack(fill="x", pady=(8, 0))
+            else:
+                self.indicator_message.pack_forget()
 
         def _draw_statistics(self) -> None:
             if self.stats_canvas is not None and hasattr(self, "statistics"):
-                self.stats_canvas.configure(bg=self.app.colors["surface"])
                 self.app._draw_histogram(self.stats_canvas, self.statistics["por_anio"])
+
+        def _draw_classes(self, canvas: Any) -> None:
+            counts = class_counts(self.statistics["por_categoria"]) if hasattr(self, "statistics") else {}
+            draw_donut(canvas, "Por clase del modelo 2024", "", [(key, key, count, class_color(key))
+                                                               for key, count in counts.items()], "productos")
 
         def show_statistics(self) -> None:
             kind, key = self.kind, self.key
@@ -3438,45 +5759,20 @@ def build_gui(root: Any, repository: Repository | CppRepository,
 
         def destroy(self) -> None:
             self.app.details.discard(self)
-            previous = getattr(self, "_previous_grab", None)
+            previous = self._previous_grab
+            cancel_widget_timers(self)
             super().destroy()
-            if previous is not None and previous.winfo_exists():
-                previous.grab_set()
-
-    # «Sierra y sabana»: verde institucional UPC; el amarillo solo marca lo pendiente.
-    LIGHT_THEME = {
-        "page": "#f3f6f3", "surface": "#ffffff", "field": "#ffffff",
-        "sidebar": "#163a2e", "sidebar_fg": "#e3ece7", "sidebar_muted": "#a9c2b6",
-        "sidebar_hover": "#1f4a3b", "ink": "#1c2a24", "muted": "#5b6c64",
-        "line": "#dce4df", "line_strong": "#c3cfc8", "hover": "#eaf0ec",
-        "primary": "#1e6b50", "primary_hover": "#185a43", "primary_pressed": "#124636",
-        "on_primary": "#ffffff", "primary_soft": "#dcefe5", "stripe": "#f7faf8",
-        "thumb": "#c3cfc8", "thumb_active": "#9fb0a7",
-        "chart_grid": "#e7ece9", "chart_track": "#eef3f0", "chart_older": "#8fb8a5",
-        "pending": "#bb7e0e", "rejected": "#b5472f", "unknown": "#87938d",
-        "error": "#b42318",
-    }
-
-    DARK_THEME = {
-        "page": "#111714", "surface": "#18201c", "field": "#1d2621",
-        "sidebar": "#0b100e", "sidebar_fg": "#e3ece7", "sidebar_muted": "#8fa79b",
-        "sidebar_hover": "#16201b", "ink": "#e3ece7", "muted": "#94a69d",
-        "line": "#28332e", "line_strong": "#3a4842", "hover": "#222c27",
-        "primary": "#4db38c", "primary_hover": "#2f8a68", "primary_pressed": "#236b51",
-        "on_primary": "#ffffff", "primary_soft": "#1f3a30", "stripe": "#1b241f",
-        "thumb": "#34423b", "thumb_active": "#4a5b52",
-        "chart_grid": "#232d28", "chart_track": "#202a25", "chart_older": "#3f7d65",
-        "pending": "#e6b04a", "rejected": "#e07a62", "unknown": "#7d8c85",
-        "error": "#ffb4ab",
-    }
-    # Botón primario: en oscuro el verde claro sirve para trazos, no como fondo de texto blanco.
-    DARK_THEME["button"] = "#2a7a5c"
-    LIGHT_THEME["button"] = LIGHT_THEME["primary"]
-    STATUS_COLORS = {"validado": "primary", "rechazado": "rejected", "Sin dato": "unknown"}
+            try:
+                if previous is not None and previous.winfo_exists():
+                    previous.grab_set()
+            except TclError:
+                pass
 
     class App:
-        def __init__(self, root: tk.Tk, initial_file: Path | None,
+        def __init__(self, root: Any, initial_file: Path | None,
                      repository: Repository | CppRepository):
+            if load_on_start:
+                root.withdraw()
             self.root = root
             self.repo = repository
             self.backend_name = "C++" if isinstance(repository, CppRepository) else "Python"
@@ -3489,75 +5785,120 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             self._record_cache: dict[tuple[str, str], dict[str, str]] = {}
             self._usage_cache: dict[str, dict[str, int]] = {}
             self._year_timer: str | None = None
-            self.status = tk.StringVar(value="Iniciando PEA-i…")
-            self.workspace = tk.StringVar()
+            self.status = ctk.StringVar(master=root, value="Iniciando PEA-i…")
+            self.workspace = ctk.StringVar(master=root)
+            self.appearance = ctk.StringVar(master=root, value="light")
             self.workspace_caption = "Espacio vacío"
             self.root.title("PEA-i UPC — Investigación")
             self.root.geometry("1280x850")
-            self.root.minsize(900, 620)
+            self.root.minsize(1024, 680)
             self._apply_theme("light")
-            self._menu()
-            # El lateral ocupa toda la altura; cabecera y estado pertenecen al contenido.
-            self.sidebar = ttk.Frame(root, style="Sidebar.TFrame", width=SIDEBAR_WIDTH)
+            self.root.configure(fg_color=T["page"])
+            self.menu_expanded = True
+            self._compact_header: bool | None = None
+            self.sidebar = ctk.CTkFrame(root, fg_color=T["sidebar"], corner_radius=0, width=220)
             self.sidebar.pack(side="left", fill="y")
             self.sidebar.pack_propagate(False)
-            main = ttk.Frame(root)
-            main.pack(side="left", fill="both", expand=True)
-            workspace_bar = ttk.Frame(main, style="Header.TFrame", padding=(24, 10, 16, 10))
-            workspace_bar.pack(side="top", fill="x")
-            workspace_bar.columnconfigure(0, weight=1)
-            self.workspace_label = ttk.Label(workspace_bar, textvariable=self.workspace, style="Header.TLabel")
-            self.workspace_label.grid(row=0, column=0, sticky="w")
-            self.save_button = ttk.Button(workspace_bar, text="Guardar como…", style="Accent.TButton", command=self.save)
-            self.save_button.grid(row=0, column=1, padx=(8, 0))
-            workspace_bar.bind("<Configure>", lambda event: self.workspace_label.configure(wraplength=max(200, event.width - 180)))
-            ttk.Frame(main, style="Rule.TFrame", height=1).pack(side="top", fill="x")
-            self.status_label = ttk.Label(main, textvariable=self.status, style="Status.TLabel",
-                                          padding=(24, 7), anchor="w", justify="left")
-            self.status_label.pack(side="bottom", fill="x")
-            ttk.Frame(main, style="Rule.TFrame", height=1).pack(side="bottom", fill="x")
-            main.bind("<Configure>", lambda event: self.status_label.configure(wraplength=max(200, event.width - 48)))
-            self.menu_expanded = True
-            brand_row = ttk.Frame(self.sidebar, style="Sidebar.TFrame")
-            brand_row.pack(fill="x", padx=10, pady=(14, 0))
-            self.burger = ttk.Button(brand_row, text="☰", width=2,
-                                     style="Burger.TButton", command=self._toggle_menu)
-            self.burger.pack(side="left")
-            self.brand = ttk.Label(brand_row, text="PEA-i", style="Brand.TLabel")
-            self.brand.pack(side="left", padx=(4, 0))
-            self.sidebar_items = ttk.Frame(self.sidebar, style="Sidebar.TFrame")
-            self.sidebar_items.pack(fill="both", expand=True)
-            ttk.Label(self.sidebar_items, text="Universidad Popular del Cesar", style="SidebarCaption.TLabel",
-                      padding=(22, 2, 12, 6), wraplength=SIDEBAR_WIDTH - 34).pack(anchor="w")
-            self.content = ttk.Frame(main)
+            self.main = ctk.CTkFrame(root, fg_color=T["page"], corner_radius=0)
+            self.main.pack(side="left", fill="both", expand=True)
+            self.header = ctk.CTkFrame(self.main, fg_color="transparent", corner_radius=0)
+            self.header.pack(side="top", fill="x", padx=24, pady=(16, 12))
+            self.header.grid_columnconfigure(1, weight=1)
+            self.burger = button(self.header, "☰", self._toggle_menu, width=34)
+            self.burger.grid(row=0, column=0, sticky="w", padx=(0, 14))
+            brand_bar = ctk.CTkFrame(self.header, fg_color="transparent")
+            brand_bar.grid(row=0, column=1, sticky="w", padx=(0, 12))
+            self.brand = ctk.CTkLabel(brand_bar, text="PEA-i", font=FONTS["h1"], text_color=T["ink"], anchor="w")
+            self.brand.pack(side="left")
+            self.brand_caption = ctk.CTkLabel(brand_bar, text="Universidad Popular del Cesar", font=FONTS["small"],
+                                              text_color=T["muted"], anchor="w")
+            self.brand_caption.pack(side="left", padx=(14, 0), pady=(6, 0))
+            self.header_actions = ctk.CTkFrame(self.header, fg_color="transparent")
+            self.header_actions.grid(row=0, column=2, sticky="e")
+            self._menu()
+            self.save_button = button(self.header_actions, "Guardar como…", lambda: self.save(),
+                                      variant="primary", width=136, height=38)
+            self.save_button.pack(side="left", padx=(4, 0))
+            self.header.bind("<Configure>", self._header_width)
+            ctk.CTkFrame(self.main, fg_color=T["line"], height=1, corner_radius=0).pack(side="top", fill="x")
+            self.status_bar = ctk.CTkFrame(self.main, fg_color=T["surface"], corner_radius=0)
+            self.status_bar.pack(side="bottom", fill="x")
+            ctk.CTkFrame(self.status_bar, fg_color=T["line"], height=1, corner_radius=0).pack(fill="x")
+            # Archivo abierto y su estado a la derecha; el último aviso a la izquierda.
+            self.workspace_state = Chip(self.status_bar, "Guardado", "muted")
+            self.workspace_state.pack(side="right", padx=(8, 24), pady=6)
+            self.workspace_label = ctk.CTkLabel(self.status_bar, textvariable=self.workspace, font=FONTS["caption"],
+                                               text_color=T["ink"], anchor="e")
+            self.workspace_label.pack(side="right")
+            self.status_label = ctk.CTkLabel(self.status_bar, textvariable=self.status, font=FONTS["caption"],
+                                            text_color=T["muted"], anchor="w", justify="left")
+            self.status_label.pack(side="left", fill="x", expand=True, padx=(24, 16), pady=8)
+            self.status_bar.bind("<Configure>", lambda event: self.status_label.configure(
+                wraplength=max(200, round(event.width / scale_of(self.status_bar)) - 360)))
+
+            sidebar_footer = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+            sidebar_footer.pack(side="bottom", fill="x", padx=20, pady=(12, 20))
+            self.theme_button = ctk.CTkSwitch(
+                sidebar_footer, text="Modo oscuro", variable=self.appearance, onvalue="dark", offvalue="light",
+                command=lambda: self.set_appearance(self.appearance.get()), font=FONTS["small"],
+                text_color=T["sidebar_fg"], fg_color=T["thumb"], progress_color=T["primary"],
+                button_color=T["sidebar_fg"], button_hover_color=T["sidebar_muted"])
+            self.theme_button.pack(anchor="w")
+            self.sidebar_items = ctk.CTkFrame(self.sidebar, fg_color=T["sidebar"], corner_radius=0)
+            self.sidebar_items.pack(fill="both", expand=True, pady=(12, 0))
+            self.content = ctk.CTkFrame(self.main, fg_color=T["page"], corner_radius=0)
             self.content.pack(side="top", fill="both", expand=True)
             self.content.rowconfigure(0, weight=1)
             self.content.columnconfigure(0, weight=1)
 
+            self.loading_layer = ctk.CTkFrame(root, fg_color=T["page"], corner_radius=0)
+            self.loading = Card(self.loading_layer)
+            ctk.CTkLabel(self.loading.body, text="Cargando datos UPC…", font=FONTS["h2"],
+                         text_color=T["ink"]).pack(padx=24, pady=(12, 16))
+            self.loading.progress = ctk.CTkProgressBar(self.loading.body, mode="indeterminate", width=280,
+                                                     fg_color=T["chart_track"], progress_color=T["primary"])
+            self.loading.progress.pack(padx=24, pady=(0, 12))
+            if load_on_start:
+                # La primera pintura incluye el aviso de carga; las páginas se construyen detrás.
+                self._set_loading(True)
+                self.root.deiconify()
+                self.root.update_idletasks()
+
             self.pages: dict[str, tk.Widget] = {}
-            self.dashboard = ttk.Frame(self.content)
+            self.dashboard = ctk.CTkFrame(self.content, fg_color=T["page"], corner_radius=0)
             self._build_dashboard()
-            self.graphs = ttk.Frame(self.content, padding=PAGE_PADDING)
+            self.graphs = ctk.CTkFrame(self.content, fg_color=T["page"], corner_radius=0)
             self._build_graphs()
             self.entity_tabs: dict[str, EntityTab] = {}
             for kind in ("grupos", "investigadores", "productos", "planes"):
                 self.entity_tabs[kind] = EntityTab(self.content, self, kind)
-            relations_host = ttk.Frame(self.content, padding=PAGE_PADDING)
-            ttk.Label(relations_host, text="Relaciones", style="Heading.TLabel").pack(anchor="w")
-            ttk.Label(relations_host, text="Vínculos entre investigadores, grupos y productos.",
-                      style="Muted.TLabel").pack(anchor="w", pady=(2, 12))
-            relations = ttk.Notebook(relations_host)
-            relations.pack(fill="both", expand=True)
+            relations_host = ctk.CTkFrame(self.content, fg_color=T["page"], corner_radius=0)
+            ctk.CTkLabel(relations_host, text="Relaciones", font=FONTS["h1"], text_color=T["ink"],
+                         anchor="w").pack(fill="x", padx=24, pady=(20, 0))
+            ctk.CTkLabel(relations_host, text="Vínculos entre investigadores, grupos y productos.", font=FONTS["small"],
+                         text_color=T["muted"], anchor="w").pack(fill="x", padx=24, pady=(2, 12))
+            relations = self.relations_view = ctk.CTkTabview(
+                relations_host, fg_color=T["page"], text_color=T["ink"],
+                segmented_button_font=FONTS["body"], segmented_button_fg_color=T["field"],
+                segmented_button_selected_color=T["primary_soft"], segmented_button_selected_hover_color=T["hover"],
+                segmented_button_unselected_color=T["field"], segmented_button_unselected_hover_color=T["hover"])
+            relations.pack(fill="both", expand=True, padx=16, pady=(0, 10))
             self.relation_tabs: dict[str, RelationTab] = {}
             for kind, title in (("membresias", "Integrantes"), ("autorias", "Autorías"),
                                 ("grupos_productos", "Grupos / productos")):
-                tab = RelationTab(relations, self, kind)
+                tab = RelationTab(relations.add(title), self, kind)
                 self.relation_tabs[kind] = tab
-                relations.add(tab, text=title)
-            self.queue_tab = ttk.Frame(self.content, padding=PAGE_PADDING)
+                tab.pack(fill="both", expand=True)
+            self.queue_tab = ctk.CTkFrame(self.content, fg_color=T["page"], corner_radius=0)
             self._build_queue()
+            self.model_page = ctk.CTkFrame(self.content, fg_color=T["page"], corner_radius=0)
+            self._build_model_page()
 
             self.nav_buttons = {}
+            self.nav_markers = {}
+            self.nav_rows = {}
+            self._nav_font = FONTS["body"]
+            self._nav_active_font = ctk.CTkFont(family=FAMILY, size=FONTS["body"].cget("size"), weight="bold")
             for group, items in (
                     ("Análisis", (("dashboard", "Dashboard", self.dashboard),
                                   ("graphs", "Gráficos", self.graphs))),
@@ -3566,19 +5907,23 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                                    ("productos", "Productos", self.entity_tabs["productos"]),
                                    ("planes", "Planes", self.entity_tabs["planes"]),
                                    ("relaciones", "Relaciones", relations_host))),
+                    ("Modelo", (("modelo", "Modelo 2024", self.model_page),)),
                     ("Seguimiento", (("cola", "Cola de revisión", self.queue_tab),))):
-                ttk.Label(self.sidebar_items, text=group, style="NavGroup.TLabel",
-                          padding=(22, 14, 0, 4)).pack(anchor="w")
+                ctk.CTkLabel(self.sidebar_items, text=group, font=FONTS["caption"],
+                             text_color=T["sidebar_muted"], anchor="w").pack(fill="x", padx=20, pady=(12, 2))
                 for page_id, title, page in items:
                     self.pages[page_id] = page
-                    # Sin margen derecho: el elemento activo se une al contenido como una pestaña.
-                    button = ttk.Button(self.sidebar_items, text=title, style="Nav.TButton",
-                                        command=lambda p=page_id: self._show_page(p))
-                    button.pack(fill="x", padx=(10, 0), pady=1)
-                    self.nav_buttons[page_id] = button
-            self.theme_button = ttk.Button(self.sidebar_items, text="Modo oscuro", style="SidebarGhost.TButton",
-                                           command=self._toggle_theme)
-            self.theme_button.pack(side="bottom", fill="x", padx=12, pady=14)
+                    row = ctk.CTkFrame(self.sidebar_items, fg_color="transparent", corner_radius=0)
+                    row.pack(fill="x", padx=10, pady=1)
+                    control = button(row, title, lambda p=page_id: self._show_page(p), variant="ghost",
+                                     width=0, font=self._nav_font)
+                    control.pack(fill="x", padx=(8, 0))
+                    self.nav_buttons[page_id] = control
+                    self.nav_rows[page_id] = row
+                    self.nav_markers[page_id] = ctk.CTkFrame(row, width=3, height=24, corner_radius=0,
+                                                           fg_color=T["primary"])
+            self.queue_badge = Chip(self.nav_rows["cola"], "", "pending")
+            self.queue_badge.bind("<Button-1>", lambda _event: self._show_page("cola"))
             for page in self.pages.values():
                 page.grid(row=0, column=0, sticky="nsew")
 
@@ -3586,10 +5931,9 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             self._show_page("dashboard")
             self.root.protocol("WM_DELETE_WINDOW", self.close)
             self._startup_timer = self.root.after(80, self.start_choice) if load_on_start else None
+            if load_on_start:
+                self._set_loading(True)
             self.root.bind("<Destroy>", self._destroyed, add="+")
-            self.root.bind_all("<MouseWheel>", self._wheel)
-            self.root.bind_all("<Button-4>", self._wheel)
-            self.root.bind_all("<Button-5>", self._wheel)
 
         def _destroyed(self, event: tk.Event) -> None:
             if event.widget is self.root:
@@ -3600,48 +5944,122 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                     if tab._search_timer:
                         self.root.after_cancel(tab._search_timer)
 
+        kit = SimpleNamespace(T=T, color=color, FONTS=FONTS, button=button, Card=Card, Kpi=Kpi, Chip=Chip,
+                              MenuButton=MenuButton, SearchField=SearchField, Pager=Pager,
+                              EmptyState=EmptyState, Dialog=Dialog, DataTable=DataTable,
+                              ChartCanvas=ChartCanvas, IndicatorPanel=IndicatorPanel, palette=palette,
+                              RecordPicker=RecordPicker, ReferenceInput=ReferenceInput, ChoiceDialog=ChoiceDialog,
+                              RecordDialog=RecordDialog, CategoryInput=CategoryInput, CategoryPicker=CategoryPicker,
+                              UrlDialog=UrlDialog)
+
+        @property
+        def _last_dialog(self) -> Dialog | None:
+            return dialog_state["last"]
+
+        def _dialog_parent(self, parent: Any = None) -> Any:
+            if parent is not None:
+                return parent
+            holder = self.root.grab_current()
+            return holder.winfo_toplevel() if holder is not None else self.root
+
+        def _message(self, title: str, text: str, buttons: list[tuple[str, str, Any, str]], default: Any,
+                     parent: Any = None, tone: str = "ink") -> Any:
+            """Diálogo de aviso o pregunta; buttons = (clave, rótulo, valor devuelto, variante), el primero a la derecha."""
+            dialog = Dialog(self._dialog_parent(parent), title, 460)
+            ctk.CTkLabel(dialog.body, text=title, font=FONTS["h2"], text_color=T[tone], anchor="w").pack(
+                fill="x", pady=(0, 8))
+            if text.count("\n") > 12 or len(text) > 900:
+                dialog.text_widget = ctk.CTkTextbox(dialog.body, width=540, height=280, wrap="word", font=FONTS["small"],
+                                                    fg_color=T["surface"], text_color=T["ink"],
+                                                    border_width=1, border_color=T["line"])
+                dialog.text_widget.insert("1.0", text)
+                dialog.text_widget.configure(state="disabled")
+                dialog.text_widget.pack(fill="both", expand=True)
+            else:
+                ctk.CTkLabel(dialog.body, text=text, font=FONTS["body"], text_color=T["ink"], anchor="w",
+                             justify="left", wraplength=420).pack(fill="x")
+            result = {"value": default}
+
+            def choose(value: Any) -> None:
+                result["value"] = value
+                dialog.close()
+            for key, label, value, variant in buttons:
+                widget = button(dialog.footer, label, lambda chosen=value: choose(chosen), variant=variant, width=112)
+                widget.pack(side="right", padx=(8, 0))
+                dialog.buttons[key] = widget
+            dialog.bind("<Return>", lambda _event: dialog.buttons[buttons[0][0]].invoke())
+            dialog.present()
+            return result["value"]
+
+        def inform(self, title: str, text: str, parent: Any = None) -> None:
+            self._message(title, text, [("accept", "Aceptar", None, "primary")], None, parent)
+
+        def alert(self, title: str, text: str, parent: Any = None) -> None:
+            self._message(title, text, [("accept", "Aceptar", None, "primary")], None, parent, tone="error")
+
+        def confirm(self, title: str, text: str, accept: str = "Sí", cancel: str = "No", parent: Any = None) -> bool:
+            return self._message(title, text, [("accept", accept, True, "primary"),
+                                               ("cancel", cancel, False, "secondary")], False, parent)
+
+        def decide(self, title: str, text: str, yes: str = "Guardar", no: str = "No guardar",
+                   cancel: str = "Cancelar", parent: Any = None) -> bool | None:
+            """Sí, no o cancelar (None), como una pregunta de tres opciones."""
+            return self._message(title, text, [("yes", yes, True, "primary"), ("no", no, False, "secondary"),
+                                               ("cancel", cancel, None, "secondary")], None, parent)
+
+        def ask_text(self, title: str, prompt: str, initial: str = "", parent: Any = None) -> str | None:
+            dialog = Dialog(self._dialog_parent(parent), title, 520)
+            ctk.CTkLabel(dialog.body, text=prompt, font=FONTS["body"], text_color=T["ink"], anchor="w",
+                         justify="left", wraplength=470).pack(fill="x", pady=(0, 8))
+            dialog.entry = ctk.CTkEntry(dialog.body, height=36, corner_radius=8, font=FONTS["body"],
+                                        fg_color=T["field"], border_color=T["line_strong"], text_color=T["ink"])
+            dialog.entry.insert(0, initial)
+            dialog.entry.pack(fill="x")
+            result: dict[str, str | None] = {"value": None}
+
+            def accept() -> None:
+                result["value"] = dialog.entry.get().strip()
+                dialog.close()
+            dialog.buttons["accept"] = button(dialog.footer, "Aceptar", accept, variant="primary", width=112)
+            dialog.buttons["accept"].pack(side="right", padx=(8, 0))
+            dialog.buttons["cancel"] = button(dialog.footer, "Cancelar", dialog.close, width=112)
+            dialog.buttons["cancel"].pack(side="right", padx=(8, 0))
+            dialog.bind("<Return>", lambda _event: accept())
+            dialog.present(focus=dialog.entry)
+            return result["value"]
+
         def _show_page(self, page_id: str) -> None:
             self.active_page = page_id
-            for key, button in self.nav_buttons.items():
-                button.configure(style="Selected.Nav.TButton" if key == page_id else "Nav.TButton")
+            for key, control in self.nav_buttons.items():
+                selected = key == page_id
+                control.configure(fg_color=T["sidebar_hover"] if selected else "transparent",
+                                  font=self._nav_active_font if selected else self._nav_font)
+                marker = self.nav_markers[key]
+                if selected:
+                    marker.place(x=0, rely=0.15, relheight=0.7)
+                else:
+                    marker.place_forget()
             self.pages[page_id].tkraise()
             if page_id == "graphs":
                 self._redraw_charts()
 
-        def _wheel(self, event: tk.Event) -> str | None:
-            widget = event.widget
-            if isinstance(widget, (tk.Text, ttk.Treeview, ttk.Combobox)):
-                return None
-            units = -1 if getattr(event, "num", None) == 4 else 1 if getattr(event, "num", None) == 5 else (
-                -int(event.delta / 120) if abs(event.delta) >= 120 else -1 if event.delta > 0 else 1)
-            while widget is not None:
-                if isinstance(widget, tk.Canvas) and widget.cget("yscrollcommand"):
-                    bbox = widget.bbox("all")
-                    if bbox and bbox[3] - bbox[1] > widget.winfo_height():
-                        widget.yview_scroll(units, "units")
-                        return "break"
-                canvas = getattr(widget, "scroll_canvas", None)
-                if canvas is not None:
-                    bbox = canvas.bbox("all")
-                    if bbox and bbox[3] - bbox[1] > canvas.winfo_height():
-                        canvas.yview_scroll(units, "units")
-                        return "break"
-                widget = getattr(widget, "master", None)
-            return None
+        def _header_width(self, event: Any) -> None:
+            compact = event.width < round(920 * scale_of(self.header))
+            if compact != self._compact_header:
+                self._compact_header = compact
+                self.header_actions.grid(row=1 if compact else 0, column=0 if compact else 2,
+                                         columnspan=3 if compact else 1, sticky="e",
+                                         pady=(12, 0) if compact else 0)
 
         def _toggle_menu(self) -> None:
             if self.menu_expanded:
-                self.sidebar_items.pack_forget()
-                self.brand.pack_forget()
-                self.sidebar.configure(width=56)
+                self.sidebar.pack_forget()
             else:
-                self.brand.pack(side="left", padx=(4, 0))
-                self.sidebar_items.pack(fill="both", expand=True)
-                self.sidebar.configure(width=SIDEBAR_WIDTH)
+                self.sidebar.pack(side="left", fill="y", before=self.main)
             self.menu_expanded = not self.menu_expanded
 
-        def _show_status(self) -> None:
-            messagebox.showinfo("Estado de datos", self.status.get(), parent=self.root)
+        def _show_status(self) -> Dialog:
+            return self.show_about("Estado de datos")
 
         def _apply_theme(self, theme: str) -> None:
             style = ttk.Style()
@@ -3649,6 +6067,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                 style.theme_use("clam")
             colors = LIGHT_THEME if theme == "light" else DARK_THEME
             self.theme = theme
+            ctk.set_appearance_mode(theme)
             self.colors = colors
             c = colors
 
@@ -3789,17 +6208,23 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                                borderwidth=0, font=font(10))
             self._restyle_widgets()
 
+        @property
+        def canvases(self) -> list[Any]:
+            """Gráficos y tablas dibujados en lienzos, vigentes en esta sesión."""
+            return list(canvas_registry)
+
+        def set_appearance(self, mode: str) -> None:
+            """Claro u oscuro: estilos de las pantallas aún en ttk, widgets CustomTkinter y lienzos."""
+            self._apply_theme(mode)
+            for canvas in self.canvases:
+                canvas.redraw()
+            self.appearance.set(mode)
+
         def _toggle_theme(self) -> None:
-            self._apply_theme("dark" if self.theme == "light" else "light")
-            self.theme_button.configure(text="Modo claro" if self.theme == "dark" else "Modo oscuro")
+            self.set_appearance("dark" if self.theme == "light" else "light")
 
         def _restyle_widgets(self) -> None:
             colors = self.colors
-            for name in ("year_canvas", "type_canvas", "validation_canvas", "rules_canvas",
-                         "dashboard_year_canvas", "dashboard_type_canvas"):
-                canvas = getattr(self, name, None)
-                if canvas is not None:
-                    canvas.configure(bg=colors["surface"])
             for name in ("stats_table",):
                 table = getattr(self, name, None)
                 if table is not None:
@@ -3808,67 +6233,106 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                 tab.restyle()
             for tab in getattr(self, "relation_tabs", {}).values():
                 tab.restyle()
-            if hasattr(self, "dashboard_page"):
-                self.dashboard_page.scroll_canvas.configure(bg=colors["page"])
             if hasattr(self, "queue_table"):
                 self.queue_table.tag_configure("stripe", background=colors["stripe"])
-            if hasattr(self, "current_stats"):
-                self._redraw_charts()
+            # Los lienzos (gráficos y tablas) se redibujan en set_appearance.
             for detail in tuple(getattr(self, "details", ())):
                 detail.refresh()
 
         def _menu(self) -> None:
-            menu = tk.Menu(self.root)
-            files = tk.Menu(menu, tearoff=False)
-            for label, command in (("Iniciar vacío", self.new_workspace),
-                                   ("Abrir archivo de datos...", self.open_file),
-                                   ("Abrir datos UPC", self.open_default),
-                                   ("Guardar", self.save), ("Guardar como...", self.save_as),
-                                   ("Exportar para hoja de cálculo...", self.export_spreadsheet),
-                                   ("Salir", self.close)):
-                files.add_command(label=label, command=command)
-            menu.add_cascade(label="Archivo", menu=files)
-            imports = tk.Menu(menu, tearoff=False)
-            for label, command in (("Hoja de cálculo (CSV/Excel)...", self.import_csv),
-                                   ("URL pública...", self.import_url),
-                                   ("PDF de texto GrupLAC/CvLAC...", self.import_pdf),
-                                   ("Documento Word...", self.import_docx)):
-                imports.add_command(label=label, command=command)
-            menu.add_cascade(label="Importar", menu=imports)
-            edit = tk.Menu(menu, tearoff=False)
-            edit.add_command(label="Deshacer", command=self.undo, accelerator="Ctrl+Z")
-            edit.add_command(label="Vaciar historial", command=self.clear_history)
-            menu.add_cascade(label="Editar", menu=edit)
-            help_menu = tk.Menu(menu, tearoff=False)
-            help_menu.add_command(label="Estado de datos", command=self._show_status)
-            help_menu.add_command(label="Acerca de PEA-i", command=lambda: messagebox.showinfo(
-                "Acerca de PEA-i", f"Programa Estadístico de Análisis de Investigación\n"
-                f"Universidad Popular del Cesar\nMotor de datos: {self.backend_name}", parent=self.root))
-            menu.add_cascade(label="Ayuda", menu=help_menu)
-            self._menus = (menu, files, imports, edit, help_menu)
-            def shortcut(action: Callable[[], Any]) -> Callable[[Any], str]:
+            self.menus = {}
+            for key, label, width, items in (
+                ("archivo", "Archivo", 92, (("Iniciar vacío", "new_workspace"),
+                                            ("Abrir archivo de datos...", "open_file"),
+                                            ("Abrir datos UPC", "open_default"), ("Guardar", "save"),
+                                            ("Guardar como...", "save_as"),
+                                            ("Exportar para hoja de cálculo...", "export_spreadsheet"),
+                                            ("Salir", "close"))),
+                ("importar", "Importar", 112, (("Hoja de cálculo (CSV/Excel)...", "import_csv"),
+                                             ("URL pública...", "import_url"),
+                                             ("PDF de texto GrupLAC/CvLAC...", "import_pdf"),
+                                             ("Documento Word...", "import_docx"))),
+                ("editar", "Editar", 84, (("Deshacer", "undo"), ("Vaciar historial", "clear_history"))),
+                ("ayuda", "Ayuda", 84, (("Estado de datos", "_show_status"), ("Acerca de PEA-i", "_show_about"))),
+            ):
+                actions = [(text, lambda method=method: getattr(self, method)()) for text, method in items]
+                self.menus[key] = MenuButton(self.header_actions, label, actions, width=width)
+                self.menus[key].pack(side="left", padx=(0, 6))
+
+            def shortcut(action: str) -> Callable[[Any], str]:
                 def invoke(_event: Any) -> str:
-                    action()
+                    getattr(self, action)()
                     return "break"
                 return invoke
-            self.root.bind("<Control-z>", shortcut(self.undo))
-            self.root.bind("<Control-s>", shortcut(self.save))
-            self.root.bind("<Control-Shift-S>", shortcut(self.save_as))
-            self.root.bind("<Control-n>", shortcut(self.new_workspace))
-            self.root.config(menu=menu)
+            for sequence, action in (("<Control-z>", "undo"), ("<Control-s>", "save"),
+                                     ("<Control-Shift-S>", "save_as"), ("<Control-n>", "new_workspace")):
+                self.root.bind(sequence, shortcut(action))
+
+        def _show_about(self) -> Dialog:
+            return self.show_about("Acerca de PEA-i")
+
+        def show_about(self, title: str = "Acerca de PEA-i") -> Dialog:
+            """Acerca de PEA-i y estado de los datos abiertos: motor, archivo, versiones y conteos."""
+            dialog = Dialog(self.root, title, 560)
+            ctk.CTkLabel(dialog.body, text="PEA-i", font=FONTS["h1"], text_color=T["ink"], anchor="w").pack(fill="x")
+            ctk.CTkLabel(dialog.body, text="Programa Estadístico de Análisis de Investigación · Universidad Popular del Cesar",
+                         font=FONTS["small"], text_color=T["muted"], anchor="w", justify="left", wraplength=500).pack(fill="x")
+            chips = ctk.CTkFrame(dialog.body, fg_color="transparent")
+            chips.pack(fill="x", pady=(8, 12))
+            for text, tone in ((f"Motor: {self.backend_name}", "primary"), (f"Esquema {SCHEMA_VERSION}", "muted"),
+                               (f"Protocolo {CPP_PROTOCOL}", "muted"),
+                               ("Cambios sin guardar", "pending") if self.repo.dirty else ("Guardado", "muted")):
+                Chip(chips, text, tone).pack(side="left", padx=(0, 6))
+            facts = {"Motor de datos": self.backend_name,
+                     "Archivo": str(self.data_file) if self.data_file else "Sin archivo (Guardar como crea uno)",
+                     "Esquema de datos": SCHEMA_VERSION, "Protocolo C++": CPP_PROTOCOL}
+            for kind in ALL_FIELDS:
+                facts[TITLES[kind]] = number(self.repo.page(kind, limit=0)["total"])
+            facts["Cola de revisión"] = number(self.repo.queue_size())
+            facts["Acciones para deshacer"] = number(self.repo.history_size())
+            card = Card(dialog.body, title="Datos abiertos", bg_color=T["page"])
+            card.pack(fill="x")
+            card.body.grid_columnconfigure(1, weight=1)
+            for line, (label, value) in enumerate(facts.items()):
+                ctk.CTkLabel(card.body, text=label, font=FONTS["small"], text_color=T["muted"], anchor="w").grid(
+                    row=line, column=0, sticky="w", padx=(0, 16), pady=2)
+                ctk.CTkLabel(card.body, text=value, font=FONTS["body"], text_color=T["ink"], anchor="w", justify="left",
+                             wraplength=330).grid(row=line, column=1, sticky="ew", pady=2)
+            ctk.CTkLabel(dialog.body, text="Último aviso: " + self.status.get(), font=FONTS["caption"],
+                         text_color=T["muted"], anchor="w", justify="left", wraplength=500).pack(fill="x", pady=(10, 0))
+            dialog.facts = facts
+            button(dialog.footer, "Cerrar", dialog.close, variant="primary", width=112).pack(side="right")
+            dialog.present(wait=False)
+            return dialog
 
         def _build_dashboard(self) -> None:
-            self.dashboard_page = ScrolledPage(self.dashboard)
+            self.dashboard_page = ctk.CTkScrollableFrame(self.dashboard, fg_color=T["page"], corner_radius=0,
+                                                        scrollbar_button_color=T["line_strong"],
+                                                        scrollbar_button_hover_color=T["muted"])
             self.dashboard_page.pack(fill="both", expand=True)
-            body = self.dashboard_page.body
-            ttk.Label(body, text="Panorama de investigación", style="Heading.TLabel").pack(anchor="w")
+            # Conserva el acceso al desplazamiento que usaban los flujos del Dashboard.
+            self.dashboard_page.scroll_canvas = self.dashboard_page._parent_canvas
+            self.dashboard_page.scroll_canvas.configure(yscrollcommand=lambda first, last: set_scrollbar(
+                self.dashboard_page._scrollbar, first, last))
+            body = ctk.CTkFrame(self.dashboard_page, fg_color="transparent")
+            body.pack(fill="both", expand=True, padx=24, pady=20)
+            title_row = ctk.CTkFrame(body, fg_color="transparent")
+            title_row.pack(fill="x")
+            ctk.CTkLabel(title_row, text="Panorama de investigación", font=FONTS["h1"],
+                         text_color=T["ink"], anchor="w").pack(side="left")
+            # Población activa de toda la institución, independiente de los filtros.
+            self.institution_chips = [Chip(title_row, "", "primary") for _ in range(2)]
+            for chip in reversed(self.institution_chips):
+                chip.pack(side="right", padx=(6, 0))
             self.context = tk.StringVar()
-            self.context_label = ttk.Label(body, textvariable=self.context, style="Muted.TLabel", wraplength=700)
+            self.context_label = ctk.CTkLabel(body, textvariable=self.context, font=FONTS["small"],
+                                             text_color=T["muted"], anchor="w", justify="left", wraplength=700)
             self.context_label.pack(fill="x", pady=(2, 14))
-            filters = ttk.Frame(body, style="Card.TFrame", padding=(12, 10, 12, 12))
-            filters.pack(fill="x", pady=(0, 14))
-            for col in range(3):
-                filters.columnconfigure(col, weight=1, uniform="filter")
+            filter_card = Card(body)
+            filter_card.pack(fill="x", pady=(0, 14))
+            filters = filter_card.body
+            for col in range(2):
+                filters.grid_columnconfigure(col, weight=1, uniform="filter")
             self.view = tk.StringVar(value="Todos")
             self.scope_id = tk.StringVar()
             self._scope_kind: str | None = None
@@ -3877,44 +6341,58 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             self.end_year = tk.StringVar()
             self.validation = tk.StringVar(value="Todos")
 
-            def field_box(col: int, row: int, label: str) -> ttk.Frame:
-                frame = ttk.Frame(filters, style="CardBody.TFrame")
-                frame.grid(row=row, column=col, sticky="ew", padx=6, pady=4)
-                ttk.Label(frame, text=label, style="Muted.Card.TLabel").pack(anchor="w", pady=(0, 3))
+            def field_box(col: int, row: int, label: str, span: int = 1) -> Any:
+                frame = ctk.CTkFrame(filters, fg_color="transparent")
+                frame.grid(row=row, column=col, columnspan=span, sticky="ew", padx=(0, 16) if col == 0 and span == 1 else 0,
+                           pady=4)
+                ctk.CTkLabel(frame, text=label, font=FONTS["caption"], text_color=T["muted"],
+                             anchor="w", height=20).pack(fill="x", pady=(0, 4))
                 return frame
 
-            view_box = ttk.Combobox(field_box(0, 0, "Vista"), textvariable=self.view, state="readonly",
-                                    width=10, values=("Todos", "Grupo", "Investigador", "Producto"))
-            view_box.pack(fill="x")
-            view_box.bind("<<ComboboxSelected>>", lambda _e: self._scope_changed())
-            self.scope_box = ReferenceInput(field_box(1, 0, "Nombre / título"), self.repo, "grupos",
-                                            variable=self.scope_id, command=self.refresh_dashboard,
-                                            style="CardBody.TFrame")
-            self.scope_box.entry.configure(width=12)
+            segmented_style = {"height": 34, "corner_radius": 8, "font": FONTS["body"], "text_color": T["ink"],
+                               "fg_color": T["field"], "selected_color": T["primary_soft"],
+                               "selected_hover_color": T["hover"], "unselected_color": T["field"],
+                               "unselected_hover_color": T["hover"]}
+            self.view_control = ctk.CTkSegmentedButton(
+                field_box(0, 0, "Vista", 2), variable=self.view,
+                values=["Todos", "Grupo", "Investigador", "Producto"],
+                command=lambda _value: self._scope_changed(), **segmented_style)
+            self.view_control.pack(fill="x")
+            self.scope_box = ReferenceInput(field_box(0, 1, "Nombre / título"), self.repo, "grupos",
+                                            variable=self.scope_id, command=self.refresh_dashboard)
             self.scope_box.pack(fill="x")
-            period_box = ttk.Combobox(field_box(2, 0, "Ventana de observación"), textvariable=self.period,
-                                      state="readonly", width=12,
-                                      values=("Todos", "Últimos 2 años", "Últimos 5 años", "Personalizado"))
-            period_box.pack(fill="x")
-            period_box.bind("<<ComboboxSelected>>", lambda _e: self.refresh_dashboard())
-            status_box = ttk.Combobox(field_box(0, 1, "Validación automática"), textvariable=self.validation,
-                                      state="readonly", width=12, values=("Todos", "Validado", "Rechazado"))
-            status_box.pack(fill="x")
-            status_box.bind("<<ComboboxSelected>>", lambda _e: self.refresh_dashboard())
-            years = field_box(1, 1, "Años: desde / hasta")
-            self.start_entry = ttk.Entry(years, textvariable=self.start_year, width=7)
+            self.scope_box.set_enabled(False)
+            self.period_box = ctk.CTkOptionMenu(
+                field_box(1, 1, "Ventana de observación"), variable=self.period,
+                values=["Todos", "Últimos 2 años", "Últimos 5 años", "Personalizado"],
+                command=lambda _value: self.refresh_dashboard(), height=34, corner_radius=8,
+                font=FONTS["body"], dropdown_font=FONTS["body"], dynamic_resizing=False,
+                fg_color=T["field"], button_color=T["field"], button_hover_color=T["hover"],
+                text_color=T["ink"], dropdown_fg_color=T["surface"],
+                dropdown_text_color=T["ink"], dropdown_hover_color=T["hover"])
+            self.period_box.pack(fill="x")
+            self.validation_control = ctk.CTkSegmentedButton(
+                field_box(0, 2, "Validación automática"), variable=self.validation,
+                values=["Todos", "Validado", "Rechazado"], command=lambda _value: self.refresh_dashboard(),
+                **segmented_style)
+            self.validation_control.pack(fill="x")
+            years = field_box(1, 2, "Años: desde / hasta")
+            entry_style = {"width": 90, "height": 34, "corner_radius": 8, "font": FONTS["body"],
+                           "fg_color": T["field"], "text_color": T["ink"], "border_color": T["line_strong"]}
+            self.start_entry = ctk.CTkEntry(years, textvariable=self.start_year, **entry_style)
             self.start_entry.pack(side="left", fill="x", expand=True)
-            ttk.Label(years, text="a", style="Muted.Card.TLabel").pack(side="left", padx=6)
-            self.end_entry = ttk.Entry(years, textvariable=self.end_year, width=7)
+            ctk.CTkLabel(years, text="a", font=FONTS["small"], text_color=T["muted"], width=16).pack(side="left", padx=6)
+            self.end_entry = ctk.CTkEntry(years, textvariable=self.end_year, **entry_style)
             self.end_entry.pack(side="left", fill="x", expand=True)
             for variable in (self.start_year, self.end_year):
                 variable.trace_add("write", self._year_changed)
             for entry in (self.start_entry, self.end_entry):
                 entry.bind("<Return>", lambda _e: self.refresh_dashboard())
             self.filter_error = tk.StringVar()
-            self.filter_error_label = ttk.Label(filters, textvariable=self.filter_error, style="Error.Card.TLabel", wraplength=650)
+            self.filter_error_label = ctk.CTkLabel(filters, textvariable=self.filter_error, font=FONTS["small"],
+                                                  text_color=T["rejected"], anchor="w", justify="left", wraplength=650)
 
-            cards = ttk.Frame(body)
+            cards = ctk.CTkFrame(body, fg_color="transparent")
             cards.pack(fill="x", pady=(0, 8))
             self.card_values = {}
             # La franja superior usa el color de estado que repiten los gráficos.
@@ -3923,166 +6401,290 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                                                        ("rejected", "Rechazados", "rejected"),
                                                        ("undated", "Sin año", "unknown"))):
                 cards.columnconfigure(index, weight=1, uniform="cards")
-                frame = ttk.Frame(cards, style="Card.TFrame")
-                frame.grid(row=0, column=index, sticky="nsew", padx=(0, 10) if index < 3 else 0)
-                ttk.Frame(frame, style=f"{tone}.Stripe.TFrame", height=3).pack(fill="x")
-                inner = ttk.Frame(frame, style="CardBody.TFrame", padding=(14, 8, 14, 12))
-                inner.pack(fill="both", expand=True)
                 value = tk.StringVar(value="0")
                 self.card_values[key] = value
-                ttk.Label(inner, textvariable=value, style="CardValue.TLabel").pack(anchor="w")
-                ttk.Label(inner, text=title, style="CardCaption.TLabel").pack(anchor="w")
-            self.metric = tk.StringVar()
+                Kpi(cards, title, tone, value).grid(row=0, column=index, sticky="nsew", padx=(0, 12) if index < 3 else 0)
+            spacer = ctk.CTkFrame(body, fg_color="transparent", height=14)
+            spacer.pack(fill="x")
+            # Solo aparece cuando hay rechazos (sus causas) o datos sin año/tipología.
             self.note = tk.StringVar()
-            ttk.Label(body, textvariable=self.metric, style="Muted.TLabel", wraplength=700).pack(fill="x")
-            self.note_label = ttk.Label(body, textvariable=self.note, style="Muted.TLabel", wraplength=700)
-            self.note_label.pack(fill="x", pady=(2, 14))
-            charts = ttk.Frame(body)
+            self.note_label = ctk.CTkLabel(body, textvariable=self.note, font=FONTS["small"],
+                                          text_color=T["rejected"], anchor="w", justify="left", wraplength=700)
+            self._note_pack = {"fill": "x", "pady": (0, 14), "after": spacer}
+            charts = ctk.CTkFrame(body, fg_color="transparent")
+            self.dashboard_charts = charts
             charts.pack(fill="x", pady=(0, 18))
             charts.columnconfigure(0, weight=1, uniform="preview")
             charts.columnconfigure(1, weight=1, uniform="preview")
-            year_panel, self.dashboard_year_canvas = self._chart_panel(charts, 210)
-            type_panel, self.dashboard_type_canvas = self._chart_panel(charts, 210)
-            year_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-            type_panel.grid(row=0, column=1, sticky="nsew")
-            table_heading = ttk.Frame(body)
+            # Solo aparece con la vista Grupo o Investigador; se ubica antes de los gráficos.
+            self.indicator_panel = IndicatorPanel(body, self.show_indicator_details, bg_color=T["page"],
+                                                  pack_options={"fill": "x", "pady": (0, 14), "before": charts})
+            self.indicator_value = self.indicator_panel.value
+            self.indicator_note = self.indicator_panel.note
+            self.indicator_canvas = self.indicator_panel.canvas
+            self._indicator_result: dict[str, Any] | None = None
+            panels = []
+            for name in ("dashboard_year_canvas", "dashboard_class_canvas", "dashboard_type_canvas",
+                         "dashboard_category_canvas"):
+                panel, canvas = self._chart_panel(charts, 260, draw=self._chart_draw(name))
+                setattr(self, name, canvas)
+                panels.append(panel)
+            self.dashboard_chart_panels = tuple(panels)
+            self._charts_stacked: bool | None = None
+            self._layout_dashboard_charts(False)
+            table_heading = ctk.CTkFrame(body, fg_color="transparent")
             table_heading.pack(fill="x", pady=(0, 6))
-            ttk.Label(table_heading, text="Productos de la vista", style="Section.TLabel").pack(side="left")
-            ttk.Button(table_heading, text="Ver todas las distribuciones", command=lambda: self._show_page("graphs")).pack(side="right")
-            columns = ("titulo", "anio", "tipologia", "validacion")
-            table_frame = ttk.Frame(body)
-            table_frame.pack(fill="x")
-            self.stats_table = ttk.Treeview(table_frame, columns=columns, show="headings", height=5, selectmode="browse")
-            self.stats_table.tag_configure("stripe", background=self.colors["stripe"])
-            column_widths = {"titulo": 360, "anio": 65, "tipologia": 200, "validacion": 100}
-            for field in columns:
-                self.stats_table.heading(field, anchor="w", text=LABELS[field])
-                self.stats_table.column(field, width=column_widths[field], minwidth=55)
-            x_scroll = AutoScrollbar(table_frame, orient="horizontal", command=self.stats_table.xview)
-            y_scroll = AutoScrollbar(table_frame, orient="vertical", command=self.stats_table.yview)
-            self.stats_table.configure(xscrollcommand=x_scroll.set, yscrollcommand=y_scroll.set)
-            self.stats_table.grid(row=0, column=0, sticky="nsew")
-            y_scroll.grid(row=0, column=1, sticky="ns")
-            x_scroll.grid(row=1, column=0, sticky="ew")
-            table_frame.columnconfigure(0, weight=1)
-            self.stats_table.bind("<ButtonRelease-1>", self._open_product)
-            self.stats_table.bind("<Return>", self._open_product)
-            stats_pager = ttk.Frame(body)
-            stats_pager.pack(fill="x", pady=(8, 0))
-            self.stats_previous = ttk.Button(stats_pager, text="Anterior", command=lambda: self._stats_move(-1))
-            self.stats_previous.pack(side="left")
+            ctk.CTkLabel(table_heading, text="Productos de la vista", font=FONTS["h2"],
+                         text_color=T["ink"]).pack(side="left")
+            button(table_heading, "Ver todas las distribuciones", lambda: self._show_page("graphs"), width=220).pack(side="right")
+            columns = ("titulo", "anio", "tipologia", "categoria", "validacion")
+            self.stats_table = DataTable(body, columns, headings={field: LABELS[field] for field in columns},
+                                         widths={"titulo": 270, "anio": 60, "tipologia": 160, "categoria": 95, "validacion": 110},
+                                         anchors={"anio": "e"},
+                                         chips={"validacion": lambda value: STATUS_COLORS.get(value.lower(), "unknown"),
+                                                "categoria": lambda value: "unknown" if value == "Sin dato" else "primary"},
+                                         height_rows=8, open_on_click=True)
+            self.stats_table.pack(fill="x")
+            self.stats_table.on_open(lambda _iid: self._open_product(None))
+            self.stats_pager = Pager(body, self._stats_move)
+            self.stats_pager.pack(fill="x", pady=(8, 0))
+            self.stats_previous = self.stats_pager.previous
+            self.stats_next = self.stats_pager.next
             self.stats_page_label = tk.StringVar()
-            ttk.Label(stats_pager, textvariable=self.stats_page_label).pack(side="left", padx=10)
-            self.stats_next = ttk.Button(stats_pager, text="Siguiente", command=lambda: self._stats_move(1))
-            self.stats_next.pack(side="left")
             self.stats_offset = 0
             self._stats_filter: tuple[Any, ...] | None = None
-            self.current_stats: dict[str, Any] = {"por_anio": {}, "por_tipologia": {},
+            self.current_stats: dict[str, Any] = {"por_anio": {}, "por_tipologia": {}, "por_categoria": {},
                                                   "por_validacion": {}, "por_regla": {}}
             body.bind("<Configure>", lambda event: self._dashboard_width(event.width), add="+")
 
         def _dashboard_width(self, width: int) -> None:
-            for label in (self.context_label, self.note_label):
-                label.configure(wraplength=max(260, width - 28))
+            logical_width = width / scale_of(self.dashboard_page)
+            if abs(logical_width - getattr(self, "_dashboard_logical_width", 0)) < 1:
+                return
+            self._dashboard_logical_width = logical_width
+            for label in (self.context_label, self.note_label, self.filter_error_label):
+                label.configure(wraplength=max(260, logical_width - 32))
+            self._layout_dashboard_charts(logical_width < 850)
 
-        def _chart_panel(self, parent: tk.Misc, height: int = 240) -> tuple[ttk.Frame, tk.Canvas]:
-            panel = ttk.Frame(parent, style="Card.TFrame", padding=(6, 8, 4, 4))
-            panel.columnconfigure(0, weight=1)
-            panel.rowconfigure(0, weight=1)
-            canvas = tk.Canvas(panel, width=280, height=height, bg=self.colors["surface"],
-                               highlightthickness=0, borderwidth=0)
-            xscroll = AutoScrollbar(panel, orient="horizontal", command=canvas.xview)
-            yscroll = AutoScrollbar(panel, orient="vertical", command=canvas.yview)
-            canvas.configure(xscrollcommand=xscroll.set, yscrollcommand=yscroll.set)
+        def _layout_dashboard_charts(self, stacked: bool) -> None:
+            """Gráficos del Dashboard en una cuadrícula de 2×2, o en una columna si la ventana es estrecha."""
+            if stacked == self._charts_stacked:
+                return
+            self._charts_stacked = stacked
+            for index, panel in enumerate(self.dashboard_chart_panels):
+                row, column = (index, 0) if stacked else divmod(index, 2)
+                panel.grid(row=row, column=column, columnspan=2 if stacked else 1, sticky="nsew",
+                           padx=0 if stacked or column else (0, 12), pady=(0, 12))
+
+        def _chart_panel(self, parent: tk.Misc, height: int = 240,
+                         draw: Callable[[Any], Any] | None = None) -> tuple[Card, ChartCanvas]:
+            panel = Card(parent)
+            panel.body.grid_columnconfigure(0, weight=1)
+            panel.body.grid_rowconfigure(0, weight=1)
+            canvas = ChartCanvas(panel.body, draw=draw, width=280, height=round(height * scale_of(parent)))
+            scroll_style = {"fg_color": T["surface"], "button_color": T["line_strong"], "button_hover_color": T["muted"]}
+            xscroll = ctk.CTkScrollbar(panel.body, orientation="horizontal", width=0, command=canvas.xview, **scroll_style)
+            yscroll = ctk.CTkScrollbar(panel.body, orientation="vertical", height=0, command=canvas.yview, **scroll_style)
+            canvas.configure(xscrollcommand=lambda first, last: set_scrollbar(xscroll, first, last, autohide=True),
+                             yscrollcommand=lambda first, last: set_scrollbar(yscroll, first, last, autohide=True))
             canvas.grid(row=0, column=0, sticky="nsew")
             yscroll.grid(row=0, column=1, sticky="ns")
             xscroll.grid(row=1, column=0, sticky="ew")
-            canvas.bind("<Configure>", lambda _e: self._redraw_charts())
             return panel, canvas
 
+        def _chart_draw(self, name: str) -> Callable[[Any], None]:
+            """Dibujo de cada gráfico del dashboard y de Gráficos con los resultados vigentes de los filtros."""
+            def stats() -> dict[str, Any]:
+                return getattr(self, "current_stats", {})
+
+            def bounds() -> tuple[int | None, int | None]:
+                filters = getattr(self, "_stats_filter", None)
+                return (filters[2], filters[3]) if filters else (None, None)
+
+            def classes(canvas: Any) -> None:
+                counts = class_counts(stats().get("por_categoria", {}))
+                draw_donut(canvas, "Productos por clase del modelo 2024", "Clase de la categoría asignada o estimada",
+                           [(key, f"{key} · {CLASS_LABELS[key]}" if key in CLASS_LABELS else key, count, class_color(key))
+                            for key, count in counts.items()], "productos")
+
+            def categories(canvas: Any, limit: int) -> None:
+                draw_treemap(canvas, "Productos por categoría" if limit > 12 else "Categorías más frecuentes",
+                             "Área proporcional a la cantidad · color por clase del modelo",
+                             [(code, count, class_color(catalog_by_code[code]["clase"]) if code in catalog_by_code
+                               else color("class_none")) for code, count in stats().get("por_categoria", {}).items()],
+                             limit=limit)
+
+            def validation(canvas: Any) -> None:
+                draw_donut(canvas, "Validación automática",
+                           "Reglas: año, tipología, autor o grupo activo, URL o DOI válido y fuente",
+                           [(state, display_value("validacion", state), count, color(STATUS_COLORS.get(state, "unknown")))
+                            for state, count in sorted(stats().get("por_validacion", {}).items(), reverse=True)],
+                           "productos")
+
+            def indicator(canvas: Any) -> None:
+                draw_indicator(canvas, self._indicator_result)
+                scale = scale_of(canvas)
+                if self._indicator_result is None:
+                    canvas.create_text(round(12 * scale), round(12 * scale), anchor="nw",
+                                       text="Aporte de cada término: disponible al elegir un grupo o investigador activo.",
+                                       font=chart_font(canvas, 10), fill=color("muted"))
+                canvas.configure(scrollregion=(0, 0, max(round(360 * scale), canvas.winfo_width()),
+                                               max(round(250 * scale), canvas.winfo_height())))
+            drawings: dict[str, Callable[[Any], None]] = {
+                "year_canvas": lambda canvas: self._draw_histogram(canvas, stats().get("por_anio", {}), bounds()),
+                "trend_canvas": lambda canvas: draw_trend(canvas, stats().get("por_anio", {}), bounds()),
+                "type_canvas": lambda canvas: self._draw_distribution(canvas, stats().get("por_tipologia", {}),
+                                                                      "Productos por tipología"),
+                "dashboard_type_canvas": lambda canvas: self._draw_distribution(
+                    canvas, stats().get("por_tipologia", {}), "Tipologías más frecuentes", 4),
+                "class_canvas": classes, "dashboard_class_canvas": classes,
+                "category_canvas": lambda canvas: categories(canvas, 30),
+                "dashboard_category_canvas": lambda canvas: categories(canvas, 12),
+                "validation_canvas": validation,
+                "graph_profile_canvas": lambda canvas: draw_indicator_profile(canvas, self._indicator_result),
+                "graph_indicator_canvas": indicator,
+            }
+            drawings["dashboard_year_canvas"] = drawings["year_canvas"]
+            return drawings[name]
+
         def _build_graphs(self) -> None:
-            heading = ttk.Frame(self.graphs)
+            body = ctk.CTkFrame(self.graphs, fg_color="transparent")
+            body.pack(fill="both", expand=True, padx=24, pady=20)
+            heading = ctk.CTkFrame(body, fg_color="transparent")
             heading.pack(fill="x")
-            ttk.Label(heading, text="Distribuciones de productos", style="Heading.TLabel").pack(side="left")
-            ttk.Button(heading, text="Cambiar filtros en Dashboard", command=lambda: self._show_page("dashboard")).pack(side="right")
-            ttk.Label(self.graphs, textvariable=self.context, style="Muted.TLabel", wraplength=700).pack(
-                fill="x", pady=(2, 14))
-            charts = ttk.Notebook(self.graphs)
+            ctk.CTkLabel(heading, text="Distribuciones de productos", font=FONTS["h1"],
+                         text_color=T["ink"]).pack(side="left")
+            button(heading, "Cambiar filtros en Dashboard", lambda: self._show_page("dashboard"), width=220).pack(side="right")
+            self.graph_context_label = ctk.CTkLabel(body, textvariable=self.context, font=FONTS["small"],
+                                                    text_color=T["muted"], anchor="w", justify="left", wraplength=700)
+            self.graph_context_label.pack(fill="x", pady=(2, 14))
+            charts = self.graph_tabs = ctk.CTkTabview(
+                body, fg_color=T["page"], text_color=T["ink"], border_width=0, corner_radius=8,
+                segmented_button_fg_color=T["field"], segmented_button_selected_color=T["primary_soft"],
+                segmented_button_selected_hover_color=T["hover"], segmented_button_unselected_color=T["field"],
+                segmented_button_unselected_hover_color=T["hover"])
             charts.pack(fill="both", expand=True)
-            for name, title in (("year_canvas", "Por año · histograma"), ("type_canvas", "Por tipología"),
-                                ("validation_canvas", "Por validación"), ("rules_canvas", "Reglas incumplidas")):
-                panel, canvas = self._chart_panel(charts)
+            # Siete clases de gráfico: histograma, línea, barras, anillo, mosaico, semicírculo y radar.
+            for name, title in (("year_canvas", "Por año"), ("trend_canvas", "Tendencia"),
+                                ("type_canvas", "Por tipología"), ("class_canvas", "Por clase"),
+                                ("category_canvas", "Por categoría"), ("graph_indicator_canvas", "Indicador"),
+                                ("validation_canvas", "Por validación")):
+                tab = charts.add(title)
+                if name == "graph_indicator_canvas":
+                    summary = ctk.CTkFrame(tab, fg_color="transparent")
+                    summary.pack(fill="x", pady=(0, 10))
+                    self.graph_indicator_summary = ctk.CTkLabel(
+                        summary, text="", font=FONTS["small"], text_color=T["muted"],
+                        anchor="w", justify="left", wraplength=430)
+                    self.graph_indicator_summary.pack(side="left", fill="x", expand=True, padx=(0, 16))
+                    self.graph_indicator_details = button(summary, "Detalle por subtipo", self.show_indicator_details, width=160)
+                    self.graph_indicator_details.pack(side="right")
+                    profile, self.graph_profile_canvas = self._chart_panel(
+                        tab, 270, draw=self._chart_draw("graph_profile_canvas"))
+                    profile.pack(fill="x", pady=(0, 10))
+                panel, canvas = self._chart_panel(tab, 250 if name == "graph_indicator_canvas" else 240,
+                                                  draw=self._chart_draw(name))
                 setattr(self, name, canvas)
-                charts.add(panel, text=title)
+                panel.pack(fill="both", expand=True)
+            body.bind("<Configure>", lambda event: self.graph_context_label.configure(
+                wraplength=max(260, event.width / scale_of(body) - 16)), add="+")
+
+        def _build_model_page(self) -> None:
+            self.model_scroll = ctk.CTkScrollableFrame(self.model_page, fg_color=T["page"], corner_radius=0,
+                                                       scrollbar_button_color=T["line_strong"],
+                                                       scrollbar_button_hover_color=T["muted"])
+            self.model_scroll.pack(fill="both", expand=True)
+            self.model_scroll._parent_canvas.configure(yscrollcommand=lambda first, last: set_scrollbar(
+                self.model_scroll._scrollbar, first, last))
+            body = ctk.CTkFrame(self.model_scroll, fg_color="transparent")
+            body.pack(fill="both", expand=True, padx=24, pady=20)
+            ctk.CTkLabel(body, text="Modelo de medición Minciencias 2024", font=FONTS["h1"],
+                         text_color=T["ink"], anchor="w").pack(fill="x", pady=(0, 12))
+            formula = Card(body)
+            formula.pack(fill="x", pady=(0, 12))
+            self.model_formula = ctk.CTkLabel(
+                formula.body, text="Ind = 3,7·Nc.Top + 2,3·Nc.A + 0,4·Nc.B + 1,5·AP + 0,5·DPC + "
+                                   "1·Fr.A + 0,2·Fr.B + 0,1·Cohe + 0,3·Coop",
+                font=FONTS["h2"], text_color=T["ink"], anchor="w", justify="left", wraplength=850)
+            self.model_formula.pack(fill="x", pady=(0, 8))
+            self.model_definitions = ctk.CTkLabel(
+                formula.body,
+                text="λ = ln(n / periodo + 1): n es la cantidad contada y periodo la ventana efectiva en años.\n"
+                     "Peso global = peso de alta calidad × peso relativo. Valor del subtipo = λ × peso global.\n"
+                     "Índice = valor / máximo de la población activa con los mismos filtros (0 si el máximo es 0).",
+                font=FONTS["caption"], text_color=T["muted"], anchor="w", justify="left", wraplength=850)
+            self.model_definitions.pack(fill="x")
+            formula.body.bind("<Configure>", lambda event: [label.configure(
+                wraplength=max(260, event.width / scale_of(body) - 8))
+                for label in (self.model_formula, self.model_definitions)], add="+")
+            classes = ctk.CTkFrame(body, fg_color="transparent")
+            classes.pack(fill="x", pady=(0, 12))
+            self.model_class_chips = []
+            for index, name in enumerate(MODEL_CLASSES):
+                count = sum(row["clase"] == name for row in catalog)
+                chip = Chip(classes, f"{name} · {decimal(MODEL_COEFFICIENTS[name])} · {count} categorías", "primary")
+                chip.grid(row=index // 4, column=index % 4, sticky="w", padx=(0, 8), pady=(0, 6))
+                self.model_class_chips.append(chip)
+            self.model_catalog = CategoryCatalog(body)
+            self.model_catalog.pack(fill="both", expand=True)
+            self.model_table = self.model_catalog.table
 
         def _build_queue(self) -> None:
-            heading = ttk.Frame(self.queue_tab)
+            body = ctk.CTkFrame(self.queue_tab, fg_color="transparent")
+            body.pack(fill="both", expand=True, padx=24, pady=20)
+            heading = ctk.CTkFrame(body, fg_color="transparent")
             heading.pack(fill="x")
-            ttk.Label(heading, text="Revisión de productos", style="Heading.TLabel").pack(side="left")
-            ttk.Button(heading, text="Añadir producto…", style="Accent.TButton", command=self.enqueue).pack(side="right")
-            ttk.Button(heading, text="Enviar rechazados", command=self.enqueue_rejected).pack(side="right", padx=6)
-            ttk.Label(self.queue_tab, text="La validación es automática. Los productos rechazados se revisan aquí en orden de llegada: "
-                      "corrija el producto o deje una nota que explique por qué no es posible.",
-                      style="Muted.TLabel", wraplength=680).pack(fill="x", pady=(2, 14))
+            ctk.CTkLabel(heading, text="Revisión de productos", font=FONTS["h1"], text_color=T["ink"]).pack(side="left")
+            button(heading, "Añadir producto…", self.enqueue, variant="primary", width=150).pack(side="right")
+            button(heading, "Enviar rechazados", self.enqueue_rejected, width=150).pack(side="right", padx=(0, 8))
+            caption = ctk.CTkLabel(body, text="La validación es automática. Los productos rechazados se revisan aquí en orden "
+                                   "de llegada: corrija el producto o deje una nota que explique por qué no es posible.",
+                                   font=FONTS["small"], text_color=T["muted"], anchor="w", justify="left", wraplength=680)
+            caption.pack(fill="x", pady=(2, 14))
             # La siguiente revisión, destacada en una tarjeta con la franja de «pendiente».
-            front = ttk.Frame(self.queue_tab, style="Card.TFrame")
+            front = Card(body, title="Siguiente en la cola", stripe="pending")
             front.pack(fill="x")
-            ttk.Frame(front, style="pending.Stripe.TFrame", height=3).pack(fill="x")
-            front_body = ttk.Frame(front, style="CardBody.TFrame", padding=(14, 10, 14, 12))
-            front_body.pack(fill="x")
-            front_body.columnconfigure(0, weight=1)
+            front.body.grid_columnconfigure(0, weight=1)
             self.queue_count = tk.StringVar()
-            ttk.Label(front_body, textvariable=self.queue_count, style="Muted.Card.TLabel").grid(row=0, column=0, sticky="w")
+            ctk.CTkLabel(front.body, textvariable=self.queue_count, font=FONTS["caption"], text_color=T["muted"],
+                         anchor="w").grid(row=0, column=0, sticky="w")
             self.queue_front_label = tk.StringVar()
-            self.queue_front_widget = ttk.Label(front_body, textvariable=self.queue_front_label, style="Card.TLabel",
-                                                font=font(11, "strong"), wraplength=560)
-            self.queue_front_widget.grid(row=1, column=0, sticky="ew", pady=(2, 10))
-            controls = ttk.Frame(front_body, style="CardBody.TFrame")
-            controls.grid(row=2, column=0, sticky="w")
-            self.review_button = ttk.Button(controls, text="Revisar siguiente", command=self.process_queue)
+            self.queue_front_widget = ctk.CTkLabel(front.body, textvariable=self.queue_front_label, font=FONTS["h2"],
+                                                   text_color=T["ink"], anchor="w", justify="left", wraplength=560)
+            self.queue_front_widget.grid(row=1, column=0, sticky="ew", pady=(2, 8))
+            self.queue_reasons = ctk.CTkFrame(front.body, fg_color="transparent")
+            self.queue_reasons.grid(row=2, column=0, sticky="w")
+            self.queue_reason_chips: list[Chip] = []
+            controls = ctk.CTkFrame(front.body, fg_color="transparent")
+            controls.grid(row=3, column=0, sticky="w", pady=(8, 0))
+            self.review_button = button(controls, "Revisar siguiente", self.process_queue, variant="primary", width=150)
             self.review_button.pack(side="left")
-            self.discard_button = ttk.Button(controls, text="Descartar siguiente", style="Danger.TButton",
-                                             command=self.discard_queue)
-            self.discard_button.pack(side="left", padx=6)
-            front_body.bind("<Configure>", lambda event: self.queue_front_widget.configure(wraplength=max(240, event.width - 30)))
-            ttk.Label(self.queue_tab, text="En cola", style="Section.TLabel").pack(anchor="w", pady=(18, 0))
-            columns = ("id", "producto_id", "motivo", "creado")
-            table_frame = ttk.Frame(self.queue_tab)
-            table_frame.pack(fill="both", expand=True, pady=(6, 0))
-            table_frame.columnconfigure(0, weight=1)
-            table_frame.rowconfigure(0, weight=1)
+            self.discard_button = button(controls, "Descartar siguiente", self.discard_queue, variant="danger", width=160)
+            self.discard_button.pack(side="left", padx=(8, 0))
+            body.bind("<Configure>", lambda event: [label.configure(wraplength=max(240, event.width / scale_of(body) - 40))
+                                                    for label in (caption, self.queue_front_widget)], add="+")
+            ctk.CTkLabel(body, text="En cola", font=FONTS["h2"], text_color=T["ink"], anchor="w").pack(fill="x", pady=(18, 6))
             # El ID del trabajo es interno (identifica la fila); no se muestra.
-            self.queue_table = ttk.Treeview(table_frame, columns=columns, show="headings",
-                                            displaycolumns=("producto_id", "motivo", "creado"))
-            self.queue_table.tag_configure("stripe", background=self.colors["stripe"])
-            for field in columns:
-                self.queue_table.heading(field, anchor="w", text={"producto_id": "Producto", "creado": "Recibido", "motivo": "Motivo"}.get(field, LABELS.get(field, field)))
-                self.queue_table.column(field, width=340 if field == "producto_id" else 260 if field == "motivo" else 150)
-            table_y = AutoScrollbar(table_frame, orient="vertical", command=self.queue_table.yview)
-            table_x = AutoScrollbar(table_frame, orient="horizontal", command=self.queue_table.xview)
-            self.queue_table.configure(yscrollcommand=table_y.set, xscrollcommand=table_x.set)
-            self.queue_table.grid(row=0, column=0, sticky="nsew")
-            table_y.grid(row=0, column=1, sticky="ns")
-            table_x.grid(row=1, column=0, sticky="ew")
-            self.queue_empty = ttk.Label(table_frame, text="No hay productos pendientes de revisión.", style="Muted.TLabel")
-            self.queue_table.bind("<Double-1>", lambda _e: self._open_queued_product())
-            self.queue_table.bind("<Return>", lambda _e: self._open_queued_product())
-            queue_pager = ttk.Frame(self.queue_tab, padding=(0, 10, 0, 0))
-            queue_pager.pack(side="bottom", fill="x", before=table_frame)
-            self.queue_previous = ttk.Button(queue_pager, text="Anterior", command=lambda: self._queue_move(-1))
-            self.queue_previous.pack(side="left")
+            self.queue_table = DataTable(body, ("id", "producto_id", "motivo", "creado"), height_rows=8,
+                                         headings={"id": "ID", "producto_id": "Producto", "motivo": "Motivo",
+                                                   "creado": "Recibido"},
+                                         widths={"id": 100, "producto_id": 340, "motivo": 280, "creado": 150})
+            self.queue_table.configure(displaycolumns=("producto_id", "motivo", "creado"))
+            self.queue_table.empty_text = "No hay productos pendientes de revisión."
+            self.queue_table.on_open(self._open_queued_product)
+            self.queue_pager = Pager(body, self._queue_move)
+            self.queue_pager.pack(side="bottom", fill="x", pady=(10, 0))
+            self.queue_table.pack(fill="both", expand=True)
+            self.queue_previous, self.queue_next = self.queue_pager.previous, self.queue_pager.next
             self.queue_page_label = tk.StringVar()
-            ttk.Label(queue_pager, textvariable=self.queue_page_label).pack(side="left", padx=10)
-            self.queue_next = ttk.Button(queue_pager, text="Siguiente", command=lambda: self._queue_move(1))
-            self.queue_next.pack(side="left")
             self.queue_offset = 0
+            self._queue_jobs: dict[str, dict[str, str]] = {}
 
-        def _open_queued_product(self) -> None:
-            selection = self.queue_table.selection()
-            if selection:
-                job = next((job for job in self.repo.queue_page(self.queue_offset, PAGE_SIZE)["rows"] if job["id"] == selection[0]), None)
-                if job:
-                    self.open_detail("productos", job["producto_id"])
+        def _open_queued_product(self, job_id: str | None = None) -> None:
+            selection = (job_id,) if job_id else self.queue_table.selection()
+            job = self._queue_jobs.get(selection[0]) if selection else None
+            if job:
+                self.open_detail("productos", job["producto_id"])
 
         def _queue_move(self, direction: int) -> None:
             self.queue_offset = max(0, self.queue_offset + direction * PAGE_SIZE)
@@ -4093,35 +6695,43 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             if self.queue_offset and self.queue_offset >= page["total"]:
                 self.queue_offset = max(0, (page["total"] - 1) // PAGE_SIZE * PAGE_SIZE)
                 page = self.repo.queue_page(self.queue_offset, PAGE_SIZE)
+            self._queue_jobs = {job["id"]: job for job in page["rows"]}
             self.queue_table.delete(*self.queue_table.get_children())
             for index, job in enumerate(page["rows"]):
                 self.queue_table.insert("", "end", iid=job["id"],
                                         values=(job["id"], self.reference_label("productos", job["producto_id"]), reason_text(job["motivo"], short=True), job["creado"].replace("T", " ")),
                                         tags=("stripe",) if index % 2 else ())
-            self.queue_count.set(f"Pendientes: {page['total']}")
-            self.queue_page_label.set(f"{self.queue_offset + 1 if page['total'] else 0}–{self.queue_offset + len(page['rows'])} de {page['total']}")
-            front = self.repo.queue_front()
-            self.queue_front_label.set("Siguiente: " + self.reference_label("productos", front["producto_id"]) if front
-                                       else "Cola vacía. Añada un producto para revisarlo.")
-            state = "normal" if front else "disabled"
-            self.review_button.configure(state=state)
-            self.discard_button.configure(state=state)
-            self.queue_previous.configure(state="normal" if self.queue_offset else "disabled")
-            self.queue_next.configure(state="normal" if self.queue_offset + PAGE_SIZE < page["total"] else "disabled")
-            if front:
-                self.queue_empty.place_forget()
+            self.queue_count.set(f"Pendientes: {number(page['total'])}")
+            self.queue_badge.set(number(page["total"]) if page["total"] else "", "pending")
+            if page["total"]:
+                self.queue_badge.place(relx=0.96, rely=0.5, anchor="e")
+                self.queue_badge.lift()
             else:
-                self.queue_empty.place(relx=0.5, rely=0.45, anchor="center")
+                self.queue_badge.place_forget()
+            self.queue_pager.show(self.queue_offset, len(page["rows"]), page["total"])
+            self.queue_page_label.set(self.queue_pager.label.cget("text"))
+            front = self.repo.queue_front()
+            self.queue_front_label.set(self.reference_label("productos", front["producto_id"]) if front
+                                       else "Cola vacía. Añada un producto para revisarlo.")
+            self.queue_reason_chips = reason_chips(self.queue_reasons, front["motivo"] if front else None)
+            # Un CTkFrame vacío conserva su alto por defecto (200 px): sin motivo no ocupa lugar.
+            self.queue_reasons.grid() if front else self.queue_reasons.grid_remove()
+            self.review_button.configure(state="normal" if front else "disabled",
+                                         fg_color=T["button"] if front else T["field"], border_width=0 if front else 1,
+                                         border_color=T["line_strong"], text_color_disabled=T["disabled"])
+            self.discard_button.configure(state="normal" if front else "disabled",
+                                          fg_color=T["rejected"] if front else T["field"], border_width=0 if front else 1,
+                                          border_color=T["line_strong"], text_color_disabled=T["disabled"])
 
         def enqueue(self, product_id: str | None = None, *, parent: tk.Misc | None = None) -> None:
             parent = parent or self.root
             if not self.repo.page("productos", limit=0)["total"]:
-                messagebox.showinfo("Sin productos", "Cree un producto primero", parent=self.root)
+                self.inform("Sin productos", "Cree un producto primero", parent=self.root)
                 return
             product_id = product_id or self.pick_record("productos", parent=parent)
             if not product_id:
                 return
-            reason = simpledialog.askstring("Motivo", "Motivo de la revisión:", parent=parent)
+            reason = self.ask_text("Motivo", "Motivo de la revisión:", parent=parent)
             if reason is None:
                 return
             self.mutate(lambda: self.repo.enqueue_review(product_id.strip(), reason))
@@ -4136,7 +6746,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
         def process_queue(self) -> None:
             job = self.repo.queue_front()
             if not job:
-                messagebox.showinfo("Cola", "No hay revisiones pendientes", parent=self.root)
+                self.inform("Cola", "No hay revisiones pendientes", parent=self.root)
                 return
             dialog = ReviewDialog(self.root, self, job)
             self.refresh()
@@ -4145,7 +6755,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
 
         def discard_queue(self) -> None:
             job = self.repo.queue_front()
-            if job and messagebox.askyesno("Descartar siguiente", f"¿Descartar revisión de {self.reference_label('productos', job['producto_id'])}?", parent=self.root):
+            if job and self.confirm("Descartar siguiente", f"¿Descartar revisión de {self.reference_label('productos', job['producto_id'])}?", parent=self.root):
                 self.mutate(self.repo.discard_review)
 
         def _stats_move(self, direction: int) -> None:
@@ -4153,43 +6763,35 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             self.refresh_dashboard()
 
         def _redraw_charts(self) -> None:
-            stats = getattr(self, "current_stats", {})
-            filters = getattr(self, "_stats_filter", None)
-            bounds = (filters[2], filters[3]) if filters else (None, None)
-            for name in ("year_canvas", "dashboard_year_canvas"):
+            for name in ("year_canvas", "dashboard_year_canvas", "trend_canvas", "type_canvas", "dashboard_type_canvas",
+                         "class_canvas", "dashboard_class_canvas", "category_canvas", "dashboard_category_canvas",
+                         "validation_canvas", "graph_profile_canvas", "graph_indicator_canvas"):
                 canvas = getattr(self, name, None)
                 if canvas is not None:
-                    self._draw_histogram(canvas, stats.get("por_anio", {}), bounds)
-            for name, field, title, limit in (
-                    ("type_canvas", "por_tipologia", "Productos por tipología", None),
-                    ("dashboard_type_canvas", "por_tipologia", "Tipologías más frecuentes", 5),
-                    ("validation_canvas", "por_validacion", "Validación automática", None)):
-                canvas = getattr(self, name, None)
-                if canvas is not None:
-                    self._draw_distribution(canvas, stats.get(field, {}), title, limit)
-            canvas = getattr(self, "rules_canvas", None)
-            if canvas is not None:
-                rules = {VALIDATION_RULES[code]: count for code, count in stats.get("por_regla", {}).items()}
-                self._draw_distribution(canvas, rules, "Reglas incumplidas",
-                                        base=stats.get("por_validacion", {}).get("rechazado", 0),
-                                        tone="rejected", empty="Todos los productos de la consulta cumplen las reglas")
+                    canvas.redraw()
+            if getattr(self, "_indicator_result", None):
+                self.indicator_canvas.redraw()
 
-        def _draw_histogram(self, canvas: tk.Canvas, values: dict[str, int],
+        def _draw_histogram(self, canvas: Any, values: dict[str, int],
                             bounds: tuple[int | None, int | None] = (None, None)) -> None:
-            c = self.colors
+            c, scale = palette(), scale_of(canvas)
+
+            def px(value: float) -> int:
+                return round(value * scale)
             canvas.delete("all")
             numeric = {int(key): value for key, value in values.items() if key.isdigit()}
             missing = values.get("Sin dato", 0)
             total = sum(values.values())
-            canvas.create_text(12, 14, anchor="w", text="Productos por año · histograma",
-                               font=font(10, "strong"), fill=c["ink"])
-            canvas.create_text(12, 34, anchor="w", text=f"{total} productos · {missing} sin año",
-                               font=font(9), fill=c["muted"])
-            height = max(170, canvas.winfo_height())
+            canvas.create_text(px(12), px(14), anchor="w", text="Productos por año · histograma",
+                               font=chart_font(canvas, 10, "strong"), fill=c["ink"])
+            canvas.create_text(px(12), px(34), anchor="w", text=f"{total} productos · {missing} sin año",
+                               font=chart_font(canvas, 9), fill=c["muted"])
+            height = max(px(170), canvas.winfo_height())
             if not numeric:
-                canvas.create_text(12, 80, anchor="w", text="Sin años registrados" if total else "Sin productos para estos filtros",
-                                   font=font(10), fill=c["muted"])
-                canvas.configure(scrollregion=(0, 0, max(canvas.winfo_width(), 280), height))
+                canvas.create_text(px(12), px(80), anchor="w",
+                                   text="Sin años registrados" if total else "Sin productos para estos filtros",
+                                   font=chart_font(canvas, 10), fill=c["muted"])
+                canvas.configure(scrollregion=(0, 0, max(canvas.winfo_width(), px(280)), height))
                 return
             first = bounds[0] if bounds[0] is not None else min(numeric)
             last = bounds[1] if bounds[1] is not None else max(numeric)
@@ -4199,34 +6801,34 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                 count = sum(value for year, value in numeric.items() if first <= year <= min(cutoff, last))
                 bins.append(("20 años\no más", count, f"older:{cutoff}"))
             bins.extend((str(year), numeric.get(year, 0), f"year:{year}") for year in range(max(first, cutoff + 1), last + 1))
-            width = max(canvas.winfo_width(), 320)
-            left, right, top, bottom = 46, width - 14, 74, height - 40
-            canvas.create_text(12, 52, anchor="w", text=f"Columna clara: 20 años o más ({cutoff} y anteriores)"
+            width = max(canvas.winfo_width(), px(320))
+            left, right, top, bottom = px(46), width - px(14), px(74), height - px(40)
+            canvas.create_text(px(12), px(52), anchor="w", text=f"Columna clara: 20 años o más ({cutoff} y anteriores)"
                                if bins[0][2].startswith("older:") else "Un año por columna",
-                               font=font(8), fill=c["muted"])
+                               font=chart_font(canvas, 8), fill=c["muted"])
             maximum = max(1, max(count for _, count, _ in bins))
             for value in sorted({round(maximum * tick / 4) for tick in range(5)}):
                 y = bottom - (bottom - top) * value / maximum
                 if value:
                     canvas.create_line(left, y, right, y, fill=c["chart_grid"])
-                canvas.create_text(left - 8, y, anchor="e", text=str(value),
-                                   font=font(8), fill=c["muted"])
+                canvas.create_text(left - px(8), y, anchor="e", text=str(value),
+                                   font=chart_font(canvas, 8), fill=c["muted"])
             step = (right - left) / len(bins)
             # Con pocas columnas la barra no ocupa todo el ancho.
-            gap = max(min(3.0, step * 0.12), (step - 64) / 2)
-            label_every = max(1, math.ceil(34 / step))
+            gap = max(min(px(3), step * 0.12), (step - px(64)) / 2)
+            label_every = max(1, math.ceil(px(34) / step))
             for index, (label, count, tag) in enumerate(bins):
                 x0, x1 = left + index * step, left + (index + 1) * step
                 y = bottom - (bottom - top) * count / maximum
                 fill = c["chart_older"] if tag.startswith("older:") else c["primary"]
                 canvas.create_rectangle(x0 + gap, y, x1 - gap, bottom, fill=fill, outline="",
                                         tags=("bin", tag, f"count:{count}"))
-                if count and (step >= 28 or tag.startswith("older:")):
-                    canvas.create_text((x0 + x1) / 2, y - 8, text=str(count),
-                                       font=font(8), fill=c["ink"])
+                if count and (step >= px(28) or tag.startswith("older:")):
+                    canvas.create_text((x0 + x1) / 2, y - px(8), text=str(count),
+                                       font=chart_font(canvas, 8), fill=c["ink"])
                 if (index % label_every == 0 and (index == 0 or len(bins) - 1 - index >= label_every)) or index == len(bins) - 1:
-                    canvas.create_text((x0 + x1) / 2, bottom + 16, text=label,
-                                       font=font(8), fill=c["muted"])
+                    canvas.create_text((x0 + x1) / 2, bottom + px(16), text=label,
+                                       font=chart_font(canvas, 8), fill=c["muted"])
             canvas.create_line(left, bottom, right, bottom, fill=c["line_strong"])
             canvas.configure(scrollregion=(0, 0, width, height))
             signature = (tuple(sorted(numeric.items())), first, last)
@@ -4234,22 +6836,39 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                 canvas.xview_moveto(0.0)
                 canvas._hist_signature = signature
 
-        def _draw_distribution(self, canvas: tk.Canvas, values: dict[str, int], title: str,
-                               limit: int | None = None, base: int | None = None, tone: str | None = None,
-                               empty: str = "Sin productos para estos filtros") -> None:
-            """Barras horizontales; base fija el denominador cuando las categorías se solapan."""
-            c = self.colors
-            canvas.delete("all")
-            width = max(canvas.winfo_width(), 320)
-            total = sum(values.values()) if base is None else base
-            canvas.create_text(12, 14, anchor="w", text=title, font=font(10, "strong"), fill=c["ink"])
-            canvas.create_text(12, 34, anchor="w", text=f"Base: {total} productos (incluye «Sin dato»)" if base is None
-                               else f"Base: {total} productos rechazados; un producto puede incumplir varias reglas",
-                               font=font(9), fill=c["muted"])
-            if not total or not any(values.values()):
-                canvas.create_text(12, 80, anchor="w", text=empty if base is not None or total else "Sin productos para estos filtros",
-                                   font=font(10), fill=c["muted"])
-                canvas.configure(scrollregion=(0, 0, width, max(160, canvas.winfo_height())))
+        def show_indicator_details(self, result: dict[str, Any] | None = None, parent: Any = None) -> Dialog | None:
+            """Subtipos del indicador indicado o, por defecto, del que muestran los filtros del Dashboard."""
+            result = result if result is not None else self._indicator_result
+            if result is None:
+                return None
+            dialog = Dialog(parent or self.root, "Detalle del indicador por subtipo", 880, 470)
+            ctk.CTkLabel(dialog.body, text=f"Detalle por subtipo · corte {result['corte']}", font=FONTS["h2"],
+                         text_color=T["ink"], anchor="w").pack(fill="x", pady=(0, 10))
+            columns = ("codigo", "clase", "cantidad", "periodo", "lambda", "peso_global", "valor")
+            table = DataTable(dialog.body, columns, height_rows=8,
+                              headings={"codigo": "Código", "clase": "Clase", "cantidad": "Cantidad",
+                                        "periodo": "Periodo (años)", "lambda": "λ", "peso_global": "Peso global",
+                                        "valor": "Valor"},
+                              widths={"codigo": 130, "clase": 80, "cantidad": 90, "periodo": 120, "lambda": 110,
+                                      "peso_global": 120, "valor": 120},
+                              anchors={name: "e" for name in columns[2:]})
+            table.pack(fill="both", expand=True)
+            for subtype in result["subtipos"]:
+                table.insert("", "end", values=(subtype["codigo"], subtype["clase"], subtype["cantidad"],
+                                                subtype["periodo"], decimal(subtype["lambda"], 4),
+                                                decimal(subtype["peso_global"], 3), decimal(subtype["valor"], 3)))
+            dialog.table = table
+            button(dialog.footer, "Cerrar", dialog.close, variant="primary", width=112).pack(side="right")
+            dialog.present(wait=False)
+            return dialog
+
+        def _draw_distribution(self, canvas: Any, values: dict[str, int], title: str,
+                               limit: int | None = None) -> None:
+            """Diagrama de barras horizontales, de la categoría más frecuente a la menos frecuente."""
+            total = sum(values.values())
+            c, px, width, _height = chart_start(canvas, title, f"Base: {number(total)} productos (incluye «Sin dato»)")
+            if not total:
+                chart_empty(canvas, "Sin productos para estos filtros", width, max(px(160), canvas.winfo_height()))
                 return
             items = sorted(((name, count) for name, count in values.items() if count),
                            key=lambda item: (-item[1], item[0]))
@@ -4262,24 +6881,23 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                     shown.append(("Sin dato", values["Sin dato"]))
                 items = shown
             max_count = max(count for _, count in items)
-            label_width = min(230, max(120, width * 0.38))
-            left, right = label_width + 26, width - 100
-            y = 58
+            label_width = min(px(230), max(px(120), width * 0.38))
+            left, right = label_width + px(26), width - px(100)
+            y = px(58)
             for name, count in items:
-                label = canvas.create_text(12, y, anchor="nw", text=name[:1].upper() + name[1:], width=label_width,
-                                           font=font(9), fill=c["ink"])
+                label = canvas.create_text(px(12), y, anchor="nw", text=name[:1].upper() + name[1:], width=label_width,
+                                           font=chart_font(canvas, 9), fill=c["ink"])
                 bbox = canvas.bbox(label)
-                row_height = max(30, (bbox[3] - bbox[1]) + 12) if bbox else 30
-                bar_y = y + row_height / 2 - 8
-                # Los estados de validación conservan su color en todo el programa.
-                color = c[tone or STATUS_COLORS.get(name, "primary")]
-                canvas.create_rectangle(left, bar_y, right, bar_y + 10, fill=c["chart_track"], outline="")
-                canvas.create_rectangle(left, bar_y, left + max(2, (right - left) * count / max_count), bar_y + 10,
-                                        fill=color, outline="", tags=("bar", f"count:{count}"))
-                canvas.create_text(right + 10, bar_y + 5, anchor="w", text=f"{count} · {count / total:.1%}",
-                                   font=font(8), fill=c["muted"])
+                row_height = max(px(30), (bbox[3] - bbox[1]) + px(12)) if bbox else px(30)
+                bar_y = y + row_height / 2 - px(8)
+                fill = c["unknown" if name == "Sin dato" else "primary"]
+                canvas.create_rectangle(left, bar_y, right, bar_y + px(10), fill=c["chart_track"], outline="")
+                canvas.create_rectangle(left, bar_y, left + max(px(2), (right - left) * count / max_count),
+                                        bar_y + px(10), fill=fill, outline="", tags=("bar", f"count:{count}"))
+                canvas.create_text(right + px(10), bar_y + px(5), anchor="w", text=f"{number(count)} · {percent(count, total)}",
+                                   font=chart_font(canvas, 8), fill=c["muted"])
                 y += row_height
-            canvas.configure(scrollregion=(0, 0, width, max(y + 10, canvas.winfo_height())))
+            canvas.configure(scrollregion=(0, 0, width, max(y + px(10), canvas.winfo_height())))
 
         def _scope_changed(self, selected: str | None = None) -> None:
             kind = {"Grupo": "grupos", "Investigador": "investigadores", "Producto": "productos"}.get(self.view.get())
@@ -4339,14 +6957,26 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                 if self.stats_offset and self.stats_offset >= result["total"]:
                     self.stats_offset = max(0, (result["total"] - 1) // PAGE_SIZE * PAGE_SIZE)
                     result = self.repo.statistics(*filters, offset=self.stats_offset, limit=PAGE_SIZE)
+                indicator = None
+                kind = {"Grupo": "grupos", "Investigador": "investigadores"}.get(self.view.get())
+                if kind and self.scope_id.get():
+                    entity = self.repo.get(kind, self.scope_id.get())
+                    if entity is not None and entity["activo"] == "1":
+                        indicator = self.repo.indicator(kind, self.scope_id.get(), start, end, status)
             except (ValueError, DataError) as exc:
                 self.filter_error.set(f"Filtro inválido: {exc}. Se conservan los últimos resultados válidos.")
-                self.filter_error_label.grid(row=2, column=0, columnspan=3, sticky="ew", padx=5)
+                self.filter_error_label.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
                 self.status.set(f"Filtro inválido: {exc}")
                 return
             self.filter_error.set("")
             self.filter_error_label.grid_remove()
             self.current_stats = result
+            self._indicator_result = indicator
+            self.indicator_panel.show(indicator, self.scope_box.label.get() if indicator is not None else "")
+            self.graph_indicator_summary.configure(
+                text=(f"Indicador: {self.indicator_value.get()} / 10 · Corte {indicator['corte']}\n"
+                      + self.indicator_note.get()) if indicator is not None else "Indicador de producción · Minciencias 2024")
+            self.graph_indicator_details.configure(state="normal" if indicator is not None else "disabled")
             active_groups = self.overview["active_groups"]
             active_people = self.overview["active_people"]
             scope = self.scope_box.label.get() if self.view.get() != "Todos" else "Toda la institución"
@@ -4357,31 +6987,27 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                                        ("rejected", "por_validacion", "rechazado"),
                                        ("undated", "por_anio", "Sin dato")):
                 self.card_values[key].set(f"{result[field].get(value, 0):,}".replace(",", "."))
-            self.metric.set(f"Institución: {active_groups} grupos activos · {active_people} investigadores activos. Cada producto se cuenta una vez.")
-            if result["total"]:
-                missing = [f"{label}: {result[field].get('Sin dato', 0)} sin dato"
-                           for label, field in (("Año", "por_anio"), ("Tipología", "por_tipologia"))
-                           if result[field].get("Sin dato", 0)]
-                rules = sorted(result["por_regla"].items(), key=lambda item: -item[1])
-                causes = ", ".join(f"{VALIDATION_RULES[code].lower()} ({count})" for code, count in rules)
-                self.note.set("Rechazos por: " + causes + (" · " + " · ".join(missing) if missing else "")
-                              if causes else "Todos los productos cumplen las reglas de validación"
-                              + (" · " + " · ".join(missing) if missing else ""))
-            else:
-                self.note.set("Sin productos para estos filtros")
+            for chip, (count, singular, plural) in zip(self.institution_chips, (
+                    (active_groups, "grupo activo", "grupos activos"),
+                    (active_people, "investigador activo", "investigadores activos"))):
+                chip.set(f"{number(count)} {singular if count == 1 else plural}", "primary")
+            rules = sorted(result["por_regla"].items(), key=lambda item: -item[1])
+            self.note.set("Rechazos por: " + ", ".join(f"{RULE_LABELS[code].lower()} ({number(count)})"
+                                                       for code, count in rules) if rules else "")
+            if rules and not self.note_label.winfo_manager():
+                self.note_label.pack(**self._note_pack)
+            elif not rules:
+                self.note_label.pack_forget()
             self.stats_table.delete(*self.stats_table.get_children())
             for index, row in enumerate(result["productos"]):
                 self.stats_table.insert("", "end", iid=row["id"],
                                         values=tuple(display_value(field, row[field]) for field in self.stats_table["columns"]),
                                         tags=("stripe",) if index % 2 else ())
-            self.stats_page_label.set(f"{self.stats_offset + 1 if result['total'] else 0}–{self.stats_offset + len(result['productos'])} de {result['total']}")
-            self.stats_previous.configure(state="normal" if self.stats_offset else "disabled")
-            self.stats_next.configure(state="normal" if self.stats_offset + PAGE_SIZE < result["total"] else "disabled")
+            self.stats_pager.show(self.stats_offset, len(result["productos"]), result["total"])
+            self.stats_page_label.set(self.stats_pager.label.cget("text"))
             self._redraw_charts()
 
-        def _open_product(self, _event: tk.Event) -> None:
-            if getattr(_event, "num", None) == 1 and not self.stats_table.identify_row(_event.y):
-                return
+        def _open_product(self, _event: tk.Event | None = None) -> None:
             selection = self.stats_table.selection()
             if selection:
                 self.open_detail("productos", selection[0])
@@ -4402,9 +7028,9 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             self.overview = self.repo.summary()
             self._scope_changed()
             self.root.title("PEA-i UPC — Investigación" + (" *" if self.repo.dirty else ""))
-            self.workspace.set(f"{self.workspace_caption} · "
-                               + ("Cambios sin guardar" if self.repo.dirty else "Sin cambios pendientes"))
-            self.workspace_label.configure(style="Dirty.Header.TLabel" if self.repo.dirty else "Header.TLabel")
+            self.workspace.set(self.workspace_caption)
+            self.workspace_state.set("Cambios sin guardar" if self.repo.dirty else "Guardado",
+                                     "pending" if self.repo.dirty else "muted")
             self.save_button.configure(text="Guardar como…" if self.data_file is None else "Guardar")
             for detail in tuple(self.details):
                 if detail.winfo_exists():
@@ -4414,7 +7040,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             try:
                 result = action()
             except (DataError, OSError, ValueError) as exc:
-                messagebox.showerror("No se pudo completar", str(exc), parent=self.root)
+                self.alert("No se pudo completar", str(exc), parent=self.root)
                 return None
             self.refresh()
             self.status.set("Cambio en memoria. Guarde para conservarlo al cerrar.")
@@ -4429,11 +7055,13 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                 self._record_cache[cache_key] = self.repo.get(kind, key) or {"id": key, "activo": "0"}
             return self._record_cache[cache_key]
 
-        def open_detail(self, kind: str, key: str, parent: tk.Misc | None = None) -> DetailDialog | None:
+        def open_detail(self, kind: str, key: str, parent: tk.Misc | None = None,
+                        tab: str | None = None) -> DetailDialog | None:
+            """Abre la ficha; tab elige una pestaña (por ejemplo «Indicador») si la ficha la tiene."""
             if self.repo.get(kind, key) is None:
                 self.status.set("Este registro ya no existe")
                 return None
-            return DetailDialog(parent or self.root, self, kind, key)
+            return DetailDialog(parent or self.root, self, kind, key, tab)
 
         def reference_label(self, kind: str, key: str) -> str:
             row = self.record(kind, key)
@@ -4513,7 +7141,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
         def _may_discard(self) -> bool:
             if not self.repo.dirty:
                 return True
-            choice = messagebox.askyesnocancel("Cambios sin guardar", "¿Guardar cambios antes de continuar?", parent=self.root)
+            choice = self.decide("Cambios sin guardar", "¿Guardar cambios antes de continuar?", parent=self.root)
             if choice is None:
                 return False
             if choice:
@@ -4521,12 +7149,33 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             return True
 
         def start_choice(self) -> None:
-            if self.initial_file is not None:
-                self._load(self.initial_file)
-            elif DEFAULT_DATA_FILE.exists():
-                self._load(DEFAULT_DATA_FILE)
+            if self._startup_timer is not None:
+                self.root.after_cancel(self._startup_timer)
+                self._startup_timer = None
+            self._set_loading(True)
+            self.root.update_idletasks()
+            try:
+                if self.initial_file is not None:
+                    self._load(self.initial_file)
+                elif DEFAULT_DATA_FILE.exists():
+                    self._load(DEFAULT_DATA_FILE)
+                else:
+                    self.status.set(f"No se encontró {DEFAULT_DATA_FILE.name}; espacio vacío.")
+            finally:
+                self._set_loading(False)
+
+        def _set_loading(self, visible: bool) -> None:
+            if not self.loading.winfo_exists():
+                return
+            if visible:
+                self.loading_layer.place(x=0, y=0, relwidth=1, relheight=1)
+                self.loading_layer.lift()
+                self.loading.place(relx=0.5, rely=0.5, anchor="center")
+                self.loading.progress.start()
             else:
-                self.status.set(f"No se encontró {DEFAULT_DATA_FILE.name}; espacio vacío.")
+                self.loading.progress.stop()
+                self.loading.place_forget()
+                self.loading_layer.place_forget()
 
         def new_workspace(self) -> None:
             if self._may_discard():
@@ -4549,19 +7198,19 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                     new_repo = load_repository(path)
             except (DataError, OSError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
                 backup = backup_of(path)
-                if backup.exists() and messagebox.askyesno("Datos dañados", f"{exc}\n\n¿Abrir la copia anterior de .backup?", parent=self.root):
+                if backup.exists() and self.confirm("Datos dañados", f"{exc}\n\n¿Abrir la copia anterior de .backup?", parent=self.root):
                     try:
                         if isinstance(self.repo, CppRepository):
                             self.repo.load(backup)
                         else:
                             new_repo = load_repository(backup)
                     except (DataError, OSError, ValueError, UnicodeError, json.JSONDecodeError) as backup_exc:
-                        messagebox.showerror("Copia inválida", str(backup_exc), parent=self.root)
+                        self.alert("Copia inválida", str(backup_exc), parent=self.root)
                         return
                     path = backup
                     recovered = True
                 else:
-                    messagebox.showerror("No se pudo cargar", str(exc), parent=self.root)
+                    self.alert("No se pudo cargar", str(exc), parent=self.root)
                     return
             if not isinstance(self.repo, CppRepository):
                 self.repo = new_repo
@@ -4596,7 +7245,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                 else:
                     save_repository(self.repo, self.data_file)
             except (OSError, DataError) as exc:
-                messagebox.showerror("No se pudo guardar", str(exc), parent=self.root)
+                self.alert("No se pudo guardar", str(exc), parent=self.root)
                 return False
             self.refresh()
             self.status.set(f"Guardado en {self.data_file}")
@@ -4634,19 +7283,21 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             try:
                 export_repository_spreadsheet(self.repo, Path(folder))
             except (OSError, DataError) as exc:
-                messagebox.showerror("No se pudo exportar", str(exc), parent=self.root)
+                self.alert("No se pudo exportar", str(exc), parent=self.root)
                 return
             self.status.set(f"Exportado para hoja de cálculo en {folder}")
 
         def close(self) -> None:
             if self._may_discard():
+                self._set_loading(False)
+                cancel_widget_timers(self.root)
                 self.root.destroy()
 
         def undo(self) -> None:
             try:
                 undone = self.repo.undo()
             except DataError as exc:
-                messagebox.showerror("No se pudo deshacer", str(exc), parent=self.root)
+                self.alert("No se pudo deshacer", str(exc), parent=self.root)
                 return
             if undone:
                 self.refresh()
@@ -4655,7 +7306,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                 self.status.set("No hay acciones para deshacer")
 
         def clear_history(self) -> None:
-            if self.repo.history_size() and messagebox.askyesno("Vaciar historial", "¿Eliminar las acciones para deshacer?", parent=self.root):
+            if self.repo.history_size() and self.confirm("Vaciar historial", "¿Eliminar las acciones para deshacer?", parent=self.root):
                 self.mutate(self.repo.clear_history)
 
         def import_csv(self) -> None:
@@ -4670,7 +7321,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                     with tempfile.TemporaryDirectory() as temporary:
                         self.import_csv_path(_xlsx_to_csv(path, Path(temporary) / "hoja.csv"))
                 except (DataError, OSError) as exc:
-                    messagebox.showerror("Excel inválido", str(exc), parent=self.root)
+                    self.alert("Excel inválido", str(exc), parent=self.root)
                 return
             self.import_csv_path(path)
 
@@ -4679,7 +7330,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                 with path.open(encoding="utf-8-sig", newline="") as stream:
                     header = next(csv.reader(stream), [])
             except (OSError, UnicodeError, csv.Error) as exc:
-                messagebox.showerror("CSV inválido", str(exc), parent=self.root)
+                self.alert("CSV inválido", str(exc), parent=self.root)
                 return
             default = next((kind for kind, fields in ALL_FIELDS.items() if tuple(header) == fields), path.stem)
             options = {TITLES[kind]: kind for kind in ALL_FIELDS}
@@ -4693,12 +7344,14 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                 else:
                     total, expected, errors = preview_csv_merge(self.repo, path, kind)
             except (DataError, OSError, UnicodeError) as exc:
-                messagebox.showerror("CSV inválido", str(exc), parent=self.root)
+                self.alert("CSV inválido", str(exc), parent=self.root)
                 return
-            summary = f"{total} filas de {kind}\nAceptables: {expected}\nRechazadas: {total - expected}"
+            summary = (f"Archivo {path.name} · {TITLES[kind]}\nFilas: {total}\nAceptables: {expected}\n"
+                       f"Rechazadas: {total - expected}")
             if errors:
-                summary += "\n\n" + "\n".join(errors[:8])
-            if not messagebox.askyesno("Vista previa", summary + "\n\n¿Importar las aceptables?", parent=self.root):
+                summary += "\n\nPrimeros errores:\n" + "\n".join(errors[:20])
+            if not self.confirm("Vista previa", summary + "\n\n¿Importar las aceptables?", accept="Importar aceptables",
+                                cancel="Cancelar", parent=self.root):
                 return
             try:
                 if isinstance(self.repo, CppRepository):
@@ -4706,11 +7359,11 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                 else:
                     accepted, errors = merge_csv(self.repo, path, kind)
             except (DataError, OSError, UnicodeError) as exc:
-                messagebox.showerror("No se pudo importar", str(exc), parent=self.root)
+                self.alert("No se pudo importar", str(exc), parent=self.root)
                 return
             self.refresh()
             self._keep_import(f"Importación: {accepted} filas aceptadas; {total - accepted} rechazadas.")
-            messagebox.showinfo("Resultado de importación", f"Aceptadas: {accepted}\nRechazadas: {total - accepted}\n\n" + "\n".join(errors[:20]), parent=self.root)
+            self.inform("Resultado de importación", f"Aceptadas: {accepted}\nRechazadas: {total - accepted}\n\n" + "\n".join(errors[:20]), parent=self.root)
 
         def _accept_external(self, kind: str, row: dict[str, str]) -> None:
             existing = self.repo.get(kind, row["id"]) if row.get("id") else None
@@ -4722,78 +7375,82 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                 self._keep_import("Registro importado.")
 
         def import_url(self, initial_url: str | None = None) -> None:
+            """Consulta una URL pública en un diálogo; con initial_url (Consultar fuente) empieza de inmediato."""
             if self._url_busy:
                 self.status.set("Ya hay una consulta URL en curso")
                 return
-            url = initial_url or simpledialog.askstring("Consultar URL", "Pegue una URL pública HTTP o HTTPS:", parent=self.root)
-            if not url:
-                return
-            self.status.set("Descargando página pública...")
             self._url_busy = True
-            result_queue: queue.Queue[WebPreview | Exception] = queue.Queue(maxsize=1)
-
-            def fetch() -> None:
-                try:
-                    result_queue.put(fetch_web_page(url.strip()))
-                except Exception as exc:
-                    result_queue.put(exc)
-
-            def check_result() -> None:
-                try:
-                    alive = self.root.winfo_exists()
-                except tk.TclError:
-                    return
-                if not alive:
-                    return
-                try:
-                    result = result_queue.get_nowait()
-                except queue.Empty:
-                    self.root.after(100, check_result)
-                    return
+            try:
+                dialog = UrlDialog(self.root, self, initial_url or "", start=bool(initial_url))
+            finally:
                 self._url_busy = False
-                if isinstance(result, Exception):
-                    messagebox.showerror("Consulta URL", str(result), parent=self.root)
-                    self.status.set("La consulta no modificó los datos")
-                    return
-                self.status.set(f"Página consultada: {result.title}")
-                self._show_web_preview(result)
+            if dialog.preview is None:
+                return
+            self.status.set(f"Página consultada: {dialog.preview.title}")
+            self._show_web_preview(dialog.preview)
 
-            threading.Thread(target=fetch, daemon=True).start()
-            self.root.after(100, check_result)
-
-        def _show_web_preview(self, preview: WebPreview, source: str | None = None) -> None:
-            dialog = tk.Toplevel(self.root)
-            dialog.title("Vista previa de URL pública")
-            dialog.transient(self.root)
-            dialog.geometry("850x650")
-            dialog.minsize(650, 450)
-            dialog.columnconfigure(0, weight=1)
-            dialog.rowconfigure(4, weight=1)
-            ttk.Label(dialog, text=preview.title, style="Heading.TLabel", wraplength=780,
-                      padding=(12, 10)).grid(row=0, column=0, sticky="w")
-            ttk.Label(dialog, text=f"Formato: {preview.format}  •  Fuente: {source or _web_source(preview.url)}",
-                      padding=(12, 0)).grid(row=1, column=0, sticky="w")
-            url_box = ttk.Entry(dialog)
+        def _show_web_preview(self, preview: WebPreview, source: str | None = None) -> Dialog:
+            dialog = Dialog(self.root, "Vista previa de URL pública", 920, 700)
+            dialog.minsize(780, 480)
+            page = ctk.CTkScrollableFrame(dialog.body, fg_color="transparent", corner_radius=0,
+                                          scrollbar_button_color=T["line_strong"], scrollbar_button_hover_color=T["muted"])
+            page.pack(fill="both", expand=True)
+            page._parent_canvas.configure(yscrollcommand=lambda first, last: set_scrollbar(page._scrollbar, first, last))
+            wrapped = [ctk.CTkLabel(page, text=preview.title, font=FONTS["h1"], text_color=T["ink"], anchor="w",
+                                    justify="left", wraplength=820)]
+            wrapped[0].pack(fill="x", padx=(0, 8))
+            chips = ctk.CTkFrame(page, fg_color="transparent")
+            chips.pack(fill="x", pady=(6, 10))
+            for text, tone in ((f"Formato {preview.format}", "muted"), (source or _web_source(preview.url), "primary")):
+                Chip(chips, text, tone).pack(side="left", padx=(0, 6))
+            url_box = ctk.CTkEntry(page, height=32, corner_radius=8, font=FONTS["small"], fg_color=T["field"],
+                                   border_color=T["line_strong"], text_color=T["ink"])
             url_box.insert(0, preview.url)
             url_box.configure(state="readonly")
-            url_box.grid(row=2, column=0, sticky="ew", padx=12, pady=6)
-            note = "Datos detectados para revisar: " + (preview.suggested_kind or "ningún registro de investigación")
-            if preview.related_members or preview.related_products:
-                note += (f"; {len(preview.related_members)} integrantes, {len(preview.related_products)} productos"
-                         f" y {len(preview.related_authorships)} autorías coincidentes con el censo")
-                if preview.related_plan:
-                    note += "; plan estratégico"
-            note += ". Los gráficos usan productos guardados e incluyen los campos desconocidos como «Sin dato»."
-            ttk.Label(dialog, text=note, wraplength=780, padding=(12, 4)).grid(row=3, column=0, sticky="w")
-            body = ttk.Frame(dialog, padding=(12, 4))
-            body.grid(row=4, column=0, sticky="nsew")
-            body.columnconfigure(0, weight=1)
-            body.rowconfigure(0, weight=1)
-            shown = tk.Text(body, wrap="word", state="normal")
-            scroll = AutoScrollbar(body, orient="vertical", command=shown.yview)
-            shown.configure(yscrollcommand=scroll.set)
-            shown.grid(row=0, column=0, sticky="nsew")
-            scroll.grid(row=0, column=1, sticky="ns")
+            url_box.pack(fill="x", padx=(0, 8))
+            detected = bool(preview.related_members or preview.related_products or preview.related_plan)
+            dialog.detected = {}
+            dialog.category_chips = []
+            if detected:
+                ctk.CTkLabel(page, text="Datos detectados", font=FONTS["h2"], text_color=T["ink"], anchor="w").pack(
+                    fill="x", pady=(16, 8))
+                figures = [("Productos", number(len(preview.related_products))),
+                           ("Autorías", number(len(preview.related_authorships)))]
+                if preview.suggested_kind != "investigadores":
+                    figures = [("Integrantes", number(len(preview.related_members))), *figures,
+                               ("Plan", "Sí" if preview.related_plan else "No")]
+                row = ctk.CTkFrame(page, fg_color="transparent")
+                row.pack(fill="x", padx=(0, 8))
+                for index, (caption, value) in enumerate(figures):
+                    dialog.detected[caption] = tk.StringVar(value=value)
+                    Kpi(row, caption, "primary", dialog.detected[caption], bg_color=T["page"]).grid(
+                        row=0, column=index, sticky="ew", padx=(0 if index == 0 else 10, 0))
+                    row.grid_columnconfigure(index, weight=1, uniform="figures")
+                per_class: dict[str, int] = {}
+                for product in preview.related_products:
+                    category = catalog_by_code.get(product.get("categoria", ""))
+                    name = category["clase"] if category else "Sin categoría"
+                    per_class[name] = per_class.get(name, 0) + 1
+                if per_class:
+                    classes = ctk.CTkFrame(page, fg_color="transparent")
+                    classes.pack(fill="x", pady=(12, 0))
+                    ctk.CTkLabel(classes, text="Categorías estimadas por tipología", font=FONTS["caption"],
+                                 text_color=T["muted"]).pack(side="left", padx=(0, 10))
+                    for name in (*MODEL_CLASSES, "Sin categoría"):
+                        if name in per_class:
+                            chip = Chip(classes, f"{name} {number(per_class[name])}",
+                                        "unknown" if name == "Sin categoría" else "pending")
+                            chip.pack(side="left", padx=(0, 6))
+                            dialog.category_chips.append(chip)
+            note = ("Revise los datos detectados antes de importarlos: se crean los registros nuevos y se actualizan "
+                    "los existentes con lo que diga la fuente." if detected else
+                    "Datos detectados para revisar: " + (preview.suggested_kind or "ningún registro de investigación") + ".")
+            wrapped.append(ctk.CTkLabel(page, text=note + " Los gráficos usan productos guardados e incluyen los campos "
+                                        "desconocidos como «Sin dato».", font=FONTS["small"], text_color=T["muted"],
+                                        anchor="w", justify="left", wraplength=820))
+            wrapped[-1].pack(fill="x", pady=(14, 0))
+            page.bind("<Configure>", lambda event: [label.configure(wraplength=max(300, event.width / scale_of(page) - 24))
+                                                    for label in wrapped], add="+")
             details = ["METADATOS DECLARADOS POR LA PÁGINA"]
             details.extend(f"{key}: {value}" for key, value in preview.metadata.items())
             if not preview.metadata:
@@ -4805,10 +7462,22 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                     details.append(f"Tabla {index}")
                     details.extend(" | ".join(row) for row in table)
                     details.append("")
-            shown.insert("1.0", "\n".join(details))
-            shown.configure(state="disabled")
-            actions = ttk.Frame(dialog, padding=10)
-            actions.grid(row=5, column=0, sticky="ew")
+            dialog.page_text = ctk.CTkTextbox(page, height=280, wrap="word", font=FONTS["small"], fg_color=T["surface"],
+                                              text_color=T["ink"], border_width=1, border_color=T["line"], corner_radius=8,
+                                              scrollbar_button_color=T["line_strong"],
+                                              scrollbar_button_hover_color=T["muted"])
+            dialog.page_text.insert("1.0", "\n".join(details))
+            dialog.page_text.configure(state="disabled")
+
+            def toggle_text() -> None:
+                shown = bool(dialog.page_text.winfo_manager())
+                if shown:
+                    dialog.page_text.pack_forget()
+                else:
+                    dialog.page_text.pack(fill="x", padx=(0, 8), pady=(8, 0))
+                dialog.buttons["text"].configure(text="Ver texto de la página" if shown else "Ocultar texto de la página")
+            dialog.buttons["text"] = button(page, "Ver texto de la página", toggle_text, width=210)
+            dialog.buttons["text"].pack(anchor="w", pady=(14, 0))
 
             def create(kind: str) -> None:
                 row = (preview.suggested_row or {}).copy() if preview.suggested_kind == kind else {}
@@ -4818,69 +7487,103 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                     row.setdefault("fuente", _web_source(preview.url))
                 else:
                     row.setdefault("fuente", source)
-                dialog.destroy()
+                dialog.close()
                 self._accept_external(kind, row)
 
             def import_group_profile() -> None:
-                dialog.destroy()
+                dialog.close()
                 proposed = (preview.suggested_row or {}).copy()
                 if not proposed:
                     return
+                kind = preview.suggested_kind
+                if kind not in ("grupos", "investigadores"):
+                    return
+                title = "Ficha GrupLAC" if kind == "grupos" else "Ficha CvLAC"
                 reviewed = None
-                if self.repo.get("grupos", proposed["id"]) is None:
-                    review = RecordDialog(self.root, "grupos", proposed, external=True, repo=self.repo)
+                if self.repo.get(kind, proposed["id"]) is None:
+                    review = RecordDialog(self.root, kind, proposed, external=True, repo=self.repo)
                     if not review.result:
                         return
                     reviewed = review.result
-                self.status.set("Incorporando ficha GrupLAC...")
+                self.status.set(f"Incorporando {title.lower()}...")
                 self.root.update_idletasks()
                 try:
-                    counts = import_gruplac_preview(self.repo, preview, reviewed)
+                    importer = import_gruplac_preview if kind == "grupos" else import_cvlac_preview
+                    counts = importer(self.repo, preview, reviewed)
                 except (DataError, OSError, ValueError) as exc:
-                    messagebox.showerror("Ficha GrupLAC", str(exc), parent=self.root)
+                    self.alert(title, str(exc), parent=self.root)
                     return
                 self.refresh()
                 self._keep_import(f"Ficha incorporada: {counts['actualizados']} registros actualizados.")
-                summary = "\n".join(f"{label}: {counts[key]}" for key, label in (
-                    ("grupos", "Grupos"), ("investigadores", "Investigadores"),
-                    ("membresias", "Membresías"), ("planes", "Planes"),
-                    ("productos", "Productos"), ("grupos_productos", "Vínculos grupo-producto"),
-                    ("autorias", "Autorías"), ("actualizados", "Actualizados con la fuente"),
-                    ("existentes", "Sin cambios")))
-                if counts["errors"]:
-                    summary += f"\nErrores: {len(counts['errors'])}\n" + "\n".join(counts["errors"][:5])
-                messagebox.showinfo("Ficha GrupLAC", summary, parent=self.root)
+                self.show_import_result(counts, kind, (reviewed or proposed)["id"])
 
             for kind, label in (("grupos", "Crear grupo"), ("investigadores", "Crear investigador"),
                                 ("productos", "Crear producto")):
-                ttk.Button(actions, text=label, command=lambda name=kind: create(name)).pack(side="left", padx=3)
-            if preview.related_members or preview.related_products or preview.related_plan:
-                ttk.Button(actions, text="Importar datos detectados", style="Accent.TButton",
-                           command=import_group_profile).pack(side="left", padx=3)
+                dialog.buttons["create_" + kind] = button(dialog.footer, label, lambda name=kind: create(name), width=120)
+                dialog.buttons["create_" + kind].pack(side="left", padx=(0, 6))
             if preview.csv_bytes is not None:
                 def import_downloaded_csv() -> None:
-                    dialog.destroy()
+                    dialog.close()
                     with tempfile.TemporaryDirectory() as temporary:
                         path = Path(temporary) / "descarga.csv"
                         path.write_bytes(preview.csv_bytes or b"")
                         self.import_csv_path(path)
-                ttk.Button(actions, text="Importar CSV PEA-i", command=import_downloaded_csv).pack(side="left", padx=3)
-            ttk.Button(actions, text="Cerrar", command=dialog.destroy).pack(side="right", padx=3)
-            dialog.bind("<Escape>", lambda _event: dialog.destroy())
-            dialog.grab_set()
+                dialog.buttons["csv"] = button(dialog.footer, "Importar CSV PEA-i", import_downloaded_csv, width=150)
+                dialog.buttons["csv"].pack(side="left", padx=(0, 6))
+            if detected:
+                dialog.buttons["import"] = button(dialog.footer, "Importar datos detectados", import_group_profile,
+                                                  variant="primary", width=200)
+                dialog.buttons["import"].pack(side="right")
+            dialog.buttons["close"] = button(dialog.footer, "Cerrar", dialog.close, width=100)
+            dialog.buttons["close"].pack(side="right", padx=(0, 8) if detected else 0)
+            dialog.present(wait=False)
+            return dialog
+
+        def show_import_result(self, counts: dict[str, Any], kind: str, key: str) -> Dialog:
+            """Resultado de incorporar una ficha; «Ver indicador» abre la ficha del grupo o investigador en su indicador."""
+            title = {"grupos": "Ficha GrupLAC", "investigadores": "Ficha CvLAC"}.get(kind, "Resultado de importación")
+            dialog = Dialog(self.root, title, 560)
+            ctk.CTkLabel(dialog.body, text=title + " incorporada", font=FONTS["h2"], text_color=T["ink"],
+                         anchor="w").pack(fill="x")
+            ctk.CTkLabel(dialog.body, text=self.reference_label(kind, key), font=FONTS["small"], text_color=T["muted"],
+                         anchor="w", justify="left", wraplength=500).pack(fill="x", pady=(2, 10))
+            dialog.table = DataTable(dialog.body, ("registros", "cantidad"), height_rows=9,
+                                     headings={"registros": "Registros", "cantidad": "Cantidad"},
+                                     widths={"registros": 320, "cantidad": 120}, anchors={"cantidad": "e"})
+            dialog.table.pack(fill="both", expand=True)
+            for field, label in (("grupos", "Grupos"), ("investigadores", "Investigadores"), ("membresias", "Membresías"),
+                                 ("planes", "Planes"), ("productos", "Productos"),
+                                 ("grupos_productos", "Vínculos grupo-producto"), ("autorias", "Autorías"),
+                                 ("actualizados", "Actualizados con la fuente"), ("existentes", "Sin cambios")):
+                dialog.table.insert("", "end", iid=field, values=(label, number(counts.get(field, 0))))
+            if counts.get("errors"):
+                ctk.CTkLabel(dialog.body, text=f"Errores: {len(counts['errors'])}\n" + "\n".join(counts["errors"][:5]),
+                             font=FONTS["small"], text_color=T["rejected"], anchor="w", justify="left",
+                             wraplength=500).pack(fill="x", pady=(10, 0))
+
+            def open_indicator() -> None:
+                dialog.close()
+                self.open_detail(kind, key, tab="Indicador")
+            has_indicator = kind in ("grupos", "investigadores") and self.repo.get(kind, key) is not None
+            dialog.indicator_button = button(dialog.footer, "Ver indicador", open_indicator, variant="primary", width=136,
+                                             state="normal" if has_indicator else "disabled")
+            dialog.indicator_button.pack(side="right")
+            button(dialog.footer, "Cerrar", dialog.close, width=112).pack(side="right", padx=(0, 8))
+            dialog.present(wait=False, focus=dialog.indicator_button if has_indicator else None)
+            return dialog
 
         def import_pdf(self) -> None:
             path = filedialog.askopenfilename(parent=self.root, title="PDF de GrupLAC o CvLAC", filetypes=[("PDF", "*.pdf")])
             if not path:
                 return
-            url = simpledialog.askstring("Origen del PDF", "URL original pública de la ficha GrupLAC/CvLAC:", parent=self.root)
+            url = self.ask_text("Origen del PDF", "URL original pública de la ficha GrupLAC/CvLAC:", parent=self.root)
             if not url:
                 return
             try:
                 kind, row = parse_scienti_pdf(Path(path), url.strip())
                 row["fuente"] = f"PDF {Path(path).name}, consultado {date.today().isoformat()}"
             except (DataError, OSError, ValueError) as exc:
-                messagebox.showerror("Importación PDF", str(exc), parent=self.root)
+                self.alert("Importación PDF", str(exc), parent=self.root)
                 return
             self._accept_external(kind, row)
 
@@ -4893,7 +7596,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             try:
                 html = extract_docx_html(path)
             except DataError as exc:
-                messagebox.showerror("Documento Word", str(exc), parent=self.root)
+                self.alert("Documento Word", str(exc), parent=self.root)
                 return
             preview = parse_web_page(html, path.resolve().as_uri(), "HTML")
             self._show_web_preview(preview, source=f"DOCX {path.name}, consultado {date.today().isoformat()}")
@@ -4901,12 +7604,28 @@ def build_gui(root: Any, repository: Repository | CppRepository,
     return App(root, data_file, repository)
 
 
+def _startup_error(root: Any, title: str, text: str) -> None:
+    """Aviso previo a la ventana principal (por ejemplo, un backend C++ indicado que no arranca)."""
+    import customtkinter as ctk
+    window = ctk.CTkToplevel(root)
+    window.title(title)
+    ctk.CTkLabel(window, text=text, wraplength=440, justify="left", anchor="w").pack(fill="x", padx=22, pady=(20, 12))
+    ctk.CTkButton(window, text="Aceptar", width=112, command=window.destroy).pack(anchor="e", padx=22, pady=(0, 18))
+    window.bind("<Escape>", lambda _event: window.destroy())
+    window.wait_visibility()
+    window.grab_set()
+    window.wait_window()
+
+
 def run_gui(data_file: Path | None = None, *, python_backend: bool = False,
             cpp_binary: Path | None = None) -> None:
-    import tkinter as tk
-    from tkinter import messagebox
+    from tkinter import TclError
 
-    root = tk.Tk()
+    if not ensure_customtkinter():
+        raise SystemExit(1)
+    import customtkinter as ctk
+
+    root = ctk.CTk()
     repository: Repository | CppRepository | None = None
     try:
         repository, fallback_reason = open_gui_repository(
@@ -4916,14 +7635,14 @@ def run_gui(data_file: Path | None = None, *, python_backend: bool = False,
             app.status.set(f"Motor Python activo: {fallback_reason}")
         root.mainloop()
     except DataError as exc:
-        messagebox.showerror("Backend C++", str(exc), parent=root)
+        _startup_error(root, "Backend C++", str(exc))
         raise
     finally:
         if isinstance(repository, CppRepository):
             repository.close()
         try:
             root.destroy()
-        except tk.TclError:
+        except TclError:
             pass
 
 

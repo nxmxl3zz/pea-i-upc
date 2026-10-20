@@ -1,10 +1,10 @@
-"""Actualiza el archivo de datos con los grupos de la Universidad Popular del Cesar.
+"""Actualiza los grupos UPC y, opcionalmente, los perfiles CvLAC indicados.
 
 Enumeración obtenida de la búsqueda pública "Ciencia y Tecnología para Todos"
 (busquedaGrupoXInstitucionGrupos.do?codInst=947), Convocatoria 957 de 2024.
 Cada grupo se descarga desde su ficha GrupLAC pública y se fusiona en el archivo
 existente con el mismo motor de importación que usa la interfaz
-(import_gruplac_preview): agrega lo nuevo, actualiza lo que la fuente cambió y no
+(import_gruplac_preview e import_cvlac_preview): agrega lo nuevo, actualiza lo que la fuente cambió y no
 borra nada. El historial se desactiva para que la carga masiva no sea cuadrática.
 """
 
@@ -21,6 +21,7 @@ DataError = pea["DataError"]
 Repository = pea["Repository"]
 fetch_web_page = pea["fetch_web_page"]
 import_gruplac_preview = pea["import_gruplac_preview"]
+import_cvlac_preview = pea["import_cvlac_preview"]
 load_repository = pea["load_repository"]
 save_repository = pea["save_repository"]
 
@@ -98,10 +99,12 @@ GROUPS: list[tuple[str, str]] = [
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Actualizar el archivo de datos con los 66 grupos UPC de GrupLAC")
+    parser = argparse.ArgumentParser(description="Actualizar los 66 grupos UPC de GrupLAC y los perfiles CvLAC indicados")
     parser.add_argument("--data", type=Path, default=ROOT / "data" / "pea_upc.csv",
                         help="Archivo de datos que se actualiza (se crea si no existe)")
     parser.add_argument("--limit", type=int, help="Máximo de grupos a consultar (para pruebas)")
+    parser.add_argument("--cvlac", action="append", default=[], metavar="URL",
+                        help="Ficha CvLAC del investigador que se incorpora después de los grupos; repetible")
     args = parser.parse_args()
     if args.limit is not None and args.limit < 1:
         parser.error("--limit debe ser positivo")
@@ -131,14 +134,34 @@ def main() -> None:
                 print(f"          - {error}")
             failures.append((name, f"{len(counts['errors'])} registros o vínculos rechazados"))
 
-    # Fusionar nunca borra: los grupos que fallaron conservan sus datos anteriores.
+    for index, url in enumerate(args.cvlac, start=1):
+        name = url
+        try:
+            preview = fetch_web_page(url)
+            name = (preview.suggested_row or {}).get("nombre", url)
+            counts = import_cvlac_preview(repo, preview, remember=False)
+        except (DataError, OSError, ValueError) as exc:
+            failures.append((name, str(exc)))
+            print(f"[CvLAC {index}/{len(args.cvlac)}] FALLO  {name}: {exc}")
+            continue
+        for kind in kinds:
+            added[kind] += counts[kind]
+        updated += counts["actualizados"]
+        print(f"[CvLAC {index}/{len(args.cvlac)}] OK     {name}  "
+              f"(nuevos: {sum(counts[kind] for kind in kinds)}, actualizados: {counts['actualizados']})")
+        if counts["errors"]:
+            for error in counts["errors"][:5]:
+                print(f"          - {error}")
+            failures.append((name, f"{len(counts['errors'])} registros o vínculos rechazados"))
+
+    # Fusionar nunca borra: las fuentes que fallaron conservan sus datos anteriores.
     if updated or any(added.values()) or not args.data.exists():
         save_repository(repo, args.data)
     print(f"\nArchivo {args.data}: {updated} registros actualizados; nuevos:")
     for kind in kinds:
         print(f"  {kind}: {added[kind]}")
     if failures:
-        print(f"\n{len(failures)} grupo(s) con importación incompleta (se conservan sus datos anteriores):")
+        print(f"\n{len(failures)} fuente(s) con importación incompleta (se conservan sus datos anteriores):")
         for name, reason in failures:
             print(f"  - {name}: {reason}")
         raise SystemExit(1)

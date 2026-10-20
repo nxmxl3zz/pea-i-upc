@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
@@ -12,6 +13,7 @@
 #include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <locale>
 #include <map>
 #include <memory>
 #include <optional>
@@ -50,11 +52,17 @@ const std::array<std::string, 7> ALL_KINDS = {
 };
 constexpr std::size_t MAX_FIELD_LENGTH = 100000;
 constexpr std::size_t MAX_CSV_ROWS = 500000;
+const std::vector<std::string> PRODUCT_FIELDS_V4 = {
+    "id", "titulo", "anio", "fecha", "familia", "tipologia",
+    "validacion", "observacion", "doi", "url", "fuente", "activo"
+};
+const std::vector<std::string> QUEUE_FIELDS = {"id", "producto_id", "motivo", "creado"};
 const std::map<std::string, std::vector<std::string>> FIELDS = {
     {"grupos", {"id", "nombre", "codigo_gruplac", "fecha_creacion", "unidad", "responsable",
                 "categoria", "descripcion", "objetivos", "mision", "vision", "lineas", "url", "fuente", "activo"}},
     {"investigadores", {"id", "nombre", "codigo_cvlac", "afiliacion", "categoria", "contacto", "url", "fuente", "activo"}},
     {"productos", {"id", "titulo", "anio", "fecha", "familia", "tipologia",
+                   "categoria", "categoria_origen",
                    "validacion", "observacion", "doi", "url", "fuente", "activo"}},
     {"planes", {"id", "grupo_id", "nombre", "inicio", "fin", "objetivo", "indicador", "meta", "actividad", "activo"}},
     {"membresias", {"grupo_id", "investigador_id", "rol", "inicio", "fin", "activo"}},
@@ -83,20 +91,218 @@ const std::map<std::string, std::string> LABELS = {
     {"grupo_id", "Grupo ID"}, {"investigador_id", "Investigador ID"},
     {"producto_id", "Producto ID"}, {"inicio", "Inicio"}, {"fin", "Fin"},
     {"objetivo", "Objetivo"}, {"indicador", "Indicador"}, {"meta", "Meta"},
-    {"actividad", "Actividad"}, {"rol", "Rol"}, {"orden", "Orden"}, {"origen", "Origen"}
+    {"actividad", "Actividad"}, {"rol", "Rol"}, {"orden", "Orden"}, {"origen", "Origen"},
+    {"categoria_origen", "Origen de categoria"}
 };
-// Version 4: un solo archivo con todas las tablas. Las versiones 1 a 3 eran carpetas
-// con un CSV por tabla; se pueden abrir y se guardan como archivo unico.
-const std::string SCHEMA_VERSION = "4";
+// Version 5: categorias del modelo 2024 y su origen. Se leen archivos v4 y v5
+// y carpetas v1 a v3; siempre se guarda un archivo unico v5.
+const std::string SCHEMA_VERSION = "5";
 const std::string LAST_FOLDER_VERSION = "3";
 // Validacion automatica de productos. Codigos y orden compartidos con Python.
-const std::array<std::string, 6> RULE_CODES = {"anio", "tipologia", "autor", "grupo", "doi", "fuente"};
+// Un autor o un grupo activos bastan: GrupLAC publica eventos y proyectos sin autores.
+const std::array<std::string, 5> RULE_CODES = {"anio", "tipologia", "vinculo", "doi", "fuente"};
+// "autor" y "grupo" son codigos anteriores que pueden seguir en motivos de cola guardados.
 const std::map<std::string, std::string> RULE_LABELS = {
     {"anio", "Sin anio de publicacion"}, {"tipologia", "Sin tipologia"},
+    {"vinculo", "Sin autor ni grupo activos"},
     {"autor", "Sin autor activo registrado"}, {"grupo", "Sin grupo activo asociado"},
     {"doi", "DOI con formato invalido"}, {"fuente", "Sin fuente verificable (URL o DOI)"}
 };
 const std::string AUTO_REASON_PREFIX = "reglas:";
+
+struct Subtype {
+    std::string codigo, clase, familia, descripcion;
+    int ventana;
+    double pesoAlta, pesoRelativo;
+    double pesoGlobal() const { return pesoAlta * pesoRelativo; }
+};
+const std::array<std::string, 7> MODEL_CLASSES = {"TOP", "A", "B", "ASC", "DPC", "FRH_A", "FRH_B"};
+const std::map<std::string, double> MODEL_COEFFICIENTS = {
+    {"TOP", 3.7}, {"A", 2.3}, {"B", 0.4}, {"ASC", 1.5}, {"DPC", 0.5},
+    {"FRH_A", 1.0}, {"FRH_B", 0.2}, {"COHE", 0.1}, {"COOP", 0.3}
+};
+// Minciencias, Anexo 1 de la convocatoria 2024, secciones 2.2.9, 3.3, 3.6 y 3.7.
+// Datos de referencia constantes, en el mismo orden que el catalogo Python.
+const std::vector<Subtype>& model2024() {
+    static const std::vector<Subtype> catalog = {
+        {"ART_OPEN_A1", "TOP", "ART_R", "Artículo de investigación A1 acceso abierto", 7, 100.0, 10.0},
+        {"ART_A1", "TOP", "ART_R", "Artículo de investigación A1", 7, 100.0, 9.5},
+        {"ART_OPEN_A2", "TOP", "ART_R", "Artículo de investigación A2 acceso abierto", 7, 100.0, 6.0},
+        {"ART_A2", "TOP", "ART_R", "Artículo de investigación A2", 7, 100.0, 5.5},
+        {"ART_OPEN_B", "A", "ART_R", "Artículo de investigación B acceso abierto", 7, 100.0, 3.5},
+        {"ART_B", "A", "ART_R", "Artículo de investigación B", 7, 100.0, 3.0},
+        {"ART_OPEN_C", "A", "ART_R", "Artículo de investigación C acceso abierto", 7, 100.0, 2.0},
+        {"ART_C", "A", "ART_R", "Artículo de investigación C", 7, 100.0, 1.5},
+        {"ART_OPEN_D", "B", "ART_D", "Artículo de investigación D acceso abierto", 5, 5.0, 10.0},
+        {"ART_D", "B", "ART_D", "Artículo de investigación D", 5, 5.0, 9.0},
+        {"N_A1", "B", "N", "Nota científica A1", 5, 4.0, 10.0},
+        {"N_A2", "B", "N", "Nota científica A2", 5, 4.0, 8.5},
+        {"N_B", "B", "N", "Nota científica B", 5, 4.0, 7.0},
+        {"N_C", "B", "N", "Nota científica C", 5, 4.0, 5.5},
+        {"N_D", "B", "N", "Nota científica D", 5, 4.0, 2.0},
+        {"LIB_A1", "TOP", "LIB", "Libro resultado de investigación A1", 7, 300.0, 10.0},
+        {"LIB_A", "TOP", "LIB", "Libro resultado de investigación A", 7, 300.0, 9.0},
+        {"LIB_B", "A", "LIB", "Libro resultado de investigación B", 7, 300.0, 8.0},
+        {"LIB_C", "B", "LIB_C", "Libro resultado de investigación C", 7, 15.0, 10.0},
+        {"CAP_LIB_A1", "TOP", "CAP_LIB", "Capítulo en libro resultado de investigación A1", 5, 60.0, 10.0},
+        {"CAP_LIB_A", "TOP", "CAP_LIB", "Capítulo en libro resultado de investigación A", 5, 60.0, 9.0},
+        {"CAP_LIB_B", "A", "CAP_LIB", "Capítulo en libro resultado de investigación B", 5, 60.0, 8.0},
+        {"CAP_LIB_C", "B", "CAP_LIB_C", "Capítulo en libro resultado de investigación C", 5, 3.0, 10.0},
+        {"LIB_FOR1", "B", "LIB_FOR", "Libro de formación Q1", 5, 60.0, 10.0},
+        {"PA1", "TOP", "PAT", "Patente de invención A1", 10, 500.0, 10.0},
+        {"PA2", "TOP", "PAT", "Patente de invención A2", 10, 500.0, 7.0},
+        {"PA3", "A", "PAT", "Patente de invención A3", 10, 500.0, 6.0},
+        {"PA4", "A", "PAT", "Patente de invención A4", 10, 500.0, 5.5},
+        {"PB1", "B", "PAT", "Patente de invención B1", 10, 500.0, 5.0},
+        {"PB2", "B", "PAT", "Patente de invención B2", 10, 500.0, 3.5},
+        {"PB3", "B", "PAT", "Patente de invención B3", 10, 500.0, 3.0},
+        {"PB4", "B", "PAT", "Patente de invención B4", 10, 500.0, 2.6},
+        {"PB5", "B", "PAT", "Patente de invención B5", 10, 500.0, 2.5},
+        {"PC", "B", "PAT", "Patente de invención C", 10, 500.0, 1.8},
+        {"MA1", "TOP", "MOD", "Patente de modelo de utilidad A1", 10, 500.0, 6.0},
+        {"MA2", "TOP", "MOD", "Patente de modelo de utilidad A2", 10, 500.0, 4.2},
+        {"MA3", "A", "MOD", "Patente de modelo de utilidad A3", 10, 500.0, 3.6},
+        {"MA4", "A", "MOD", "Patente de modelo de utilidad A4", 10, 500.0, 3.33},
+        {"MB1", "B", "MOD", "Patente de modelo de utilidad B1", 10, 500.0, 3.0},
+        {"MB2", "B", "MOD", "Patente de modelo de utilidad B2", 10, 500.0, 2.1},
+        {"MB3", "B", "MOD", "Patente de modelo de utilidad B3", 10, 500.0, 1.8},
+        {"MB4", "B", "MOD", "Patente de modelo de utilidad B4", 10, 500.0, 1.7},
+        {"MB5", "B", "MOD", "Patente de modelo de utilidad B5", 10, 500.0, 1.5},
+        {"MC", "B", "MOD", "Patente de modelo de utilidad C", 10, 500.0, 1.1},
+        {"VV_A1", "TOP", "VV", "Variedad vegetal A1", 10, 300.0, 10.0},
+        {"VV_A2", "TOP", "VV", "Variedad vegetal A2", 10, 300.0, 8.0},
+        {"VV_A3", "A", "VV", "Variedad vegetal A3", 10, 300.0, 5.0},
+        {"VV_A4", "A", "VV", "Variedad vegetal A4", 10, 300.0, 2.5},
+        {"VV_B1", "B", "VV", "Variedad vegetal B1", 10, 300.0, 5.0},
+        {"VV_B2", "B", "VV", "Variedad vegetal B2", 10, 300.0, 4.0},
+        {"VV_B3", "B", "VV", "Variedad vegetal B3", 10, 300.0, 2.5},
+        {"VV_B4", "B", "VV", "Variedad vegetal B4", 10, 300.0, 1.0},
+        {"VA_A", "TOP", "VA", "Nueva raza animal o población mejorada A", 10, 300.0, 10.0},
+        {"VA_B", "A", "VA", "Nueva raza animal o población mejorada B", 10, 300.0, 5.0},
+        {"AAD_A1", "TOP", "AAD", "Obra o producto de creación (AAD) A1", 10, 100.0, 10.0},
+        {"AAD_A", "TOP", "AAD", "Obra o producto de creación (AAD) A", 10, 100.0, 8.0},
+        {"AAD_B", "A", "AAD", "Obra o producto de creación (AAD) B", 10, 100.0, 6.0},
+        {"AAD_C", "B", "AAD", "Obra o producto de creación (AAD) C", 10, 100.0, 4.0},
+        {"DI_A", "A", "DI", "Diseño industrial A", 5, 35.0, 10.0},
+        {"DI_B", "B", "DI", "Diseño industrial B", 5, 35.0, 5.0},
+        {"ECI", "A", "ECI", "Esquema de circuito integrado", 5, 35.0, 4.0},
+        {"SF", "B", "SF", "Software", 5, 35.0, 8.0},
+        {"PP", "A", "PP", "Planta piloto", 5, 35.0, 4.0},
+        {"PI", "A", "PI", "Prototipo industrial", 5, 35.0, 4.0},
+        {"SD", "A", "SD", "Signo distintivo", 5, 35.0, 4.0},
+        {"PN", "B", "PN", "Producto nutracéutico", 5, 35.0, 6.0},
+        {"CC", "B", "CC", "Colección científica", 5, 35.0, 10.0},
+        {"NRC_A", "B", "NRC", "Nuevo registro científico A", 5, 35.0, 8.0},
+        {"NRC_B", "B", "NRC", "Nuevo registro científico B", 5, 35.0, 5.0},
+        {"SE", "A", "SE", "Secreto empresarial", 5, 100.0, 5.0},
+        {"EBT_A", "A", "EBT", "Empresa de base tecnológica A", 5, 100.0, 10.0},
+        {"EBT_B", "B", "EBT", "Empresa de base tecnológica B", 5, 100.0, 8.0},
+        {"ICC_A", "A", "ICC", "Empresa creativa y cultural A", 5, 100.0, 10.0},
+        {"ICC_B", "B", "ICC", "Empresa creativa y cultural B", 5, 100.0, 4.0},
+        {"IG_A1", "A", "IG", "Innovación en gestión empresarial A1", 5, 100.0, 10.0},
+        {"IG_A2", "A", "IG", "Innovación en gestión empresarial A2", 5, 100.0, 6.0},
+        {"IG_B1", "B", "IG", "Innovación en gestión empresarial B1", 5, 100.0, 5.0},
+        {"IG_B2", "B", "IG", "Innovación en gestión empresarial B2", 5, 100.0, 3.0},
+        {"IPP", "B", "IPP", "Innovación en procedimientos y servicios", 5, 100.0, 5.0},
+        {"RNL_A", "TOP", "RNL", "Regulación, norma, reglamento o legislación A", 5, 100.0, 10.0},
+        {"RNL_B", "A", "RNL", "Regulación, norma, reglamento o legislación B", 5, 100.0, 8.0},
+        {"RNR", "A", "RNR", "Normatividad del espectro radioeléctrico", 5, 100.0, 8.0},
+        {"RNT", "B", "RNT", "Norma técnica", 5, 100.0, 7.0},
+        {"RNPC", "B", "RNPC", "Guía de práctica clínica", 5, 100.0, 7.0},
+        {"GMCF", "B", "GMCF", "Guía de manejo clínico forense", 5, 100.0, 7.0},
+        {"MADV", "B", "MADV", "Manual o modelo de atención diferencial a víctimas", 5, 100.0, 7.0},
+        {"PAU", "B", "PAU", "Protocolo de atención a usuarios/víctimas", 5, 100.0, 7.0},
+        {"PVE", "B", "PVE", "Protocolo de vigilancia epidemiológica", 5, 100.0, 7.0},
+        {"AL", "B", "AL", "Acuerdo de ley", 5, 100.0, 8.0},
+        {"RNPL", "B", "RNPL", "Proyecto de ley", 5, 100.0, 6.0},
+        {"CT", "B", "CT", "Concepto técnico", 5, 15.0, 10.0},
+        {"MR", "B", "MR", "Registro de acuerdo de licencia (AAD)", 5, 14.0, 10.0},
+        {"FIS", "ASC", "FIS", "Proceso ASC para asuntos de interés social", 5, 200.0, 10.0},
+        {"GPP_A", "ASC", "GPP", "Proceso ASC para insumos de política pública A", 5, 200.0, 10.0},
+        {"GPP_B", "ASC", "GPP", "Proceso ASC para insumos de política pública B", 5, 200.0, 7.0},
+        {"GPP_C", "ASC", "GPP", "Proceso ASC para insumos de política pública C", 5, 200.0, 5.0},
+        {"FCP_A", "ASC", "FCP", "Proceso ASC para cadenas productivas A", 5, 200.0, 10.0},
+        {"FCP_B", "ASC", "FCP", "Proceso ASC para cadenas productivas B", 5, 200.0, 5.0},
+        {"FCP_C", "ASC", "FCP", "Proceso ASC para cadenas productivas C", 5, 200.0, 3.0},
+        {"TCCG_A", "ASC", "TCCG", "Proceso ASC Centro de Ciencia y grupo A", 5, 200.0, 10.0},
+        {"TCCG_B", "ASC", "TCCG", "Proceso ASC Centro de Ciencia y grupo B", 5, 200.0, 7.0},
+        {"TCCG_C", "ASC", "TCCG", "Proceso ASC Centro de Ciencia y grupo C", 5, 200.0, 4.0},
+        {"TCCG_D", "ASC", "TCCG", "Proceso ASC Centro de Ciencia y grupo D", 5, 200.0, 1.0},
+        {"EC_A", "DPC", "EC", "Evento científico con componente de apropiación A", 5, 100.0, 10.0},
+        {"EC_B", "DPC", "EC", "Evento científico con componente de apropiación B", 5, 100.0, 6.0},
+        {"RC_A", "DPC", "RC", "Participación en red de conocimiento A", 5, 100.0, 10.0},
+        {"RC_B", "DPC", "RC", "Participación en red de conocimiento B", 5, 100.0, 6.0},
+        {"TC_A", "DPC", "TC", "Taller de creación A", 5, 100.0, 10.0},
+        {"TC_B", "DPC", "TC", "Taller de creación B", 5, 100.0, 8.0},
+        {"TC_C", "DPC", "TC", "Taller de creación C", 5, 100.0, 6.0},
+        {"ECA_A", "DPC", "ECA", "Evento artístico, de arquitectura o diseño A", 5, 100.0, 8.0},
+        {"ECA_B", "DPC", "ECA", "Evento artístico, de arquitectura o diseño B", 5, 100.0, 6.0},
+        {"WP", "DPC", "WP", "Documento de trabajo (working paper)", 5, 100.0, 10.0},
+        {"NSG", "DPC", "NSG", "Nueva secuencia genética", 5, 100.0, 10.0},
+        {"ERL", "DPC", "ERL", "Edición de revista o libro de divulgación", 5, 100.0, 6.0},
+        {"IFI", "DPC", "IFI", "Informe final de investigación", 5, 100.0, 2.0},
+        {"INF", "DPC", "INF", "Informe técnico", 5, 100.0, 5.0},
+        {"CON_CT", "DPC", "CON_CT", "Consultoría científico-tecnológica", 5, 100.0, 7.5},
+        {"CON_AAD", "DPC", "CON_AAD", "Consultoría en arte, arquitectura y diseño", 5, 100.0, 7.5},
+        {"PEE_A1", "DPC", "PEE", "Publicación editorial no especializada A1", 5, 100.0, 10.0},
+        {"PEE_A2", "DPC", "PEE", "Publicación editorial no especializada A2", 5, 100.0, 8.0},
+        {"PEE_B1", "DPC", "PEE", "Publicación editorial no especializada B1", 5, 100.0, 7.0},
+        {"PEE_B2", "DPC", "PEE", "Publicación editorial no especializada B2", 5, 100.0, 5.0},
+        {"PEE_C1", "DPC", "PEE", "Publicación editorial no especializada C1", 5, 100.0, 5.0},
+        {"PEE_C2", "DPC", "PEE", "Publicación editorial no especializada C2", 5, 100.0, 3.0},
+        {"PCD_A1", "DPC", "PCD", "Producción de contenido digital A1", 5, 100.0, 10.0},
+        {"PCD_A2", "DPC", "PCD", "Producción de contenido digital A2", 5, 100.0, 8.0},
+        {"PCD_B1", "DPC", "PCD", "Producción de contenido digital B1", 5, 100.0, 7.0},
+        {"PCD_B2", "DPC", "PCD", "Producción de contenido digital B2", 5, 100.0, 5.0},
+        {"PCD_C1", "DPC", "PCD", "Producción de contenido digital C1", 5, 100.0, 5.0},
+        {"PCD_C2", "DPC", "PCD", "Producción de contenido digital C2", 5, 100.0, 3.0},
+        {"TRM_A1", "DPC", "TRM", "Estrategia y contenido transmedia A1", 5, 100.0, 10.0},
+        {"TRM_A2", "DPC", "TRM", "Estrategia y contenido transmedia A2", 5, 100.0, 8.0},
+        {"TRM_B1", "DPC", "TRM", "Estrategia y contenido transmedia B1", 5, 100.0, 7.0},
+        {"TRM_B2", "DPC", "TRM", "Estrategia y contenido transmedia B2", 5, 100.0, 5.0},
+        {"TRM_C1", "DPC", "TRM", "Estrategia y contenido transmedia C1", 5, 100.0, 5.0},
+        {"TRM_C2", "DPC", "TRM", "Estrategia y contenido transmedia C2", 5, 100.0, 3.0},
+        {"DW_A1", "DPC", "DW", "Desarrollo web A1", 5, 100.0, 10.0},
+        {"DW_A2", "DPC", "DW", "Desarrollo web A2", 5, 100.0, 8.0},
+        {"DW_B1", "DPC", "DW", "Desarrollo web B1", 5, 100.0, 7.0},
+        {"DW_B2", "DPC", "DW", "Desarrollo web B2", 5, 100.0, 5.0},
+        {"DW_C1", "DPC", "DW", "Desarrollo web C1", 5, 100.0, 5.0},
+        {"DW_C2", "DPC", "DW", "Desarrollo web C2", 5, 100.0, 3.0},
+        {"LIB_FOR2", "DPC", "LIB_FOR_DPC", "Libro de formación Q2", 5, 100.0, 10.0},
+        {"LIB_FOR3", "DPC", "LIB_FOR_DPC", "Libro de formación Q3", 5, 100.0, 10.0},
+        {"BOL", "DPC", "BOL", "Boletín divulgativo de resultado de investigación", 5, 100.0, 3.0},
+        {"LIB_DIV", "DPC", "LIB_DIV", "Libro de divulgación o compilación de divulgación", 5, 100.0, 10.0},
+        {"GC", "DPC", "GC", "Generación de contenidos", 5, 100.0, 4.0},
+        {"MAN_GUI", "DPC", "MAN_GUI", "Manual o guía especializada", 5, 100.0, 2.0},
+        {"TD_A", "FRH_A", "TD", "Dirección de tesis de doctorado A", 5, 160.0, 10.0},
+        {"TD_B", "FRH_A", "TD", "Dirección de tesis de doctorado B", 5, 160.0, 5.0},
+        {"TM_A", "FRH_B", "TM", "Dirección de trabajo de grado de maestría A", 5, 70.0, 10.0},
+        {"TM_B", "FRH_B", "TM", "Dirección de trabajo de grado de maestría B", 5, 70.0, 5.0},
+        {"TP_A", "FRH_B", "TP", "Dirección de trabajo de pregrado A", 5, 20.0, 10.0},
+        {"TP_B", "FRH_B", "TP", "Dirección de trabajo de pregrado B", 5, 20.0, 5.0},
+        {"PID_A", "FRH_B", "PID", "Proyecto de investigación y desarrollo A", 5, 50.0, 10.0},
+        {"PID_B", "FRH_B", "PID", "Proyecto de investigación y desarrollo B", 5, 50.0, 6.0},
+        {"PID_C", "FRH_B", "PID", "Proyecto de investigación y desarrollo C", 5, 50.0, 2.0},
+        {"PIC_A", "FRH_B", "PIC", "Proyecto de investigación-creación A", 5, 50.0, 10.0},
+        {"PIC_B", "FRH_B", "PIC", "Proyecto de investigación-creación B", 5, 50.0, 6.0},
+        {"PIC_C", "FRH_B", "PIC", "Proyecto de investigación-creación C", 5, 50.0, 2.0},
+        {"PF_A", "FRH_B", "PF", "Proyecto ID+I con formación A", 5, 50.0, 10.0},
+        {"PF_B", "FRH_B", "PF", "Proyecto ID+I con formación B", 5, 50.0, 8.0},
+        {"PE", "FRH_B", "PE", "Proyecto de extensión y responsabilidad social en CTeI", 5, 100.0, 10.0},
+        {"AP_A", "FRH_A", "AP_PROG", "Apoyo a creación de programa doctorado", 5, 100.0, 10.0},
+        {"AP_B", "FRH_B", "AP_PROG", "Apoyo a creación de programa maestría", 5, 100.0, 8.0},
+        {"AP_C", "FRH_A", "AP_CUR", "Apoyo a creación de cursos doctorado", 5, 100.0, 5.0},
+        {"AP_D", "FRH_B", "AP_CUR", "Apoyo a creación de cursos maestría", 5, 100.0, 3.0},
+        {"APO", "FRH_B", "APO", "Acompañamiento y asesoría Programa Ondas", 5, 30.0, 10.0},
+    };
+    return catalog;
+}
+const Subtype* findSubtype(const std::string& code) {
+    const auto& catalog = model2024();
+    const auto found = std::find_if(catalog.begin(), catalog.end(),
+                                    [&](const Subtype& subtype) { return subtype.codigo == code; });
+    return found == catalog.end() ? nullptr : &*found;
+}
 
 const std::string& field(const Row& row, const std::string& key) {
     static const std::string empty;
@@ -248,6 +454,13 @@ Row cleanRow(const std::string& kind, const Row& input) {
             catch (const std::exception&) { throw DataError("Anio invalido"); }
             if (year < 1900 || year > currentYear() + 1) throw DataError("Anio fuera de rango");
         }
+        if (!row["categoria"].empty() && !findSubtype(row["categoria"]))
+            throw DataError("Categoria desconocida: " + row["categoria"]);
+        if (!row["categoria_origen"].empty() && row["categoria_origen"] != "estimada" &&
+            row["categoria_origen"] != "manual")
+            throw DataError("Origen de categoria: estimada o manual");
+        if (row["categoria"].empty()) row["categoria_origen"].clear();
+        else if (row["categoria_origen"].empty()) row["categoria_origen"] = "manual";
         // El repositorio recalcula este campo; "pendiente" procede de carpetas anteriores.
         if (row["validacion"].empty()) row["validacion"] = "rechazado";
         if (row["validacion"] != "pendiente" && row["validacion"] != "validado" && row["validacion"] != "rechazado")
@@ -277,13 +490,13 @@ Row cleanRow(const std::string& kind, const Row& input) {
     return row;
 }
 
-// Adapta filas de las versiones 1 y 2 (y del historial guardado con ellas).
+// Adapta filas antiguas, tambien del historial, sin alterar las categorias v5.
 Row legacyRow(const std::string& kind, Row row) {
     if (kind == "grupos") row.erase("sigla");
     if (kind == "productos") {
         if (!row.count("validacion")) row["validacion"] = "pendiente";
         auto category = row.find("categoria");
-        if (category != row.end()) {
+        if (!row.count("categoria_origen") && category != row.end()) {
             const std::string value = trim(category->second);
             row.erase(category);
             if (!value.empty())
@@ -1022,8 +1235,28 @@ struct Statistics {
     std::size_t total = 0;
     std::map<std::string, int> byYear;
     std::map<std::string, int> byType;
+    std::map<std::string, int> byCategory;
     std::map<std::string, int> byValidation;
     std::map<std::string, int> byRule;
+};
+struct IndicatorTerm {
+    std::string name;
+    double coefficient = 0, value = 0, maximum = 0, index = 0, contribution = 0;
+};
+struct SubtypeCount {
+    std::string code, clase;
+    int count = 0, period = 0;
+    double lambda = 0, globalWeight = 0, value = 0;
+};
+struct Indicator {
+    std::string kind, id, status;
+    int cutoff = 0;
+    std::optional<int> start;
+    std::size_t population = 0, products = 0, uncategorized = 0, estimated = 0;
+    std::vector<IndicatorTerm> classes;
+    IndicatorTerm cohesion, cooperation;
+    std::vector<SubtypeCount> subtypes;
+    double total = 0;
 };
 struct ImportResult {
     std::size_t total = 0;
@@ -1059,8 +1292,7 @@ class Repository {
             const Row* owner = get("grupos", field(link, "grupo_id"));
             if (field(link, "activo") == "1" && owner && field(*owner, "activo") == "1") group = true;
         });
-        if (!author) failed.push_back("autor");
-        if (!group) failed.push_back("grupo");
+        if (!author && !group) failed.push_back("vinculo");
         const std::string doi = normalizedExternal("productos", field(product, "doi"));
         if (!doi.empty() && !validDoi(doi)) failed.push_back("doi");
         if (!verifiableUrl(field(product, "url")) && !(!doi.empty() && validDoi(doi)))
@@ -1347,6 +1579,11 @@ public:
         if (!current) throw DataError("Registro no encontrado");
         Row merged = *current;
         for (const auto& item : changes) merged[item.first] = item.second;
+        if (kind == "productos" && changes.count("categoria") && !changes.count("categoria_origen")) {
+            const std::string category = trim(field(changes, "categoria"));
+            if (category != field(*current, "categoria"))
+                merged["categoria_origen"] = category.empty() ? "" : "manual";
+        }
         Row updated = cleanRow(kind, merged);
         if (entityIndex(kind) >= 0) {
             if (field(updated, "id") != field(*current, "id"))
@@ -1422,7 +1659,7 @@ public:
             output.push_back(']');
         };
         for (const auto& kind : ALL_KINDS) addRows(kind, rows(kind), FIELDS.at(kind));
-        addRows("cola_validacion", queue_.rows(), {"id", "producto_id", "motivo", "creado"});
+        addRows("cola_validacion", queue_.rows(), QUEUE_FIELDS);
         output.push_back('}');
         return output;
     }
@@ -1609,6 +1846,7 @@ public:
             };
             count(result.byYear, "anio");
             count(result.byType, "tipologia");
+            count(result.byCategory, "categoria");
             count(result.byValidation, "validacion");
             const auto found = issues_.find(field(product, "id"));
             if (found != issues_.end())
@@ -1616,10 +1854,143 @@ public:
         });
         return result;
     }
+private:
+    using GroupsOf = std::map<std::string, std::set<std::string>>;
+    struct IndicatorRaw {
+        std::map<std::string, double> values;
+        std::size_t products = 0, uncategorized = 0, estimated = 0;
+        std::vector<SubtypeCount> subtypes;
+    };
+    IndicatorRaw indicatorRaw(const std::string& kind, const std::string& key, int cutoff,
+                              std::optional<int> start, const std::string& status,
+                              const GroupsOf& groupsOf) const {
+        IndicatorRaw result;
+        for (const auto& item : MODEL_COEFFICIENTS) result.values[item.first] = 0.0;
+        std::optional<int> periodCap;
+        if (start) periodCap = cutoff - *start + 1;
+        if (kind == "grupos") {
+            const std::string created = field(*get(kind, key), "fecha_creacion");
+            if (!created.empty()) {
+                const int age = cutoff - std::stoi(created.substr(0, 4)) + 1;
+                periodCap = periodCap ? std::min(*periodCap, age) : age;
+            }
+        }
+        if (periodCap && *periodCap < 1) return result;
+        const int uncategorizedStart = start ? std::max(cutoff - 9, *start) : cutoff - 9;
+        const std::set<std::string> emptyGroups;
+        auto groupsFor = [&](const std::string& id) -> const std::set<std::string>& {
+            const auto found = groupsOf.find(id);
+            return found == groupsOf.end() ? emptyGroups : found->second;
+        };
+        const auto& researcherGroups = groupsFor(key);
+        std::map<std::string, int> counts;
+        std::size_t newKnowledge = 0, authors = 0, groupLinks = 0;
+        forEachRelated(kind == "grupos" ? "grupos_productos" : "autorias", key, kind == "grupos",
+                       [&](const Row& link) {
+            if (field(link, "activo") != "1") return;
+            const Row* product = get("productos", field(link, "producto_id"));
+            if (!product || field(*product, "activo") != "1" || field(*product, "anio").empty()) return;
+            if (!status.empty() && field(*product, "validacion") != status) return;
+            const int year = std::stoi(field(*product, "anio"));
+            const std::string code = field(*product, "categoria");
+            if (code.empty()) {
+                if (uncategorizedStart <= year && year <= cutoff) ++result.uncategorized;
+                return;
+            }
+            const Subtype* subtype = findSubtype(code);
+            if (!subtype) return;
+            const int period = periodCap ? std::min(subtype->ventana, *periodCap) : subtype->ventana;
+            if (year < cutoff - period + 1 || year > cutoff) return;
+            ++counts[code];
+            ++result.products;
+            if (field(*product, "categoria_origen") == "estimada") ++result.estimated;
+            if (subtype->clase != "TOP" && subtype->clase != "A" && subtype->clase != "B") return;
+            ++newKnowledge;
+            std::set<std::string> productGroups;
+            if (kind == "grupos") productGroups.insert(key);
+            forEachRelated("autorias", field(*product, "id"), true, [&](const Row& authorship) {
+                if (field(authorship, "activo") != "1") return;
+                const std::string researcherId = field(authorship, "investigador_id");
+                const Row* researcher = get("investigadores", researcherId);
+                if (!researcher || field(*researcher, "activo") != "1") return;
+                const auto& authorGroups = groupsFor(researcherId);
+                bool belongs = kind == "grupos" ? authorGroups.count(key) != 0 : researcherId == key;
+                if (kind == "investigadores" && !belongs)
+                    for (const auto& group : authorGroups)
+                        if (researcherGroups.count(group)) { belongs = true; break; }
+                if (belongs) ++authors;
+                productGroups.insert(authorGroups.begin(), authorGroups.end());
+            });
+            groupLinks += productGroups.size();
+        });
+        for (const auto& subtype : model2024()) {
+            const auto found = counts.find(subtype.codigo);
+            if (found == counts.end()) continue;
+            const int period = periodCap ? std::min(subtype.ventana, *periodCap) : subtype.ventana;
+            const double frequency = std::log(static_cast<double>(found->second) / period + 1.0);
+            const double value = frequency * subtype.pesoGlobal();
+            result.values[subtype.clase] += value;
+            result.subtypes.push_back({subtype.codigo, subtype.clase, found->second, period,
+                                       frequency, subtype.pesoGlobal(), value});
+        }
+        if (newKnowledge) {
+            result.values["COHE"] = std::max(0.0, static_cast<double>(authors) / static_cast<double>(newKnowledge) - 1.0);
+            result.values["COOP"] = std::max(0.0, static_cast<double>(groupLinks) / static_cast<double>(newKnowledge) - 1.0);
+        }
+        return result;
+    }
+public:
+    Indicator indicator(const std::string& kind, const std::string& key,
+                        std::optional<int> start = {}, std::optional<int> end = {},
+                        const std::string& status = "") const {
+        if (kind != "grupos" && kind != "investigadores")
+            throw DataError("Tipo de indicador: grupos o investigadores");
+        if (start && end && *start > *end) throw DataError("El anio inicial supera al final");
+        if (!status.empty() && status != "validado" && status != "rechazado")
+            throw DataError("Validacion: validado o rechazado");
+        const Row* entity = get(kind, key);
+        if (!entity) throw DataError("Registro no encontrado");
+        if (field(*entity, "activo") != "1") throw DataError("Registro inactivo");
+        const int cutoff = end.value_or(currentYear());
+        GroupsOf groupsOf;
+        forEachRow("membresias", [&](const Row& membership) {
+            if (field(membership, "activo") != "1") return;
+            const Row* group = get("grupos", field(membership, "grupo_id"));
+            const Row* researcher = get("investigadores", field(membership, "investigador_id"));
+            if (group && researcher && field(*group, "activo") == "1" && field(*researcher, "activo") == "1")
+                groupsOf[field(membership, "investigador_id")].insert(field(membership, "grupo_id"));
+        });
+        const IndicatorRaw raw = indicatorRaw(kind, key, cutoff, start, status, groupsOf);
+        auto maxima = raw.values;
+        Indicator result;
+        result.kind = kind; result.id = key; result.status = status;
+        result.cutoff = cutoff; result.start = start; result.population = 1;
+        forEachRow(kind, [&](const Row& other) {
+            if (field(other, "activo") != "1" || field(other, "id") == key) return;
+            ++result.population;
+            const auto values = indicatorRaw(kind, field(other, "id"), cutoff, start, status, groupsOf).values;
+            for (auto& item : maxima) item.second = std::max(item.second, values.at(item.first));
+        });
+        auto term = [&](const std::string& name) {
+            const double value = raw.values.at(name), maximum = maxima.at(name);
+            const double index = maximum ? value / maximum : 0.0;
+            const double coefficient = MODEL_COEFFICIENTS.at(name);
+            return IndicatorTerm{name, coefficient, value, maximum, index, coefficient * index};
+        };
+        for (const auto& name : MODEL_CLASSES) {
+            result.classes.push_back(term(name));
+            result.total += result.classes.back().contribution;
+        }
+        result.cohesion = term("COHE"); result.cooperation = term("COOP");
+        result.total += result.cohesion.contribution;
+        result.total += result.cooperation.contribution;
+        result.products = raw.products; result.uncategorized = raw.uncategorized; result.estimated = raw.estimated;
+        result.subtypes = raw.subtypes;
+        return result;
+    }
 };
 
 const std::vector<std::string> MANIFEST_FIELDS = {"version", "guardado"};
-const std::vector<std::string> QUEUE_FIELDS = {"id", "producto_id", "motivo", "creado"};
 const std::vector<std::string> HISTORY_FIELDS = {"orden", "snapshot"};
 // Secciones del archivo unico en orden de lectura: cada relacion aparece despues de las
 // entidades que enlaza, asi que puede crearse en cuanto se lee.
@@ -1644,16 +2015,15 @@ fs::path backupOf(const fs::path& path) {
 }
 // Compara el conjunto de encabezados (sin importar el orden) para detectar formatos anteriores.
 bool headerMatches(const fs::path& path, const std::vector<std::string>& fields) {
-    std::ifstream input(path, std::ios::binary);
-    if (!input) throw DataError("No se pudo abrir " + path.string());
-    std::string first;
-    std::getline(input, first);
-    if (startsWith(first, "\xef\xbb\xbf")) first.erase(0, 3);
-    if (!first.empty() && first.back() == '\r') first.pop_back();
-    std::set<std::string> actual;
-    std::stringstream names(first);
-    for (std::string name; std::getline(names, name, ',');) actual.insert(name);
-    return actual == std::set<std::string>(fields.begin(), fields.end());
+    bool first = true, matches = false;
+    readCsvRecords(path, [&](std::vector<std::string>& record, std::size_t) {
+        if (!first) return;
+        first = false;
+        matches = record.size() == fields.size() &&
+                  std::set<std::string>(record.begin(), record.end()) ==
+                  std::set<std::string>(fields.begin(), fields.end());
+    });
+    return matches;
 }
 // Carpeta de las versiones 1 a 3 (un CSV por tabla); se guarda luego como archivo unico.
 Repository loadFolder(const fs::path& directory) {
@@ -1670,7 +2040,7 @@ Repository loadFolder(const fs::path& directory) {
     const bool upgrade = version != LAST_FOLDER_VERSION;
     Repository repo;
     for (const auto& kind : ENTITY_KINDS) {
-        auto columns = FIELDS.at(kind);
+        auto columns = kind == "productos" ? PRODUCT_FIELDS_V4 : FIELDS.at(kind);
         const fs::path path = directory / (kind + ".csv");
         if (legacy && kind == "grupos") {
             auto oldColumns = columns;
@@ -1738,6 +2108,7 @@ void readDataFile(const fs::path& path,
     const std::string name = path.filename().string();
     std::size_t next = 0, rows = 0;
     std::string section;
+    std::string version;
     std::vector<std::string> header;
     auto where = [&](std::size_t line) { return name + ", linea " + std::to_string(line) + ": "; };
     readCsvRecords(path, [&](std::vector<std::string>& record, std::size_t line) {
@@ -1755,7 +2126,8 @@ void readDataFile(const fs::path& path,
         }
         if (section.empty()) throw DataError(where(line) + "el archivo debe comenzar con #manifest");
         if (header.empty()) {
-            const auto& fields = sections[next - 1].second;
+            const auto& fields = section == "productos" && version == "4" ?
+                                 PRODUCT_FIELDS_V4 : sections[next - 1].second;
             const std::set<std::string> expected(fields.begin(), fields.end());
             const std::set<std::string> actual(record.begin(), record.end());
             if (record.size() != fields.size() || actual != expected)
@@ -1765,7 +2137,9 @@ void readDataFile(const fs::path& path,
         }
         if (record.size() != header.size()) throw DataError(where(line) + "fila malformada en #" + section);
         if (++rows > MAX_CSV_ROWS) throw DataError(where(line) + "demasiadas filas en #" + section);
-        visit(section, csvRow(header, record, true), line);
+        Row row = csvRow(header, record, true);
+        if (section == "manifest") version = field(row, "version");
+        visit(section, std::move(row), line);
     });
     if (next < sections.size()) throw DataError(name + ": falta la seccion #" + sections[next].first);
     if (header.empty()) throw DataError(name + ": falta el encabezado de la seccion #" + section);
@@ -1780,7 +2154,8 @@ Repository loadFile(const fs::path& path) {
         try {
             if (section == "manifest") {
                 if (++manifests > 1) throw DataError("Manifest con mas de una fila");
-                if (field(row, "version") != SCHEMA_VERSION) throw DataError("Version de datos incompatible");
+                if (field(row, "version") != "4" && field(row, "version") != SCHEMA_VERSION)
+                    throw DataError("Version de datos incompatible");
             } else if (FIELDS.count(section)) {
                 repo.create(section, std::move(row), false);
             } else if (section == "cola_validacion") {
@@ -1878,11 +2253,13 @@ void saveRepository(Repository& repo, const fs::path& path) {
 ImportResult importCsv(Repository& repo, const fs::path& path, const std::string& kind,
                        bool apply) {
     if (!FIELDS.count(kind)) throw DataError("Tipo de CSV desconocido");
+    const auto& columns = kind == "productos" && headerMatches(path, PRODUCT_FIELDS_V4) ?
+                          PRODUCT_FIELDS_V4 : FIELDS.at(kind);
     ImportResult result;
     std::set<std::string> ids;
     std::set<std::pair<std::string, std::string>> pairs;
     std::set<std::string> external;
-    readCsvEach(path, FIELDS.at(kind), [&](Row row, std::size_t number) {
+    readCsvEach(path, columns, [&](Row row, std::size_t number) {
         ++result.total;
         try {
             Row clean = repo.validateCreate(kind, row);
@@ -1916,7 +2293,7 @@ ImportResult importCsv(Repository& repo, const fs::path& path, const std::string
         Rows inverse;
         inverse.reserve(result.accepted);
         try {
-            readCsvEach(path, FIELDS.at(kind), [&](Row row, std::size_t) {
+            readCsvEach(path, columns, [&](Row row, std::size_t) {
                 try {
                     repo.validateCreate(kind, row);
                 } catch (const DataError&) { return; }
@@ -2076,6 +2453,11 @@ void printDetail(const Repository& repo, const std::string& kind,
     std::cout << "\n";
     for (const auto& name : FIELDS.at(kind))
         std::cout << label(name) << ": " << field(*row, name) << '\n';
+    if (kind == "productos") {
+        if (const Subtype* subtype = findSubtype(field(*row, "categoria")))
+            std::cout << "Clase: " << subtype->clase << "\nPeso relativo: " << subtype->pesoRelativo
+                      << "\nValor en puntos: " << subtype->pesoGlobal() << '\n';
+    }
     auto printRelated = [&](const std::string& title, const std::string& relKind,
                             const std::string& id, bool fromLeft,
                             const std::string& otherField, const std::string& targetKind) {
@@ -2160,14 +2542,7 @@ void printTally(const std::string& title, const std::map<std::string, int>& valu
     for (const auto& item : values)
         std::cout << "  " << display(item.first, 58) << " | " << item.second << '\n';
 }
-void statisticsMenu(const Repository& repo) {
-    std::cout << "\n=== Estadisticas descriptivas ===\n"
-              << "1. Todos  2. Por grupo  3. Por investigador  4. Por producto\n";
-    const int viewOption = askNumber("Vista: ", 1, 4);
-    const std::array<std::string, 4> views = {"Todos", "Grupo", "Investigador", "Producto"};
-    const std::string view = views[static_cast<std::size_t>(viewOption - 1)];
-    std::string selected;
-    if (viewOption != 1) selected = ask(view + " ID: ");
+std::pair<std::optional<int>, std::optional<int>> askWindow() {
     std::cout << "1. Todos los anios  2. Ultimos 2  3. Ultimos 5  4. Rango\n";
     const int window = askNumber("Ventana: ", 1, 4);
     std::optional<int> start;
@@ -2188,6 +2563,17 @@ void statisticsMenu(const Repository& repo) {
         start = parse(from);
         end = parse(to);
     }
+    return {start, end};
+}
+void statisticsMenu(const Repository& repo) {
+    std::cout << "\n=== Estadisticas descriptivas ===\n"
+              << "1. Todos  2. Por grupo  3. Por investigador  4. Por producto\n";
+    const int viewOption = askNumber("Vista: ", 1, 4);
+    const std::array<std::string, 4> views = {"Todos", "Grupo", "Investigador", "Producto"};
+    const std::string view = views[static_cast<std::size_t>(viewOption - 1)];
+    std::string selected;
+    if (viewOption != 1) selected = ask(view + " ID: ");
+    const auto [start, end] = askWindow();
     const std::string validation = lowercase(ask("Validacion (validado/rechazado, vacio = todas): "));
     const Statistics stats = repo.statistics(view, selected, start, end, validation, 0, 40);
     const auto [activeGroups, activePeople] = repo.activeCounts();
@@ -2212,6 +2598,45 @@ void statisticsMenu(const Repository& repo) {
     }
     if (stats.total > 40) std::cout << "(primeros 40 mostrados)\n";
     std::cout << "Cada producto se cuenta una vez; el filtro temporal excluye anios sin dato.\n";
+}
+void indicatorMenu(const Repository& repo) {
+    std::cout << "\n=== Indicador de produccion cientifica ===\n"
+              << "1. Grupo  2. Investigador  3. Tabla de pesos del modelo\n";
+    const int option = askNumber("Opcion: ", 1, 3);
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    if (option == 3) {
+        output << "Codigo | Clase | Ventana | Peso relativo | Peso global | Descripcion\n";
+        for (const auto& subtype : model2024())
+            output << std::left << std::setw(16) << subtype.codigo << " | " << std::setw(6) << subtype.clase
+                   << " | " << subtype.ventana << " | " << subtype.pesoRelativo << " | "
+                   << subtype.pesoGlobal() << " | " << subtype.descripcion << '\n';
+        std::cout << output.str();
+        return;
+    }
+    const std::string kind = option == 1 ? "grupos" : "investigadores";
+    const std::string id = ask(option == 1 ? "Grupo ID: " : "Investigador ID: ");
+    const auto [start, end] = askWindow();
+    const std::string status = lowercase(ask("Validacion (validado/rechazado, vacio = todas): "));
+    const Indicator result = repo.indicator(kind, id, start, end, status);
+    output << std::fixed << std::setprecision(4)
+           << "Clase   | Coef   | Valor          | Maximo         | Indice   | Aporte\n";
+    auto print = [&](const IndicatorTerm& term, const std::string& name) {
+        output << std::left << std::setw(7) << name << " | " << std::right << std::setw(6) << term.coefficient
+               << " | " << std::setw(14) << term.value << " | " << std::setw(14) << term.maximum
+               << " | " << std::setw(8) << term.index << " | " << std::setw(8) << term.contribution << '\n';
+    };
+    for (const auto& term : result.classes) print(term, term.name);
+    print(result.cohesion, "Cohe");
+    print(result.cooperation, "Coop");
+    output << "Ind. = " << result.total << " (maximo posible 10)\n"
+           << "Productos contados: " << result.products << " | estimadas: " << result.estimated
+           << " | sin categoria: " << result.uncategorized << " | poblacion: " << result.population << '\n'
+           << "Codigo | n | periodo | lambda | peso global | valor\n";
+    for (const auto& subtype : result.subtypes)
+        output << subtype.code << " | " << subtype.count << " | " << subtype.period << " | "
+               << subtype.lambda << " | " << subtype.globalWeight << " | " << subtype.value << '\n';
+    std::cout << output.str();
 }
 void queueMenu(Repository& repo) {
     while (true) {
@@ -2391,8 +2816,9 @@ public:
                       << (repo_.dirty() ? "  * sin guardar" : "") << '\n'
                       << "1. Grupos  2. Investigadores  3. Productos  4. Planes\n"
                       << "5. Relaciones  6. Importar CSV  7. Estadisticas\n"
-                      << "8. Cola de revision  9. Deshacer  10. Datos  11. Guardar  0. Salir\n";
-            const int option = askNumber("Opcion: ", 0, 11);
+                      << "8. Cola de revision  9. Deshacer  10. Datos  11. Guardar\n"
+                      << "12. Indicador  0. Salir\n";
+            const int option = askNumber("Opcion: ", 0, 12);
             if (option == 0) {
                 if (mayReplace()) return;
                 continue;
@@ -2408,6 +2834,7 @@ public:
                     std::cout << (repo_.undo() ? "Ultima accion deshecha.\n" : "Historial vacio.\n");
                 else if (option == 10) filesMenu();
                 else if (option == 11) save();
+                else if (option == 12) indicatorMenu(repo_);
             } catch (const std::exception& error) {
                 std::cout << "Error: " << error.what() << '\n';
             }
@@ -2418,6 +2845,29 @@ public:
 // Protocolo local: una solicitud JSON por linea en stdin y una respuesta en stdout.
 // Los valores de la solicitud son cadenas; "values" contiene otro objeto JSON
 // codificado como cadena. Esto permite reutilizar el lector de instantaneas.
+std::string jsonNumber(double value) {
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << std::setprecision(17) << value;
+    std::string result = output.str();
+    if (result.find_first_of(".eE") == std::string::npos) result += ".0";
+    return result;
+}
+std::string jsonCatalog() {
+    std::string result = "[";
+    for (const auto& subtype : model2024()) {
+        if (result.size() > 1) result.push_back(',');
+        result += "{\"codigo\":" + jsonString(subtype.codigo) +
+                  ",\"clase\":" + jsonString(subtype.clase) +
+                  ",\"familia\":" + jsonString(subtype.familia) +
+                  ",\"descripcion\":" + jsonString(subtype.descripcion) +
+                  ",\"ventana\":" + std::to_string(subtype.ventana) +
+                  ",\"peso_alta\":" + jsonNumber(subtype.pesoAlta) +
+                  ",\"peso_relativo\":" + jsonNumber(subtype.pesoRelativo) +
+                  ",\"peso_global\":" + jsonNumber(subtype.pesoGlobal()) + "}";
+    }
+    return result + "]";
+}
 std::string jsonRow(const Row& row) {
     std::string result = "{";
     bool first = true;
@@ -2457,8 +2907,37 @@ std::string jsonStatistics(const Statistics& value) {
            ",\"total\":" + std::to_string(value.total) +
            ",\"por_anio\":" + jsonTally(value.byYear) +
            ",\"por_tipologia\":" + jsonTally(value.byType) +
+           ",\"por_categoria\":" + jsonTally(value.byCategory) +
            ",\"por_validacion\":" + jsonTally(value.byValidation) +
            ",\"por_regla\":" + jsonTally(value.byRule) + "}";
+}
+std::string jsonIndicatorTerm(const IndicatorTerm& term, bool withClass = false) {
+    return "{" + (withClass ? "\"clase\":" + jsonString(term.name) + "," : "") +
+           "\"coeficiente\":" + jsonNumber(term.coefficient) +
+           ",\"valor\":" + jsonNumber(term.value) + ",\"maximo\":" + jsonNumber(term.maximum) +
+           ",\"indice\":" + jsonNumber(term.index) + ",\"aporte\":" + jsonNumber(term.contribution) + "}";
+}
+std::string jsonIndicator(const Indicator& value) {
+    std::string classes = "[", subtypes = "[";
+    for (const auto& term : value.classes) {
+        if (classes.size() > 1) classes.push_back(',');
+        classes += jsonIndicatorTerm(term, true);
+    }
+    for (const auto& subtype : value.subtypes) {
+        if (subtypes.size() > 1) subtypes.push_back(',');
+        subtypes += "{\"codigo\":" + jsonString(subtype.code) + ",\"clase\":" + jsonString(subtype.clase) +
+                    ",\"cantidad\":" + std::to_string(subtype.count) + ",\"periodo\":" + std::to_string(subtype.period) +
+                    ",\"lambda\":" + jsonNumber(subtype.lambda) + ",\"peso_global\":" + jsonNumber(subtype.globalWeight) +
+                    ",\"valor\":" + jsonNumber(subtype.value) + "}";
+    }
+    return "{\"tipo\":" + jsonString(value.kind) + ",\"id\":" + jsonString(value.id) +
+           ",\"corte\":" + std::to_string(value.cutoff) + ",\"inicio\":" +
+           (value.start ? std::to_string(*value.start) : "null") + ",\"estado\":" + jsonString(value.status) +
+           ",\"poblacion\":" + std::to_string(value.population) + ",\"productos\":" + std::to_string(value.products) +
+           ",\"sin_categoria\":" + std::to_string(value.uncategorized) + ",\"estimadas\":" + std::to_string(value.estimated) +
+           ",\"clases\":" + classes + "],\"cohesion\":" + jsonIndicatorTerm(value.cohesion) +
+           ",\"cooperacion\":" + jsonIndicatorTerm(value.cooperation) + ",\"subtipos\":" + subtypes +
+           "],\"indicador\":" + jsonNumber(value.total) + "}";
 }
 std::string jsonImport(const ImportResult& value) {
     std::string errors = "[";
@@ -2509,7 +2988,8 @@ class ApiApp {
         const std::string kind = field(request, "kind");
         const std::string key = field(request, "key");
         const std::string second = field(request, "second");
-        if (action == "ping") return "{\"backend\":\"cpp\",\"protocol\":\"3\"}";
+        if (action == "ping") return "{\"backend\":\"cpp\",\"protocol\":\"4\"}";
+        if (action == "catalog") return jsonCatalog();
         if (action == "state") return state();
         if (action == "new_id") {
             if (entityIndex(kind) < 0) throw DataError("Tipo de entidad desconocido");
@@ -2584,6 +3064,9 @@ class ApiApp {
                 pageNumber(request, "offset", 0, SIZE_MAX),
                 pageNumber(request, "limit", 100, 200)));
         }
+        if (action == "indicator")
+            return jsonIndicator(repo_.indicator(kind, key, optionalYear(request, "start"),
+                                                 optionalYear(request, "end"), field(request, "status")));
         if (action == "queue_rows") return jsonRows(repo_.queueRows());
         if (action == "queue_page")
             return jsonPage(repo_.queuePage(pageNumber(request, "offset", 0, SIZE_MAX),
@@ -2636,6 +3119,93 @@ void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error("Autoprueba: " + message);
 }
 void selfTest() {
+    require(model2024().size() == 169, "catalogo de 169 subtipos");
+    const Subtype* article = findSubtype("ART_A2");
+    require(article && article->pesoGlobal() == 550.0, "peso global ART_A2");
+    require(!findSubtype("XYZ"), "subtipo inexistente");
+    require(MODEL_CLASSES.front() == "TOP" && MODEL_CLASSES.back() == "FRH_B" &&
+            MODEL_COEFFICIENTS.at("TOP") == 3.7, "clases y coeficientes del modelo");
+    struct CommaDecimal : std::numpunct<char> {
+        char do_decimal_point() const override { return ','; }
+    };
+    const std::locale originalLocale;
+    std::locale::global(std::locale(originalLocale, new CommaDecimal));
+    const std::string localized = jsonNumber(5.5);
+    const std::string localizedCatalog = jsonCatalog();
+    std::locale::global(originalLocale);
+    require(localized == "5.5" && localizedCatalog.find("\"peso_relativo\":5.5") != std::string::npos,
+            "numeros JSON independientes de la configuracion regional");
+
+    Repository fixture;
+    fixture.create("grupos", {{"id", "G1"}, {"nombre", "G1"}, {"fecha_creacion", "2010-01-01"}});
+    fixture.create("grupos", {{"id", "G2"}, {"nombre", "G2"}, {"fecha_creacion", "2025-03-01"}});
+    for (const auto& id : {"I1", "I2", "I3"}) fixture.create("investigadores", {{"id", id}, {"nombre", id}});
+    for (const auto& pair : std::vector<std::pair<std::string, std::string>>{
+             {"G1", "I1"}, {"G1", "I2"}, {"G2", "I3"}, {"G2", "I1"}})
+        fixture.create("membresias", {{"grupo_id", pair.first}, {"investigador_id", pair.second}});
+    const std::array<std::string, 8> years = {"2025", "2024", "2021", "2026", "2019", "2025", "2023", "2025"};
+    const std::array<std::string, 8> categories = {"ART_D", "ART_D", "LIB_B", "ART_D", "SF", "", "WP", "WP"};
+    const std::array<std::string, 8> authors = {"I1", "I1", "I2", "I3", "I1", "I1", "I3", "I1"};
+    for (std::size_t i = 0; i < years.size(); ++i) {
+        const std::string id = "P" + std::to_string(i + 1);
+        fixture.create("productos", {{"id", id}, {"titulo", id}, {"anio", years[i]},
+                                     {"categoria", categories[i]}, {"tipologia", "Prueba"}});
+        fixture.create("autorias", {{"producto_id", id}, {"investigador_id", authors[i]}});
+        fixture.create("grupos_productos", {{"grupo_id", i == 3 || i == 6 ? "G2" : "G1"}, {"producto_id", id}});
+    }
+    fixture.create("autorias", {{"producto_id", "P1"}, {"investigador_id", "I2"}});
+    require(std::abs(fixture.indicator("grupos", "G1", {}, 2026).total - 3.531937) < 1e-6, "indicador G1");
+    require(std::abs(fixture.indicator("grupos", "G2", {}, 2026).total - 0.4) < 1e-9, "indicador G2");
+    require(std::abs(fixture.indicator("investigadores", "I1", {}, 2026).total - 1.3) < 1e-9, "indicador I1");
+    require(fixture.indicator("grupos", "G2", {}, 2024).products == 0, "indicador anterior a la creacion");
+    fixture.toggle("grupos", "G1");
+    try {
+        fixture.indicator("grupos", "G1", {}, 2026);
+        throw std::runtime_error("Autoprueba: indicador de grupo inactivo aceptado");
+    } catch (const DataError& error) { require(std::string(error.what()) == "Registro inactivo", "indicador inactivo"); }
+    fixture.undo();
+
+    Repository categorized;
+    categorized.create("productos", {{"id", "P-CAT"}, {"titulo", "T"}, {"categoria", "ART_A1"}});
+    require(field(*categorized.get("productos", "P-CAT"), "categoria_origen") == "manual",
+            "categoria manual por defecto");
+    auto rejectsCategory = [&](const Row& values, const std::string& message) {
+        try {
+            categorized.create("productos", values);
+        } catch (const DataError& error) {
+            require(error.what() == message, "mensaje de categoria invalida");
+            return;
+        }
+        throw std::runtime_error("Autoprueba: se acepto categoria u origen invalido");
+    };
+    rejectsCategory({{"id", "P-BAD"}, {"titulo", "T"}, {"categoria", "XYZ"}},
+                    "Categoria desconocida: XYZ");
+    rejectsCategory({{"id", "P-BAD"}, {"titulo", "T"}, {"categoria", "ART_D"}, {"categoria_origen", "otra"}},
+                    "Origen de categoria: estimada o manual");
+    rejectsCategory({{"id", "P-BAD"}, {"titulo", "T"}, {"categoria_origen", "otra"}},
+                    "Origen de categoria: estimada o manual");
+    categorized.create("productos", {{"id", "P-EST"}, {"titulo", "T"}, {"categoria", "ART_D"},
+                                     {"categoria_origen", "estimada"}});
+    categorized.update("productos", "P-EST", "", {{"observacion", "nota"}});
+    require(field(*categorized.get("productos", "P-EST"), "categoria_origen") == "estimada",
+            "editar observacion conserva origen estimado");
+    require(categorized.undo() && field(*categorized.get("productos", "P-EST"), "categoria") == "ART_D" &&
+            field(*categorized.get("productos", "P-EST"), "observacion").empty(), "deshacer conserva categoria");
+    categorized.update("productos", "P-EST", "", {{"categoria", " ART_D "}});
+    require(field(*categorized.get("productos", "P-EST"), "categoria_origen") == "estimada",
+            "misma categoria conserva origen estimado");
+    categorized.update("productos", "P-EST", "", {{"categoria", "ART_C"}});
+    require(field(*categorized.get("productos", "P-EST"), "categoria_origen") == "manual",
+            "cambiar categoria establece origen manual");
+    categorized.update("productos", "P-EST", "", {{"categoria", ""}});
+    require(field(*categorized.get("productos", "P-EST"), "categoria_origen").empty(), "vaciar categoria limpia origen");
+    require(categorized.statistics().byCategory == std::map<std::string, int>{{"ART_A1", 1}, {"Sin dato", 1}},
+            "estadisticas por categoria");
+    const Row modern = legacyRow("productos", {{"id", "P"}, {"titulo", "T"}, {"categoria", "ART_D"},
+                                               {"categoria_origen", "manual"}});
+    require(field(modern, "categoria") == "ART_D" && field(modern, "observacion").empty(),
+            "adaptador de historial conserva categoria v5");
+
     DoublyList list;
     require(list.rows().empty(), "lista vacia");
     list.append({{"id", "A"}});
@@ -2694,23 +3264,28 @@ void selfTest() {
     require(repo.statistics("Grupo", "G-DEMO-1").products.size() == 3, "vista por grupo");
     require(repo.statistics("Investigador", "I-DEMO-2").products.size() == 2, "vista por investigador");
     require(state("P-DEMO-1") == "validado" && state("P-DEMO-2") == "validado", "validacion automatica");
-    require(repo.productIssues("P-DEMO-3") == std::vector<std::string>{"autor"}, "regla de autor");
-    require(repo.productIssues("P-DEMO-4") == std::vector<std::string>{"tipologia", "autor", "fuente"},
+    require(state("P-DEMO-3") == "validado" && repo.productIssues("P-DEMO-3").empty(),
+            "un grupo basta sin autor");
+    require(repo.productIssues("P-DEMO-4") == std::vector<std::string>{"tipologia", "fuente"},
             "reglas en orden");
-    require(repo.statistics("Todos", "", {}, {}, "validado").products.size() == 2, "filtro de validacion");
-    require(repo.statistics().byRule.at("autor") == 2, "conteo de reglas");
+    require(repo.statistics("Todos", "", {}, {}, "validado").products.size() == 3, "filtro de validacion");
+    require(!repo.statistics().byRule.count("vinculo") && repo.statistics().byRule.at("fuente") == 1,
+            "conteo de reglas");
     require(repo.queueSize() == 2 && field(*repo.queueFront(), "producto_id") == "P-DEMO-2",
             "cola persistida");
     repo.toggle("investigadores", "I-DEMO-2");
-    require(state("P-DEMO-1") == "rechazado", "autor inactivo invalida el producto");
-    require(repo.undo() && state("P-DEMO-1") == "validado", "deshacer revalida");
+    require(state("P-DEMO-1") == "validado", "el grupo sostiene el producto sin autor activo");
+    repo.toggle("grupos_productos", "G-DEMO-1", "P-DEMO-1");
+    require(state("P-DEMO-1") == "rechazado" &&
+            repo.productIssues("P-DEMO-1") == std::vector<std::string>{"vinculo"}, "sin autor ni grupo");
+    require(repo.undo() && repo.undo() && state("P-DEMO-1") == "validado", "deshacer revalida");
     repo.update("productos", "P-DEMO-1", "", {{"doi", "10.12/x"}});
     require(repo.productIssues("P-DEMO-1") == std::vector<std::string>{"doi", "fuente"}, "DOI mal formado");
     require(repo.undo() && state("P-DEMO-1") == "validado", "deshacer DOI");
     repo.toggle("grupos_productos", "G-DEMO-1", "P-DEMO-1");
     require(repo.statistics("Grupo", "G-DEMO-1").products.size() == 2,
             "vinculo inactivo fuera de la vista");
-    require(state("P-DEMO-1") == "rechazado", "vinculo de grupo inactivo");
+    require(state("P-DEMO-1") == "validado", "el autor sostiene el producto sin grupo activo");
     require(repo.undo() && repo.statistics("Grupo", "G-DEMO-1").products.size() == 3,
             "deshacer vinculo");
     try {
@@ -2727,7 +3302,7 @@ void selfTest() {
         throw std::runtime_error("No se bloqueo el borrado con relaciones");
     } catch (const DataError&) {}
     require(repo.enqueueRejected() == 1 && repo.queueSize() == 3, "encolar rechazados");
-    require(field(repo.queuePage(2, 1).rows.front(), "motivo") == "reglas:tipologia,autor,fuente",
+    require(field(repo.queuePage(2, 1).rows.front(), "motivo") == "reglas:tipologia,fuente",
             "motivo automatico");
     require(repo.undo() && repo.queueSize() == 2, "deshacer cola");
     const Row legacy = legacyRow("productos", {{"id", "P"}, {"titulo", "T"}, {"categoria", "A1"}});
@@ -2748,7 +3323,7 @@ void selfTest() {
         std::ifstream saved(dataFile, std::ios::binary);
         text.assign(std::istreambuf_iterator<char>(saved), std::istreambuf_iterator<char>());
     }
-    require(startsWith(text, "#manifest\nversion,guardado\n4,"), "archivo unico empieza con #manifest");
+    require(startsWith(text, "#manifest\nversion,guardado\n5,"), "archivo unico v5 empieza con #manifest");
     Repository loaded = loadRepository(dataFile);
     require(loaded.snapshot() == repo.snapshot(), "CSV y JSON de historial ida y vuelta");
     const fs::path edited = temp.path / "editado.csv";

@@ -21,7 +21,7 @@ def write_folder(repo, path: Path, version: str) -> None:
               **{kind: repo.rows(kind) for kind in pea.ALL_FIELDS},
               "cola_validacion": list(repo.queue), "historial": []}
     for name, rows in tables.items():
-        fields = pea.DATA_SECTIONS[name]
+        fields = pea.PRODUCT_FIELDS_V4 if name == "productos" else pea.DATA_SECTIONS[name]
         with (path / f"{name}.csv").open("w", encoding="utf-8", newline="") as stream:
             writer = csv.writer(stream, lineterminator="\n")
             writer.writerow(fields)
@@ -169,7 +169,7 @@ def main() -> None:
         products = pea._csv_read(path / "productos.csv", pea.ENTITY_FIELDS["productos"], encoded=True)
         with (path / "productos.csv").open("w", encoding="utf-8", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=tuple(
-                field for field in pea.ENTITY_FIELDS["productos"] if field != "validacion"), extrasaction="ignore")
+                field for field in pea.PRODUCT_FIELDS_V4 if field != "validacion"), extrasaction="ignore")
             writer.writeheader()
             writer.writerows(products)
         (path / "cola_validacion.csv").unlink()
@@ -177,7 +177,7 @@ def main() -> None:
         try:
             legacy.load(path)
             assert legacy.get("productos", "P-OLD")["validacion"] == "rechazado"
-            assert legacy.product_issues("P-OLD") == ["anio", "tipologia", "autor", "grupo", "fuente"]
+            assert legacy.product_issues("P-OLD") == ["anio", "tipologia", "vinculo", "fuente"]
             converted = path / "datos.csv"
             legacy.save(converted)
             assert pea.load_repository(converted).get("grupos", "G-OLD")["nombre"] == "Grupo anterior"
@@ -193,8 +193,8 @@ def main() -> None:
         products = pea._csv_read(path / "productos.csv", pea.ENTITY_FIELDS["productos"], encoded=True)
         products[0].update(categoria="B", validacion="pendiente")
         with (path / "productos.csv").open("w", encoding="utf-8", newline="") as stream:
-            writer = csv.DictWriter(stream, fieldnames=(*pea.ENTITY_FIELDS["productos"][:6], "categoria",
-                                                        *pea.ENTITY_FIELDS["productos"][6:]))
+            writer = csv.DictWriter(stream, fieldnames=(*pea.PRODUCT_FIELDS_V4[:6], "categoria",
+                                                        *pea.PRODUCT_FIELDS_V4[6:]))
             writer.writeheader()
             writer.writerows(products)
         upgraded = pea.CppRepository(binary)
