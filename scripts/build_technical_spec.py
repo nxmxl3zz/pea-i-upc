@@ -806,7 +806,7 @@ def build() -> None:
     bullet(doc, "Esquema y reglas: apartados 5, 6 y 13; protocolo entre procesos: apartado 2; indicador: apartado 9.")
     bullet(doc, "Procedencia de datos: data/README.md y fichas públicas GrupLAC y CvLAC enlazadas allí.")
     bullet(doc, "Código fuente: src/cpp/Taller2_REMR.cpp y src/python/Taller2_REMR.py.")
-    bullet(doc, "Video de presentación: docs/pea-i-por-dentro.mp4.")
+    bullet(doc, "Videos de presentación: docs/video_taller.mp4 (Taller 2) y docs/video_parcial.mp4 (Parcial 2).")
 
     heading(doc, "15 Algoritmos principales")
     paragraph(doc, "Consulta estadística: la multilista selecciona los IDs de producto asociados a la "
