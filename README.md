@@ -1,6 +1,6 @@
 # PEA-i UPC
 
-Programa Estadístico de Análisis de Investigación para la Universidad Popular del Cesar. El proyecto contiene dos soluciones: una consola C++17 y una aplicación Python con Tkinter. La ventana inicia el motor C++ como proceso local cuando está disponible y usa el motor Python autónomo si no puede iniciarlo. La comunicación entre ambos usa JSON por `stdin`/`stdout`; no requiere abrir dos ventanas ni un servidor.
+Programa Estadístico de Análisis de Investigación para la Universidad Popular del Cesar. Incluye una consola C++17 y una aplicación Python con interfaz CustomTkinter. La ventana usa el motor C++ como proceso local (mensajes JSON por `stdin`/`stdout`) y, si no puede iniciarlo, su propio motor Python.
 
 ## Organización del repositorio
 
@@ -20,128 +20,59 @@ tests/                            Pruebas del dominio, integración y carga
 CMakeLists.txt                    Compilación C++
 ```
 
-## Videos de presentación
+## Videos
 
-[**«PEA-i por dentro»**](docs/video_taller.mp4) (Taller 2, 5 min, 1080p) explica cómo funcionan la pila
-y la cola en el código y luego muestra la aplicación real: recorrido, cola de revisión, agregar, eliminar
-y filtros.
-
-[**«PEA-i: el indicador»**](docs/video_parcial.mp4) (Parcial 2, 5 min, 1080p) explica las categorías del
-modelo Minciencias 2024 y cómo se calcula el indicador de producción recorriendo las multilistas, y luego
-lo muestra en la aplicación real: importar las fichas GrupLAC y CvLAC del enunciado, el detalle por
-subtipo, la ventana de años y una categoría corregida a mano.
+- [**«PEA-i por dentro»**](docs/video_taller.mp4) (Taller 2, 5 min): la pila y la cola en el código y en la aplicación.
+- [**«PEA-i: el indicador»**](docs/video_parcial.mp4) (Parcial 2, 5 min): las categorías del modelo Minciencias 2024, el cálculo del indicador y su uso en la aplicación.
 
 ## Instalación y ejecución
 
-Descargue el ZIP del repositorio en GitHub y **extraiga la carpeta completa**, o use `git clone`. Se necesita Python 3.10 o posterior con Tkinter y una sesión de escritorio. La interfaz usa **CustomTkinter** (`requirements.txt` fija `customtkinter==6.0.0`). Si falta, al abrir PEA-i por primera vez el programa pregunta si desea instalarlo con `pip` (se necesita Internet una sola vez); también puede instalarlo antes con `py -3 -m pip install -r requirements.txt` en Windows o `python3 -m pip install -r requirements.txt` en Linux. La consola C++, los scripts y las pruebas del núcleo no lo necesitan.
+Se necesita Python 3.10 o posterior con Tkinter y CustomTkinter (`requirements.txt`). Si falta CustomTkinter, PEA-i ofrece instalarlo la primera vez que se abre.
 
-En distribuciones Linux cuyo Python del sistema no admite `pip` (PEP 668, por ejemplo Arch o Debian recientes), use un entorno virtual desde la carpeta del proyecto: `python3 -m venv .venv`, `.venv/bin/pip install -r requirements.txt` y `.venv/bin/python src/python/Taller2_REMR.py`.
+- **Windows (64 bits):** doble clic en **`Iniciar PEA-i.pyw`**, o `py -3 src/python/Taller2_REMR.py`. Usa el ejecutable incluido `bin/windows/pea_cpp.exe`, que solo se acepta si su SHA-256 coincide con las fuentes; no hace falta compilar.
+- **Linux:** `python3 src/python/Taller2_REMR.py`. Si el Python del sistema no admite `pip` (PEP 668), cree un entorno virtual con `python3 -m venv .venv` y `.venv/bin/pip install -r requirements.txt`, y ejecute con `.venv/bin/python`. Con CMake y un compilador C++17, la ventana compila el motor C++ cuando hace falta.
+- **Solo la consola C++:** `bin\windows\pea_cpp.exe` en Windows; en Linux `cmake -S . -B build && cmake --build build && ./build/pea_cpp`.
 
-### Windows de 64 bits
+Opciones: `--data ARCHIVO` abre otro archivo de datos, `--python-backend` fuerza el motor Python y `--cpp-binary RUTA` usa otro ejecutable C++. El motor activo aparece en **Ayuda → Acerca de PEA-i**.
 
-Haga doble clic en **`Iniciar PEA-i.pyw`**. El repositorio incluye `bin/windows/pea_cpp.exe`, por lo que el uso normal no requiere CMake, NMake, Dev-C++ ni `g++`. Si la asociación de `.pyw` no funciona, abra PowerShell en la raíz del proyecto y ejecute:
+## Uso
 
-```powershell
-py -3 src/python/Taller2_REMR.py
-```
-
-El motor activo aparece en **Ayuda → Acerca de PEA-i**. Para ejecutar solo la consola C++ use `bin\windows\pea_cpp.exe`. Para forzar el motor Python use `py -3 src/python/Taller2_REMR.py --python-backend`.
-
-### Linux
-
-```bash
-python3 src/python/Taller2_REMR.py        # o .venv/bin/python src/python/Taller2_REMR.py
-```
-
-Si CMake y un compilador C++17 están instalados, la ventana compila y ejecuta el backend C++ cuando hace falta. Si no están disponibles, inicia el motor Python. Para compilar y abrir la consola por separado:
-
-```bash
-cmake -S . -B build
-cmake --build build
-./build/pea_cpp
-```
-
-Para indicar un ejecutable C++ propio use `--cpp-binary RUTA`. Para abrir otro archivo de datos al iniciar use `--data ARCHIVO`; la consola también admite esa opción.
-
-## Uso de la ventana
-
-Al iniciar se abre automáticamente `data/pea_upc.csv`, salvo que se indique `--data`, y **Guardar** escribe en ese mismo archivo. El menú **Archivo** permite iniciar vacío, abrir otro archivo de datos, volver a los datos UPC y guardar en otro archivo con **Guardar como**.
-
-La navegación lateral contiene Dashboard, Gráficos, Grupos, Investigadores, Productos, Planes, Relaciones y Cola de revisión. La sección actual queda resaltada; el botón ☰ contrae o despliega el menú. Las tablas muestran 100 filas por página y la búsqueda abarca el conjunto completo. Puede filtrar entidades por **Todos**, **Activos** o **Inactivos**.
-
-Pulse un producto para abrir su ficha completa, con **Resumen**, **Autores**, **Grupos** y **Estadísticas**. Abrir la ficha conserva la búsqueda y la página de la lista. Para otras entidades, haga doble clic o pulse **Abrir ficha**. Los grupos incluyen pestañas de integrantes, planes y productos; los investigadores incluyen sus grupos y productos. Desde estas fichas puede editar registros, crear planes, vincular entidades y editar, desactivar o eliminar vínculos. Los vínculos inactivos siguen visibles para consultar su historia. El resumen muestra solo los campos con datos y lista los vacíos en una línea «Sin registrar». Las tablas ocultan las columnas que ningún registro ha llenado y las muestran en cuanto alguno lo tiene. La clasificación del grupo y la de sus integrantes aparecen en el módulo de grupos. La categoría de un producto es un subtipo del modelo Minciencias 2024 y aparece en la tabla, la ficha y el formulario de productos (ver [Indicador de producción](#indicador-de-producción)).
-
-El dashboard reúne filtros, cuatro tarjetas de resumen, un histograma anual, barras por tipología y los productos de la consulta. Ofrece vistas **Todos**, **Grupo**, **Investigador** y **Producto**, con filtros de año y validación. Todos los filtros responden automáticamente al seleccionar o escribir; el rango personalizado también acepta Enter. No hay botones Aplicar/Limpiar. **Elegir…** abre un selector por nombre o ID con búsqueda y páginas sobre todos los registros, incluso los posteriores a la fila 100.
-
-El histograma agrupa los productos de **20 años o más** en una columna; en 2026 incluye **2006 y anteriores**. El corte avanza con el año actual y siempre respeta la ventana elegida. La vista previa agrupa las tipologías menos frecuentes como «Otras tipologías (agrupadas)». **Gráficos** ofrece el desglose completo por año, tipología, categoría del modelo, validación y reglas incumplidas, con el mismo contexto del dashboard y barras desplazables. Un dato vacío no se inventa: el producto sigue en el total y aparece como «Sin dato». Los porcentajes usan el total de productos de la consulta, incluidos los datos desconocidos.
-
-Puede crear, editar, desactivar y eliminar entidades y relaciones. Los formularios muestran campos obligatorios y conservan lo escrito si falla la validación. La **validación es automática**: un producto queda validado si tiene año, tipología, un autor **o** un grupo activos, y una URL o un DOI válido (un DOI mal formado también lo rechaza); si no, queda rechazado y su ficha indica qué reglas incumple. Un autor o un grupo bastan porque GrupLAC publica eventos y proyectos sin autores, y CvLAC productos que ningún grupo declara. En la captura incluida, los 21.419 productos quedan validados y ninguno rechazado ([detalle](data/README.md#categorías-y-validación-automática)). La **Cola de revisión** atiende los productos rechazados por orden de llegada: **Enviar rechazados** los encola en una acción y **Revisar siguiente** permite corregir el producto y cerrar la revisión con una nota obligatoria. **Editar → Deshacer** revierte acciones. Los datos, la cola y el historial se conservan al guardar.
-
-La barra superior indica el archivo abierto y los cambios pendientes, con **Guardar** (o **Guardar como…** si los datos aún no tienen archivo). La barra inferior muestra resultados y errores. Atajos: **Ctrl+S** guardar, **Ctrl+Shift+S** guardar como, **Ctrl+N** iniciar vacío, **Ctrl+Z** deshacer y **Ctrl+Enter** guardar un formulario. El dashboard se desplaza verticalmente en ventanas pequeñas y ambas apariencias se conservan al navegar.
+- **Datos:** al iniciar se abre `data/pea_upc.csv` y **Guardar** escribe en él. **Archivo** permite iniciar vacío, abrir otro archivo, guardar como y exportar una copia para hoja de cálculo.
+- **Registros:** grupos, investigadores, productos, planes y sus relaciones se crean, editan, desactivan y eliminan desde las tablas y las fichas. **Ctrl+Z** deshace.
+- **Dashboard y Gráficos:** resúmenes, histogramas y distribuciones en las vistas Todos, Grupo, Investigador y Producto, con filtros de años y validación.
+- **Validación y cola:** un producto queda validado si tiene año, tipología, un autor o un grupo activos y una URL o un DOI válido. La **Cola de revisión** atiende los rechazados en orden de llegada.
 
 ### Indicador de producción
 
-PEA-i calcula el indicador de producción científica del modelo de medición Minciencias 2024 para un grupo o para un investigador:
+PEA-i calcula el indicador del modelo Minciencias 2024 para un grupo o un investigador:
 
 `Ind = 3,7·Nc.Top + 2,3·Nc.A + 0,4·Nc.B + 1,5·AP + 0,5·DPC + 1·Fr.A + 0,2·Fr.B + 0,1·Cohe + 0,3·Coop`
 
-Cada término es un índice entre 0 y 1, relativo al máximo entre los grupos (o investigadores) activos cargados, así que el indicador vale como máximo 10. Cada producto aporta según su categoría: uno de los 169 subtipos del modelo, con su clase, ventana de observación (5, 7 o 10 años), peso relativo y valor en puntos (peso global). La [especificación técnica](docs/especificacion_tecnica.docx) (apartado 9) detalla el cálculo y las variables de entrada y salida.
+Cada término es un índice de 0 a 1 relativo al máximo entre las entidades activas cargadas, así que el indicador vale como máximo 10. Cada producto aporta según su categoría, uno de los 169 subtipos del modelo.
 
-- **Dashboard:** elija la vista **Grupo** o **Investigador** y la entidad. El panel muestra «Ind. x de 10», la población de referencia, los productos contados, estimados y sin categoría, y una barra por término. **Detalle por subtipo** lista cantidad, período, λ, peso global y valor de cada subtipo. La ventana de observación y el filtro de validación del dashboard también se aplican al indicador.
-- **Para calcular el indicador de una URL del enunciado:** **Importar → URL pública…**, pegue la ficha GrupLAC del grupo (o la hoja de vida CvLAC del investigador), pulse **Importar datos detectados** y elija esa entidad en el dashboard.
-- **Categorías:** el importador estima la categoría más baja de la familia que corresponde a la sección y la tipología de GrupLAC o CvLAC (por ejemplo, un artículo publicado en revista especializada queda como `ART_D`), porque las fichas públicas no publican la categoría de cada producto. Para corregirla, edite el producto y elija otra categoría: queda con origen manual y una reimportación no la cambia.
-- **Consola C++:** la opción **12. Indicador** calcula el indicador de un grupo o de un investigador con la misma ventana y validación que las estadísticas, y la subopción 3 lista la tabla de pesos del modelo.
+- **En la ventana:** **Importar → URL pública…**, pegue la ficha GrupLAC del grupo o la hoja de vida CvLAC del investigador, pulse **Importar datos detectados** y luego **Ver indicador**. También aparece en el dashboard al elegir un grupo o un investigador.
+- **Categorías:** el importador estima la más baja de cada familia, porque las fichas públicas no la publican. Una categoría elegida a mano se conserva al reimportar.
+- **Consola C++:** opción **12. Indicador**.
+
+El cálculo completo está en el apartado 9 de la [especificación técnica](docs/especificacion_tecnica.docx).
 
 ### Importar información
 
-- **CSV:** ambos motores importan los archivos con los encabezados del diccionario de persistencia (apartado 13 de la [especificación técnica](docs/especificacion_tecnica.docx)). La ventana propone el tipo según los encabezados y permite seleccionarlo por nombre. La vista previa indica filas aceptables y rechazadas.
-- **Excel `.xlsx`:** la interfaz Python convierte la primera hoja a CSV antes de la vista previa. Requiere `openpyxl` (`pip install openpyxl`).
-- **URL pública:** la interfaz Python muestra HTML, texto, CSV o PDF de texto antes de crear registros. Reconoce fichas GrupLAC (grupo, integrantes, plan y productos) y CvLAC (investigador y sus productos con autoría) y metadatos explícitos de artículos; otros sitios pueden mostrarse sin proponer campos. No ejecuta JavaScript de la página ni inicia sesión en sitios externos.
-- **PDF local:** la interfaz Python requiere `pdftotext` de Poppler y texto seleccionable. Un PDF escaneado necesita OCR externo.
-- **Word `.docx`:** la interfaz Python extrae texto para vista previa mediante `mammoth` (`pip install mammoth`).
+La ventana importa CSV, Excel `.xlsx` (con `openpyxl`), URL públicas (fichas GrupLAC y CvLAC), PDF con texto (con `pdftotext`) y Word `.docx` (con `mammoth`), siempre con vista previa. Cada importación se guarda al instante y no duplica registros: agrega lo nuevo y actualiza lo que cambió. La consola C++ importa CSV. Los límites y controles de seguridad de las fuentes están en el apartado 7 de la especificación.
 
-La consola C++ importa CSV; en el uso integrado, Python consulta las fuentes y envía a C++ los registros aceptados.
+## Datos
 
-Cada importación se guarda de inmediato en el archivo abierto, así que los datos crecen con cada fuente consultada. Volver a importar una ficha GrupLAC no duplica registros: agrega lo nuevo y actualiza lo que la fuente cambió (por ejemplo, la clasificación del grupo o un integrante cuyo período terminó), sin borrar nada ni reemplazar las observaciones de revisión. La [especificación técnica](docs/especificacion_tecnica.docx) (apartado 7) indica qué campos se actualizan.
+`data/pea_upc.csv` (19 de octubre de 2026) reúne 66 grupos, 2.748 investigadores y 21.419 productos de las fichas públicas GrupLAC y CvLAC de la UPC, con sus planes y relaciones. Todo se guarda en un solo archivo (esquema 5) junto con la cola de revisión y el historial, y cada guardado deja una copia en `.backup/`. La procedencia, los límites y cómo actualizar la captura están en [data/README.md](data/README.md).
 
-## Datos incluidos y persistencia
-
-`data/pea_upc.csv`, actualizado el **19 de octubre de 2026**, contiene **66 grupos, 2.748 investigadores, 21.419 productos, 66 planes, 3.303 membresías, 22.781 vínculos grupo-producto y 17.170 autorías** de fichas públicas GrupLAC y CvLAC. Hay 20.917 productos con categoría estimada y 502 sin categoría; 66 grupos tienen fecha de creación. De los investigadores, 274 tienen una categoría CvLAC capturada; los campos sin fuente suficiente quedan vacíos. La [procedencia y límites de la captura](data/README.md) están documentados aparte. No se necesita Internet para consultar los datos incluidos.
-
-Todos los datos viven en **un solo archivo** (esquema **versión 5**): secciones `#manifest`, cuatro tablas de entidades, tres de relaciones, la cola de revisión y el historial, en ese orden, cada una con su encabezado. Ambos motores leen el archivo de arriba abajo y crean cada registro al leerlo. Las carpetas de las versiones 1 a 3 (un CSV por tabla) se abren eligiendo la carpeta o su `manifest.csv` y se guardan como archivo único; la carpeta no se modifica. Cada guardado deja el archivo anterior en `.backup/` junto al archivo. Abra un archivo de datos en una sola instancia a la vez.
-
-El esquema neutraliza en disco los valores que una hoja de cálculo podría interpretar como fórmulas y los recupera al cargar. **Archivo → Exportar para hoja de cálculo** crea una copia segura para consulta; esa exportación no incluye la cola ni el historial y no sustituye al archivo de datos.
-
-## Medidas y límites de seguridad
-
-Las consultas web aceptan HTTP/HTTPS en puertos 80/443, rechazan direcciones locales y privadas, comprueban también cada redirección, desactivan el proxy heredado del entorno y conectan a una IP pública ya validada. La descarga limita la respuesta a 8 MB. La conexión tiene un tiempo de espera por operación de 15 segundos; un servidor que envía datos muy lentamente puede prolongar la consulta, por lo que no debe tratarse como una garantía de duración total.
-
-Los archivos locales PDF, Word y Excel tienen un límite de 32 MB. Word y Excel se inspeccionan como archivos comprimidos antes de procesarlos: máximo 10.000 entradas y 128 MB declarados al descomprimir. La extracción PDF limita el texto a 5 millones de caracteres y aplica 25 segundos de espera total; en sistemas POSIX también impone límites de memoria y CPU al conversor. Las importaciones CSV limitan cada campo a 100.000 caracteres y cada archivo a 500.000 filas.
-
-El binario Windows incluido se usa solo cuando coinciden su SHA-256 y la huella de las fuentes. Esas huellas detectan cambios accidentales o desajustes; al distribuirse junto con el ejecutable, **no autentican al autor**. Descargue el proyecto de una fuente en la que confíe. No se deben pegar tokens o contraseñas en URL de importación; el programa elimina parámetros de consulta al guardar las URL propuestas, salvo los identificadores públicos necesarios de GrupLAC/CvLAC.
-
-## Verificación y actualización
-
-Desde la raíz del proyecto:
+## Pruebas
 
 ```bash
 python3 -m unittest discover -s tests/python -v
-cmake -S . -B build
-cmake --build build
+cmake -S . -B build && cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-En Windows, sustituya `python3` por `py -3`. Las pruebas de PDF, Excel y Word omiten lo que dependa de herramientas opcionales no instaladas. Para actualizar un clon, cierre PEA-i y ejecute `git pull` desde la carpeta del proyecto; si cambió `data/pea_upc.csv` localmente, confirme o guarde esos cambios antes.
-
-Las regresiones de interfaz requieren una sesión gráfica y CustomTkinter, y se omiten si falta alguno; ejecútelas con el Python donde instaló `requirements.txt` (por ejemplo `.venv/bin/python`). Para recorrerlas también con C++, después de compilar:
-
-```bash
-PEA_TEST_CPP=build/pea_cpp python3 -m unittest discover -s tests/python -v
-```
-
-En Windows PowerShell: `$env:PEA_TEST_CPP = 'bin/windows/pea_cpp.exe'`, seguido de `py -3 -m unittest discover -s tests/python -v`. Estas pruebas usan archivos temporales y no guardan cambios en `data/`.
-
-`python3 scripts/import_upc_dataset.py` vuelve a consultar la lista de grupos públicos y fusiona los cambios en `data/pea_upc.csv` con las mismas reglas de la interfaz; necesita Internet y, si una ficha falla, ese grupo conserva sus datos anteriores. Use `--limit N` para consultar solo los primeros grupos y `--data OTRO.csv` para actualizar otro archivo. Añada `--cvlac URL` para incorporar los productos de un investigador después de los grupos; la opción puede repetirse. `python3 scripts/populate_cvlac.py` completa la categoría CvLAC de los investigadores en el mismo archivo. `python3 scripts/build_real_sample.py` genera por separado una muestra pequeña en `data/sample_scienti.csv` y no reemplaza el conjunto de 66 grupos.
+En Windows use `py -3`. Las pruebas de interfaz necesitan una sesión gráfica y CustomTkinter; para repetirlas con el motor C++, defina `PEA_TEST_CPP=build/pea_cpp`. Las pruebas no modifican `data/`.
 
 
 ### Rafael Miranda
