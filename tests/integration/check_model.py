@@ -156,7 +156,7 @@ def main() -> None:
     try:
         catalog = cpp.catalog()
         assert catalog == pea.Repository().catalog()
-        assert cpp._request("ping") == {"backend": "cpp", "protocol": "4"}
+        assert cpp._request("ping") == {"backend": "cpp", "protocol": "6"}
         for row in catalog:
             assert isinstance(row["ventana"], int)
             assert all(isinstance(row[field], float) for field in ("peso_alta", "peso_relativo", "peso_global"))

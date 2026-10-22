@@ -24,6 +24,7 @@ import_gruplac_preview = pea["import_gruplac_preview"]
 import_cvlac_preview = pea["import_cvlac_preview"]
 load_repository = pea["load_repository"]
 save_repository = pea["save_repository"]
+redact_url = pea["_redact_url"]
 
 GROUP_URL = "https://scienti.minciencias.gov.co/gruplac/jsp/visualiza/visualizagr.jsp?nro={nro}"
 
@@ -119,6 +120,8 @@ def main() -> None:
         url = GROUP_URL.format(nro=nro)
         try:
             preview = fetch_web_page(url)
+            for diagnostic in preview.diagnostics:
+                print(f"          [EXTRACCIÓN INCOMPLETA] {name}: {diagnostic}")
             counts = import_gruplac_preview(repo, preview, remember=False)
         except (DataError, OSError, ValueError) as exc:
             failures.append((name, str(exc)))
@@ -135,10 +138,12 @@ def main() -> None:
             failures.append((name, f"{len(counts['errors'])} registros o vínculos rechazados"))
 
     for index, url in enumerate(args.cvlac, start=1):
-        name = url
+        name = redact_url(url)
         try:
             preview = fetch_web_page(url)
-            name = (preview.suggested_row or {}).get("nombre", url)
+            name = (preview.suggested_row or {}).get("nombre", name)
+            for diagnostic in preview.diagnostics:
+                print(f"          [EXTRACCIÓN INCOMPLETA] {name}: {diagnostic}")
             counts = import_cvlac_preview(repo, preview, remember=False)
         except (DataError, OSError, ValueError) as exc:
             failures.append((name, str(exc)))

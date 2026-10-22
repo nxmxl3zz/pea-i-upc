@@ -349,6 +349,35 @@ class GuiTest(unittest.TestCase):
             self.wait_events(0.1)
         self.assertEqual(self.app.year_canvas.cget("bg"), pea.LIGHT_THEME["surface"])
 
+    def test_native_file_dialog_preserves_palette(self):
+        if self.root.tk.call("tk", "windowingsystem") != "x11":
+            self.skipTest("El selector Tk de archivos se verifica en X11")
+        from tkinter import filedialog
+
+        for mode, colors in (("light", pea.LIGHT_THEME), ("dark", pea.DARK_THEME)):
+            with self.subTest(mode=mode):
+                self.app.set_appearance(mode)
+                observed = {}
+
+                def inspect_and_cancel():
+                    try:
+                        observed["entry"] = self.root.tk.call("winfo", "class", ".__tk_filedialog.contents.f2.ent")
+                        for style, option in (("TFrame", "-background"), ("TLabel", "-foreground"),
+                                              ("TButton", "-foreground"), ("TEntry", "-fieldbackground")):
+                            observed[style] = self.root.tk.call("ttk::style", "lookup", style, option)
+                    except self.tk.TclError as exc:
+                        observed["error"] = str(exc)
+                    finally:
+                        self.root.tk.call(".__tk_filedialog.contents.f2.cancel", "invoke")
+
+                self.root.after(200, inspect_and_cancel)
+                with tempfile.TemporaryDirectory() as temporary:
+                    selected = filedialog.askopenfilename(parent=self.root, initialdir=temporary)
+                self.assertEqual(selected, "")
+                self.assertEqual(observed, {"entry": "TEntry", "TFrame": colors["page"],
+                                            "TLabel": colors["ink"], "TButton": colors["ink"],
+                                            "TEntry": colors["field"]})
+
     def test_appearance_switch_after_closing_a_table_dialog(self):
         fixture_f.populate(self.repo)
         self.app.refresh()
@@ -862,6 +891,65 @@ class GuiTest(unittest.TestCase):
         self.assertIn("45", summary)
         detail.destroy()
 
+    def test_existing_external_profile_opens_import_result_with_canonical_id(self):
+        fixture = Path(__file__).resolve().parents[1] / "fixtures/cvlac_productos.html"
+        url = "https://scienti.minciencias.gov.co/cvlac/visualizador/generarCurriculoCv.do?cod_rh=0000494917"
+        preview = pea.parse_web_page(fixture.read_text(encoding="utf-8"), url)
+        self.repo.create("investigadores", {"id": "I-manual", "nombre": "Anterior",
+                                           "codigo_cvlac": preview.suggested_row["codigo_cvlac"]})
+        dialog = self.app._show_web_preview(preview)
+        with patch.object(self.app, "show_import_result") as result, patch.object(self.app, "alert") as errors:
+            dialog.buttons["import"].invoke()
+        errors.assert_not_called()
+        counts, kind, key = result.call_args.args
+        self.assertEqual((kind, key, counts["errors"]), ("investigadores", "I-manual", []))
+        shown = self.app.show_import_result(counts, kind, key)
+        self.assertEqual(shown.indicator_button.cget("state"), "normal")
+        shown.indicator_button.invoke()
+        detail = next(iter(self.app.details))
+        self.assertEqual((detail.key, detail.tabs.get()), ("I-manual", "Indicador"))
+        detail.destroy()
+
+    def test_malformed_csv_load_preserves_current_workspace(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "bad.csv"
+            path.write_text('#manifest\nversion,guardado\n"5', encoding="utf-8")
+            with patch.object(self.app, "alert") as alert:
+                self.app._load(path)
+            alert.assert_called_once()
+        self.assertIsNotNone(self.app.repo.get("productos", "P-old"))
+        self.assertIsNone(self.app.data_file)
+
+    def test_backend_failure_during_load_preserves_workspace_and_backup(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "data.csv"
+            backup = pea.backup_of(path)
+            backup.parent.mkdir()
+            backup.write_text("Copia que debe conservarse", encoding="utf-8")
+            for phase in ("primary", "backup"):
+                errors = [pea.BackendError("Proceso detenido")]
+                if phase == "backup":
+                    errors.insert(0, pea.DataError("Archivo dañado"))
+                loader = (patch.object(self.repo, "load", side_effect=errors)
+                          if isinstance(self.repo, pea.CppRepository)
+                          else patch.object(pea, "load_repository", side_effect=errors))
+                with self.subTest(phase=phase), loader, \
+                        patch.object(self.app, "confirm", return_value=True) as confirm, \
+                        patch.object(self.app, "alert") as alert:
+                    self.app._load(path)
+                    self.assertEqual(confirm.call_count, 0 if phase == "primary" else 1)
+                    self.assertEqual(alert.call_args.args, ("Motor C++ no disponible", "Proceso detenido"))
+                self.assertIsNotNone(self.app.repo.get("productos", "P-old"))
+                self.assertIsNone(self.app.data_file)
+                self.assertEqual(backup.read_text(encoding="utf-8"), "Copia que debe conservarse")
+            if isinstance(self.repo, pea.CppRepository):
+                with patch.object(self.repo, "reset", side_effect=pea.BackendError("Proceso detenido")), \
+                        patch.object(self.app, "_may_discard", return_value=True), \
+                        patch.object(self.app, "alert") as alert:
+                    self.app.new_workspace()
+                alert.assert_called_once()
+                self.assertIsNotNone(self.app.repo.get("productos", "P-old"))
+
     def test_estimated_category_is_flagged_in_summary(self):
         self.repo.update("productos", "P-old", {"categoria": "ART_D", "categoria_origen": "estimada"})
         self.repo.update("productos", "P-new", {"categoria": "ART_D", "categoria_origen": "manual"})
@@ -1264,7 +1352,7 @@ class GuiTest(unittest.TestCase):
                     facts = dialog.facts
                     self.assertEqual(facts["Motor de datos"], self.app.backend_name)
                     self.assertEqual(facts["Archivo"], "Sin archivo (Guardar como crea uno)")
-                    self.assertEqual((facts["Esquema de datos"], facts["Protocolo C++"]), ("5", "4"))
+                    self.assertEqual((facts["Esquema de datos"], facts["Protocolo C++"]), ("5", pea.CPP_PROTOCOL))
                     self.assertEqual((facts["Productos"], facts["Grupos"], facts["Cola de revisión"]), ("2", "0", "1"))
                 finally:
                     dialog.close()
@@ -1523,6 +1611,140 @@ class GuiTest(unittest.TestCase):
                 self.assertTrue(self.app.edit_record(kind, key))
                 self.assertEqual(checks, [True])
                 self.assertEqual(self.repo.get(kind, key), before)
+
+
+    def test_block_7_11_entity_filters_use_one_repository_page(self):
+        for index in range(250):
+            self.repo.create("productos", {"id": f"PX{index}", "titulo": f"Extra {index}",
+                                          "activo": str(int(index % 2 == 0))})
+        for state, active in (("Activos", "1"), ("Inactivos", "0")):
+            with self.subTest(state=state), patch.object(self.repo, "page", wraps=self.repo.page) as pages:
+                result = self.app.entity_page("productos", 0, "Extra", state)
+            self.assertEqual((result["total"], len(result["rows"])), (125, 100))
+            self.assertTrue(all(row["activo"] == active for row in result["rows"]))
+            self.assertEqual(pages.call_count, 1)
+
+    def test_block_7_11_relationship_search_uses_one_page_and_caches_names(self):
+        self.repo.create("grupos", {"id": "G", "nombre": "Grupo"})
+        for index in range(150):
+            self.repo.create("investigadores", {"id": f"I{index}", "nombre": f"Ana {index}"})
+            self.repo.create("membresias", {"grupo_id": "G", "investigador_id": f"I{index}"})
+        self.app._record_cache.clear()
+        with patch.object(self.repo, "page", wraps=self.repo.page) as pages:
+            result = self.app.relationship_page("membresias", 0, "Ana")
+        self.assertEqual((result["total"], len(result["rows"])), (150, 100))
+        self.assertEqual(pages.call_count, 1)
+        for row in result["rows"]:
+            self.assertIn(("investigadores", row["investigador_id"]), self.app._record_cache)
+
+    def test_block_7_11_product_toggle_skips_unrelated_tables(self):
+        tab = self.app.entity_tabs["productos"]
+        tab.table.selection_set("P-new")
+        with patch.object(self.app.entity_tabs["grupos"], "refresh") as groups, \
+                patch.object(self.app.entity_tabs["investigadores"], "refresh") as people, \
+                patch.object(self.app.entity_tabs["planes"], "refresh") as plans, \
+                patch.object(self.app.relation_tabs["membresias"], "refresh") as memberships:
+            tab.toggle()
+        self.assertEqual(self.repo.get("productos", "P-new")["activo"], "0")
+        for refresh in (groups, people, plans, memberships):
+            refresh.assert_not_called()
+
+    def test_block_7_11_dashboard_pagination_reuses_indicator(self):
+        self.repo.create("grupos", {"id": "G", "nombre": "Grupo"})
+        for index in range(105):
+            self.repo.create("productos", {"id": f"PG{index}", "titulo": f"Producto {index}", "anio": "2025"})
+            self.repo.create("grupos_productos", {"grupo_id": "G", "producto_id": f"PG{index}"})
+        self.app.refresh()
+        self.app.view.set("Grupo")
+        self.app._scope_changed()
+        previous = self.app._indicator_result
+        with patch.object(self.repo, "indicator", wraps=self.repo.indicator) as indicator:
+            self.app._stats_move(1)
+        self.assertEqual(self.app.stats_offset, 100)
+        self.assertEqual(self.app._indicator_result, previous)
+        indicator.assert_not_called()
+        self.repo.update("productos", "PG0", {"categoria": "ART_A1"})
+        self.app.refresh()
+        self.assertEqual(self.app._indicator_result, self.repo.indicator("grupos", "G"))
+
+    def test_block_7_11_save_only_refreshes_workspace_status(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "saved.csv"
+            self.app.data_file = path
+            with patch.object(self.app.entity_tabs["productos"], "refresh") as products, \
+                    patch.object(self.app, "refresh_dashboard") as dashboard:
+                self.assertTrue(self.app.save())
+            self.assertTrue(path.is_file())
+            self.assertFalse(self.repo.dirty)
+            products.assert_not_called()
+            dashboard.assert_not_called()
+
+    def test_block_7_11_partial_import_keeps_extraction_warnings(self):
+        url = "https://scienti.minciencias.gov.co/gruplac/jsp/visualiza/visualizagr.jsp?nro=123"
+        html = ('<h1>Grupo de prueba</h1><h2>Datos básicos</h2><h2>Artículos publicados</h2>'
+                '<p>1.- Artículo: Producto válido</p><p>2025,</p>'
+                '<p>2.- Artículo: Sin fecha</p><p>Revista sin año</p><h2>Libros publicados</h2>')
+        preview = pea.parse_web_page(html, url)
+        self.assertEqual(len(preview.related_products), 1)
+        self.assertTrue(preview.diagnostics)
+        group_id = preview.suggested_row["id"]
+        self.repo.create("grupos", preview.suggested_row)
+        self.app.refresh()
+        dialog = self.app._show_web_preview(preview)
+        self.assertEqual(dialog.diagnostics, preview.diagnostics)
+        self.assertEqual(dialog.diagnostics_label.winfo_manager(), "pack")
+        self.assertIn("Sin fecha", dialog.diagnostics_label.cget("text"))
+        self.assertIn(preview.diagnostics[0], dialog.page_text.get("1.0", "end"))
+        dialog.buttons["import"].invoke()
+        result = self.app._last_dialog
+        try:
+            self.assertEqual(result.diagnostics, preview.diagnostics)
+            self.assertIn("Sin fecha", result.diagnostics_label.cget("text"))
+            self.assertEqual(result.table.item("productos", "values"), ("Productos", "1"))
+            self.assertIsNotNone(self.repo.get("grupos", group_id))
+            self.assertIsNotNone(self.repo.get("productos", preview.related_products[0]["id"]))
+        finally:
+            result.close()
+
+    def test_block_7_11_all_extraction_warnings_remain_accessible(self):
+        warnings = tuple(f"Productos GrupLAC: omitido {index} por falta de año" for index in range(7))
+        preview = pea.parse_web_page("<h1>Fuente de prueba</h1>", "https://example.org")._replace(
+            diagnostics=warnings)
+        dialog = self.app._show_web_preview(preview)
+        try:
+            self.assertIn("7", dialog.diagnostics_label.cget("text"))
+            for warning in warnings:
+                self.assertIn(warning, dialog.page_text.get("1.0", "end"))
+        finally:
+            dialog.close()
+        result = self.app.show_import_result({}, "productos", "P-old", diagnostics=warnings)
+        try:
+            with patch.object(self.app, "inform") as inform:
+                result.buttons["diagnostics"].invoke()
+            self.assertEqual(inform.call_args.args[1], "\n".join(warnings))
+        finally:
+            result.close()
+
+    def test_block_7_11_local_pdf_shows_warning_before_import(self):
+        url = "https://scienti.minciencias.gov.co/gruplac/jsp/visualiza/visualizagr.jsp?nro=456"
+        text = "Grupo PDF\nDatos básicos\nAño y mes de formación\n2025-99\nClasificación\nA1"
+        events = []
+
+        def accept(kind, row):
+            events.append("import")
+            self.repo.create(kind, row)
+
+        with patch("tkinter.filedialog.askopenfilename", return_value="fixture.pdf"), \
+                patch.object(self.app, "ask_text", return_value=url), \
+                patch.object(pea, "extract_pdf_text", return_value=text) as extract, \
+                patch.object(self.app, "inform", side_effect=lambda *_args, **_kw: events.append("warning")) as inform, \
+                patch.object(self.app, "_accept_external", side_effect=accept):
+            self.app.import_pdf()
+        self.assertEqual(events, ["warning", "import"])
+        self.assertIn("fecha de formación inválida", inform.call_args.args[1])
+        self.assertEqual(extract.call_count, 1)
+        self.assertEqual(self.repo.get("grupos", "G-456")["nombre"], "Grupo PDF")
+        self.assertEqual(self.repo.get("grupos", "G-456")["fecha_creacion"], "")
 
 
 class CppGuiTest(GuiTest):
