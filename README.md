@@ -30,8 +30,8 @@ CMakeLists.txt                    Compilación C++
 Se necesita Python 3.10 o posterior con Tkinter y CustomTkinter (`requirements.txt`). Si falta CustomTkinter, PEA-i ofrece instalarlo la primera vez que se abre.
 
 - **Windows (64 bits):** doble clic en **`Iniciar PEA-i.pyw`**, o `py -3 src/python/Taller2_REMR.py`. Usa el ejecutable incluido `bin/windows/pea_cpp.exe`, que solo se acepta si su SHA-256 coincide con las fuentes; no hace falta compilar.
-- **Linux:** `python3 src/python/Taller2_REMR.py`. Si el Python del sistema no admite `pip` (PEP 668), cree un entorno virtual con `python3 -m venv .venv` y `.venv/bin/pip install -r requirements.txt`, y ejecute con `.venv/bin/python`. Con CMake y un compilador C++17, la ventana compila el motor C++ cuando hace falta.
-- **Solo la consola C++:** `bin\windows\pea_cpp.exe` en Windows; en Linux `cmake -S . -B build && cmake --build build && ./build/pea_cpp`.
+- **Linux:** `python3 src/python/Taller2_REMR.py`. Si el Python del sistema no admite `pip` (PEP 668), cree un entorno virtual con `python3 -m venv .venv` y `.venv/bin/pip install -r requirements.txt`, y ejecute con `.venv/bin/python`. Con CMake y un compilador C++17, la ventana compila el motor C++ en Release cuando hace falta.
+- **Solo la consola C++:** `bin\windows\pea_cpp.exe` en Windows; en Linux `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release && ./build/pea_cpp`.
 
 Opciones: `--data ARCHIVO` abre otro archivo de datos, `--python-backend` fuerza el motor Python y `--cpp-binary RUTA` usa otro ejecutable C++. El motor activo aparece en **Ayuda → Acerca de PEA-i**.
 
@@ -68,7 +68,8 @@ La ventana importa CSV, Excel `.xlsx` (con `openpyxl`), URL públicas (fichas Gr
 
 ```bash
 python3 -m unittest discover -s tests/python -v
-cmake -S . -B build && cmake --build build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
 ctest --test-dir build --output-on-failure
 ```
 

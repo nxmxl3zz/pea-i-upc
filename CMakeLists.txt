@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.16)
 project(pea_i_upc LANGUAGES CXX)
 
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type for single-configuration generators" FORCE)
+endif()
+
 add_executable(pea_cpp src/cpp/Taller2_REMR.cpp)
 target_compile_features(pea_cpp PRIVATE cxx_std_17)
 set_target_properties(pea_cpp PROPERTIES CXX_EXTENSIONS OFF)

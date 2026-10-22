@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from contextlib import contextmanager, nullcontext
 from datetime import date, datetime
 import hashlib
 from html.parser import HTMLParser
@@ -30,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from typing import Any, Callable, Iterator, NamedTuple
 import unicodedata
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -108,6 +110,8 @@ VALIDATION_STATES = ("validado", "rechazado")
 AUTO_REASON_PREFIX = "reglas:"
 LONG_FIELDS = {"descripcion", "objetivos", "mision", "vision", "lineas", "observacion", "objetivo", "indicador", "meta", "actividad", "fuente"}
 MAX_FIELD_LEN = 100_000
+MAX_HISTORY_BYTES = 64 * 1024 * 1024
+csv.field_size_limit(MAX_HISTORY_BYTES)
 MAX_CSV_ROWS = 500_000
 MAX_PDF_TEXT = 5_000_000
 MAX_PDF_MEMORY = 512 * 1024 * 1024
@@ -319,6 +323,10 @@ class DataError(ValueError):
     """Dato inválido o relación que rompería la integridad."""
 
 
+class BackendError(DataError):
+    """La comunicación falló; no se puede continuar la operación como un rechazo de fila."""
+
+
 class ListNode:
     def __init__(self, value: dict[str, str]):
         self.value = value
@@ -471,6 +479,8 @@ class LinkedStack:
         self.limit = limit
 
     def push(self, value: str) -> None:
+        if len(value.encode("utf-8")) > MAX_HISTORY_BYTES:
+            raise DataError("La acción supera el límite de 64 MiB del historial")
         self.top = StackNode(value, self.top)
         self.length += 1
         if self.length > self.limit:
@@ -589,6 +599,8 @@ def clean_row(kind: str, values: dict[str, Any]) -> dict[str, str]:
             row["anio"] = row["fecha"][:4]
         if row["anio"]:
             try:
+                if not re.fullmatch(r"[0-9]{4}", row["anio"]):
+                    raise ValueError("Formato de año")
                 year = int(row["anio"])
             except ValueError as exc:
                 raise DataError("Año inválido") from exc
@@ -607,11 +619,15 @@ def clean_row(kind: str, values: dict[str, Any]) -> dict[str, str]:
         if row["validacion"] not in (*VALIDATION_STATES, "pendiente"):
             raise DataError("Validación: validado o rechazado")
     if kind == "autorias" and row["orden"]:
-        if not row["orden"].isdigit() or int(row["orden"]) < 1:
+        significant = row["orden"].lstrip("0")
+        if (not re.fullmatch(r"[0-9]+", row["orden"]) or not significant or len(significant) > 19
+                or (len(significant) == 19 and significant > "9223372036854775807")):
             raise DataError("Orden de autor debe ser positivo")
     for field in ("fecha", "fecha_creacion", "inicio", "fin"):
         if field in row and row[field]:
             try:
+                if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", row[field]):
+                    raise ValueError("Formato de fecha")
                 date.fromisoformat(row[field])
             except ValueError as exc:
                 raise DataError(f"{LABELS[field]} debe ser AAAA-MM-DD") from exc
@@ -622,7 +638,7 @@ def clean_row(kind: str, values: dict[str, Any]) -> dict[str, str]:
         if row["inicio"] > row["fin"]:
             raise DataError("La fecha final precede la inicial")
     for field, value in row.items():
-        if len(value) > MAX_FIELD_LEN:
+        if len(value.encode("utf-8")) > MAX_FIELD_LEN:
             raise DataError(f"El campo {LABELS.get(field, field)} supera el tamaño permitido")
     return row
 
@@ -689,6 +705,8 @@ def auto_reason_codes(reason: str) -> list[str] | None:
 class Repository:
     """Operaciones del dominio. Las entidades viven en listas; relaciones en multilistas."""
 
+    _external_fields = {"grupos": "codigo_gruplac", "investigadores": "codigo_cvlac", "productos": "doi"}
+
     def __init__(self) -> None:
         self.entities = {name: DoublyLinkedList() for name in ENTITY_FIELDS}
         self.relations = {
@@ -697,6 +715,10 @@ class Repository:
         self.history = LinkedStack()
         self.queue = LinkedQueue()
         self.issues: dict[str, tuple[str, ...]] = {}
+        self._batch_changes: list[list[dict[str, str]]] | None = None
+        self._batch_bytes = 0
+        self._external_index: dict[str, dict[str, str]] = {kind: {} for kind in self._external_fields}
+        self._indicator_population: dict[tuple[Any, ...], tuple[dict[str, float], int]] = {}
         self.dirty = False
 
     def catalog(self) -> list[dict[str, Any]]:
@@ -713,17 +735,50 @@ class Repository:
             rows.sort(key=lambda row: (row[left], row[right]))
         return rows
 
+    @staticmethod
+    def _matches(row: dict[str, str], needle: str) -> bool:
+        return not needle or needle in " ".join(value for _, value in sorted(row.items()) if value).casefold()
+
+    def _page_references(self, kind: str, rows: list[dict[str, str]], side: str = "") -> dict[str, Any]:
+        left, right, left_kind, right_kind = RELATION_ENDS[kind]
+        ends = ((left, left_kind), (right, right_kind)) if not side else (
+            ((right, right_kind),) if side == "left" else ((left, left_kind),))
+        return {entity_kind: [self.get(entity_kind, key).copy() for key in dict.fromkeys(row[field] for row in rows)]
+                for field, entity_kind in ends}
+
     def page(self, kind: str, offset: int = 0, limit: int = PAGE_SIZE,
-             query: str = "") -> dict[str, Any]:
+             query: str = "", *, active: str = "", group_id: str = "",
+             include_references: bool = False) -> dict[str, Any]:
         source = self.entities.get(kind) or self.relations.get(kind)
         if source is None:
             raise DataError(f"Tipo desconocido: {kind}")
+        if active not in ("", "0", "1"):
+            raise DataError("Activo debe ser 0 o 1")
+        if group_id and kind != "planes":
+            raise DataError("El filtro de grupo solo se admite para planes")
+        if include_references and kind not in RELATION_ENDS:
+            raise DataError("La búsqueda de extremos solo se admite para relaciones")
         needle = query.casefold().strip()
-        rows = (row for row in source if not needle or needle in " ".join(row.values()).casefold())
+
+        def matches(row: dict[str, str]) -> bool:
+            if (active and row["activo"] != active) or (group_id and row["grupo_id"] != group_id):
+                return False
+            if self._matches(row, needle):
+                return True
+            if include_references:
+                left, right, left_kind, right_kind = RELATION_ENDS[kind]
+                return (self._matches(self.get(left_kind, row[left]), needle)
+                        or self._matches(self.get(right_kind, row[right]), needle))
+            return False
+
+        rows = (row for row in source if matches(row))
         if kind in RELATION_ENDS:
             left, right = RELATION_ENDS[kind][:2]
             matches = sorted(rows, key=lambda row: (row[left], row[right]))
-            return {"rows": [row.copy() for row in matches[offset:offset + limit]], "total": len(matches)}
+            result = {"rows": [row.copy() for row in matches[offset:offset + limit]], "total": len(matches)}
+            if include_references:
+                result["references"] = self._page_references(kind, result["rows"])
+            return result
         page_rows = []
         total = 0
         for row in rows:
@@ -771,6 +826,7 @@ class Repository:
         return tuple(failed)
 
     def _revalidate(self, product_ids: Any) -> None:
+        self._indicator_population.clear()
         for product_id in set(product_ids):
             product = self.get("productos", product_id)
             if product is None:
@@ -804,22 +860,40 @@ class Repository:
         return None
 
     def related(self, kind: str, key: str, side: str) -> list[dict[str, str]]:
+        if kind not in RELATION_ENDS:
+            raise DataError(f"Relación desconocida: {kind}")
+        if side not in ("left", "right"):
+            raise DataError("Extremo desconocido")
         relation = self.relations[kind]
         return list(relation.by_left(key) if side == "left" else relation.by_right(key))
 
     def related_page(self, kind: str, key: str, side: str, offset: int = 0,
-                     limit: int = PAGE_SIZE, active_only: bool = False) -> dict[str, Any]:
+                     limit: int = PAGE_SIZE, active_only: bool = False,
+                     query: str = "", *, include_references: bool = False) -> dict[str, Any]:
+        if kind not in RELATION_ENDS:
+            raise DataError(f"Relación desconocida: {kind}")
+        if side not in ("left", "right"):
+            raise DataError("Extremo desconocido")
         relation = self.relations[kind]
         source = relation.by_left(key) if side == "left" else relation.by_right(key)
+        needle = query.casefold().strip()
+        left, right, left_kind, right_kind = RELATION_ENDS[kind]
+        other_field, other_kind = (right, right_kind) if side == "left" else (left, left_kind)
         rows = []
         total = 0
         for row in source:
             if active_only and row["activo"] != "1":
                 continue
+            if (needle and not self._matches(row, needle)
+                    and not self._matches(self.get(other_kind, row[other_field]), needle)):
+                continue
             if offset <= total < offset + limit:
                 rows.append(row.copy())
             total += 1
-        return {"rows": rows, "total": total}
+        result = {"rows": rows, "total": total}
+        if include_references:
+            result["references"] = self._page_references(kind, rows, side)
+        return result
 
     def history_size(self) -> int:
         return self.history.length
@@ -847,11 +921,53 @@ class Repository:
             fresh.queue.enqueue(job)
         self.entities, self.relations, self.queue = fresh.entities, fresh.relations, fresh.queue
         self.issues = fresh.issues
+        self._external_index = fresh._external_index
+        self._indicator_population.clear()
         self.dirty = True
 
-    def _remember(self) -> None:
-        self.history.push(self.snapshot())
+    @staticmethod
+    def _undo_row(op: str, kind: str, row: dict[str, str]) -> dict[str, str]:
+        return {**row, "__op": op, "__kind": kind}
+
+    def _remember(self, changes: list[dict[str, str]]) -> None:
+        if not changes:
+            return
+        state = json.dumps({"__undo": changes}, ensure_ascii=False, separators=(",", ":"))
+        size = len(state.encode("utf-8"))
+        if size + self._batch_bytes > MAX_HISTORY_BYTES:
+            raise DataError("La acción supera el límite de 64 MiB del historial")
+        if self._batch_changes is None:
+            self.history.push(state)
+        else:
+            self._batch_changes.append(changes)
+            self._batch_bytes += size
         self.dirty = True
+
+    def begin_batch(self) -> None:
+        if self._batch_changes is not None:
+            raise DataError("Ya hay una importación en curso")
+        self._batch_changes = []
+        self._batch_bytes = 0
+
+    def end_batch(self) -> None:
+        if self._batch_changes is None:
+            raise DataError("No hay una importación en curso")
+        changes = [row for operation in reversed(self._batch_changes) for row in operation]
+        self._batch_changes = None
+        self._batch_bytes = 0
+        self._remember(changes)
+
+    @contextmanager
+    def batch(self):
+        self.begin_batch()
+        try:
+            yield
+        finally:
+            self.end_batch()
+
+    def _outside_batch(self) -> None:
+        if self._batch_changes is not None:
+            raise DataError("Termine la importación antes de cambiar el archivo o el historial")
 
     @staticmethod
     def _decode_delta(snapshot: str) -> list[dict[str, str]] | None:
@@ -861,7 +977,7 @@ class Repository:
         if set(state) != {"__undo"} or not isinstance(state["__undo"], list) or not state["__undo"]:
             raise DataError("Historial de cambios inválido")
         for change in state["__undo"]:
-            if not isinstance(change, dict):
+            if not isinstance(change, dict) or any(not isinstance(value, str) for value in change.values()):
                 raise DataError("Historial de cambios inválido")
             op, kind = change.get("__op"), change.get("__kind")
             if op == "queue_remove":
@@ -881,7 +997,89 @@ class Repository:
                 raise DataError("Operación de historial desconocida")
         return state["__undo"]
 
+    def _validate_delta(self, changes: list[dict[str, str]]) -> None:
+        # Simula solo las claves afectadas. Un historial incoherente no puede deshacer media acción.
+        pending: dict[str, dict[Any, dict[str, str] | None]] = {kind: {} for kind in ALL_FIELDS}
+        jobs = {job["id"]: job for job in self.queue}
+        external_owners: dict[tuple[str, str], str | None] = {}
+
+        def row_key(kind: str, row: dict[str, str]) -> str | tuple[str, str]:
+            return row["id"] if kind in ENTITY_FIELDS else tuple(row[name] for name in RELATION_ENDS[kind][:2])
+
+        def get(kind: str, key: Any) -> dict[str, str] | None:
+            return pending[kind][key] if key in pending[kind] else self.get(kind, key)
+
+        def rows(kind: str) -> Iterator[dict[str, str]]:
+            source = self.entities[kind] if kind in ENTITY_FIELDS else self.relations[kind]
+            for row in source:
+                effective = get(kind, row_key(kind, row))
+                if effective is not None:
+                    yield effective
+            for key, row in pending[kind].items():
+                if row is not None and self.get(kind, key) is None:
+                    yield row
+
+        for change in changes:
+            op, kind = change["__op"], change["__kind"]
+            if op == "queue_remove":
+                if jobs.pop(change["id"], None) is None:
+                    raise DataError("Trabajo de historial no encontrado")
+                continue
+            if op == "queue_prepend":
+                job = {name: change[name] for name in QUEUE_FIELDS}
+                if (not job["id"] or not job["creado"] or job["id"] in jobs
+                        or get("productos", job["producto_id"]) is None):
+                    raise DataError("Trabajo de historial inválido")
+                jobs[job["id"]] = job
+                continue
+            row = _legacy_row(kind, {name: value for name, value in change.items() if not name.startswith("__")})
+            if op != "delete":
+                row = clean_row(kind, row)
+            key = row_key(kind, row)
+            current = get(kind, key)
+            if (op == "create" and current is not None) or (op != "create" and current is None):
+                raise DataError("Historial incompatible con los registros actuales")
+            if op == "delete":
+                if kind == "grupos" and any(plan["grupo_id"] == key for plan in rows("planes")):
+                    raise DataError("El grupo del historial aún tiene planes")
+                for rel, (left, right, left_kind, right_kind) in RELATION_ENDS.items():
+                    endpoint = left if kind == left_kind else right if kind == right_kind else None
+                    if endpoint and any(link[endpoint] == key for link in rows(rel)):
+                        raise DataError("El registro del historial aún tiene relaciones")
+                if kind == "productos" and any(job["producto_id"] == key for job in jobs.values()):
+                    raise DataError("El producto del historial aún tiene revisiones")
+                external = self._external_fields.get(kind)
+                if external:
+                    normalized = self._normalized_external(kind, current[external])
+                    if normalized:
+                        external_owners[kind, normalized] = None
+                pending[kind][key] = None
+                continue
+            if kind == "planes" and get("grupos", row["grupo_id"]) is None:
+                raise DataError("El grupo del plan de historial no existe")
+            if kind in RELATION_ENDS:
+                left, right, left_kind, right_kind = RELATION_ENDS[kind]
+                if get(left_kind, row[left]) is None or get(right_kind, row[right]) is None:
+                    raise DataError("La relación del historial apunta a una entidad inexistente")
+            external = self._external_fields.get(kind)
+            if external:
+                normalized = self._normalized_external(kind, row[external])
+                previous = self._normalized_external(kind, current[external]) if current is not None else ""
+                if normalized:
+                    identity = (kind, normalized)
+                    owner = (external_owners[identity] if identity in external_owners
+                             else self._external_index[kind].get(normalized))
+                    if owner is not None and owner != key:
+                        raise DataError("Identidad externa duplicada en el historial")
+                if previous and previous != normalized:
+                    external_owners[kind, previous] = None
+                if normalized:
+                    external_owners[kind, normalized] = key
+            pending[kind][key] = row
+
     def _apply_delta(self, changes: list[dict[str, str]]) -> None:
+        self._validate_delta(changes)
+        self.dirty = True
         for change in changes:
             op, kind = change["__op"], change["__kind"]
             if op == "queue_remove":
@@ -902,11 +1100,17 @@ class Repository:
                     current = self.get(kind, key)
                     if current is None:
                         raise DataError("Registro de historial no encontrado")
+                    row = clean_row(kind, row)
+                    self._check_links(kind, row)
+                    if kind in ENTITY_FIELDS:
+                        self._unique_external(kind, row, str(key))
+                        self._reindex_external(kind, current, row)
                     current.update(row)
                     self._revalidate(self._affected_products(kind, current))
         self.dirty = True
 
     def undo(self) -> bool:
+        self._outside_batch()
         previous = self.history.peek()
         if previous is None:
             return False
@@ -919,6 +1123,7 @@ class Repository:
         return True
 
     def clear_history(self) -> None:
+        self._outside_batch()
         self.history.clear()
         self.dirty = True
 
@@ -930,17 +1135,39 @@ class Repository:
             if not self.get(left_kind, row[left]) or not self.get(right_kind, row[right]):
                 raise DataError("La relación apunta a una entidad inexistente")
 
+    @staticmethod
+    def _normalized_external(kind: str, value: str) -> str:
+        return _doi_text(value) if kind == "productos" else value.strip().lower()
+
     def _unique_external(self, kind: str, row: dict[str, str], old_id: str = "") -> None:
-        field = {"grupos": "codigo_gruplac", "investigadores": "codigo_cvlac", "productos": "doi"}.get(kind)
-        if not field or not row[field]:
+        field = self._external_fields.get(kind)
+        if field:
+            normalized = self._normalized_external(kind, row[field])
+            owner = self._external_index[kind].get(normalized) if normalized else None
+            if owner is not None and owner != old_id:
+                raise DataError(f"{LABELS[field]} ya registrado en {owner}")
+
+    def _reindex_external(self, kind: str, old: dict[str, str] | None,
+                          new: dict[str, str] | None) -> None:
+        field = self._external_fields.get(kind)
+        if not field:
             return
-        normalized = row[field].strip().lower().removeprefix("https://doi.org/") if field == "doi" else row[field].strip().lower()
-        for existing in self.entities[kind]:
-            if existing["id"] == old_id or not existing[field]:
-                continue
-            candidate = existing[field].strip().lower().removeprefix("https://doi.org/") if field == "doi" else existing[field].strip().lower()
-            if candidate == normalized:
-                raise DataError(f"{LABELS[field]} ya registrado en {existing['id']}")
+        previous = self._normalized_external(kind, old[field]) if old is not None else ""
+        current = self._normalized_external(kind, new[field]) if new is not None else ""
+        if previous == current:
+            return
+        if current:
+            self._external_index[kind][current] = new["id"]
+        if previous:
+            del self._external_index[kind][previous]
+
+    def find_external(self, kind: str, value: str) -> dict[str, str] | None:
+        if kind not in self._external_fields:
+            raise DataError("Tipo sin identidad externa")
+        needle = self._normalized_external(kind, value)
+        owner = self._external_index[kind].get(needle) if needle else None
+        row = self.get(kind, owner) if owner is not None else None
+        return row.copy() if row is not None else None
 
     def create(self, kind: str, values: dict[str, Any], remember: bool = True) -> dict[str, str]:
         row = clean_row(kind, values)
@@ -954,9 +1181,11 @@ class Repository:
             if self.get(kind, (row[left], row[right])):
                 raise DataError("Relación duplicada")
         if remember:
-            self._remember()
+            fields = ("id",) if kind in ENTITY_FIELDS else RELATION_ENDS[kind][:2]
+            self._remember([self._undo_row("delete", kind, {field: row[field] for field in fields})])
         if kind in ENTITY_FIELDS:
             self.entities[kind].append(row)
+            self._reindex_external(kind, None, row)
         else:
             self.relations[kind].add(row)
         self._revalidate(self._affected_products(kind, row))
@@ -979,7 +1208,9 @@ class Repository:
         if kind in ENTITY_FIELDS:
             self._unique_external(kind, updated, current["id"])
         if remember:
-            self._remember()
+            self._remember([self._undo_row("replace", kind, current)])
+        if kind in ENTITY_FIELDS:
+            self._reindex_external(kind, current, updated)
         current.update(updated)
         self._revalidate(self._affected_products(kind, current))
         return current
@@ -998,9 +1229,10 @@ class Repository:
             if kind == "productos" and any(job["producto_id"] == key for job in self.queue):
                 raise DataError("Hay revisiones pendientes para el producto")
         if remember:
-            self._remember()
+            self._remember([self._undo_row("create", kind, row)])
         affected = self._affected_products(kind, row)
         if kind in ENTITY_FIELDS:
+            self._reindex_external(kind, row, None)
             self.entities[kind].remove(str(key))
         else:
             self.relations[kind].remove(*key)
@@ -1177,15 +1409,23 @@ class Repository:
                 groups_of.setdefault(researcher_id, set()).add(membership["grupo_id"])
 
         raw = self._indicator_raw(kind, key, cutoff, start, status, groups_of)
-        maxima = raw["valores"].copy()
-        population = 1
-        for other in self.entities[kind]:
-            if other["activo"] != "1" or other["id"] == key:
-                continue
-            population += 1
-            values = self._indicator_raw(kind, other["id"], cutoff, start, status, groups_of)["valores"]
-            for name in maxima:
-                maxima[name] = max(maxima[name], values[name])
+        cache_key = (kind, start, end, status, cutoff)
+        cached = self._indicator_population.get(cache_key)
+        if cached is None:
+            maxima = raw["valores"].copy()
+            population = 1
+            for other in self.entities[kind]:
+                if other["activo"] != "1" or other["id"] == key:
+                    continue
+                population += 1
+                values = self._indicator_raw(kind, other["id"], cutoff, start, status, groups_of)["valores"]
+                for name in maxima:
+                    maxima[name] = max(maxima[name], values[name])
+            if len(self._indicator_population) >= 16:
+                del self._indicator_population[next(iter(self._indicator_population))]
+            self._indicator_population[cache_key] = (maxima, population)
+        else:
+            maxima, population = cached
 
         def term(name: str) -> dict[str, float]:
             value, maximum = raw["valores"][name], maxima[name]
@@ -1233,17 +1473,20 @@ class Repository:
             raise DataError("Producto inexistente")
         if any(job["producto_id"] == product_id for job in self.queue):
             raise DataError("El producto ya está en la cola")
-        self._remember()
-        self.queue.enqueue(self._new_job(product_id, reason))
+        job = self._new_job(product_id, reason)
+        self._remember([self._undo_row("queue_remove", "", {"id": job["id"]})])
+        self.queue.enqueue(job)
     def enqueue_rejected(self) -> int:
         """Encola los productos activos rechazados que aún no esperan revisión (una acción)."""
         queued = {job["producto_id"] for job in self.queue}
         targets = [row["id"] for row in self.entities["productos"]
                    if row["activo"] == "1" and row["validacion"] == "rechazado" and row["id"] not in queued]
         if targets:
-            self._remember()
-            for product_id in targets:
-                self.queue.enqueue(self._new_job(product_id, AUTO_REASON_PREFIX + ",".join(self.issues.get(product_id, ()))))
+            jobs = [self._new_job(product_id, AUTO_REASON_PREFIX + ",".join(self.issues.get(product_id, ())))
+                    for product_id in targets]
+            self._remember([self._undo_row("queue_remove", "", {"id": job["id"]}) for job in jobs])
+            for job in jobs:
+                self.queue.enqueue(job)
         return len(targets)
     def process_review(self, observation: str) -> dict[str, str]:
         """Cierra la revisión del frente con una nota; la validación sigue siendo automática."""
@@ -1256,18 +1499,42 @@ class Repository:
         if current is None:
             raise DataError("El producto ya no existe")
         clean_row("productos", {**current, "observacion": observation})
-        self._remember()
+        self._remember([self._undo_row("replace", "productos", current),
+                        self._undo_row("queue_prepend", "", job)])
         self.update("productos", job["producto_id"], {"observacion": observation}, remember=False)
         self.queue.dequeue()
         return {**job, "validacion": current["validacion"]}
     def discard_review(self) -> dict[str, str]:
         if not self.queue.peek():
             raise DataError("La cola está vacía")
-        self._remember()
+        self._remember([self._undo_row("queue_prepend", "", self.queue.peek())])
         return self.queue.dequeue()  # type: ignore[return-value]
 
 def _storage_cell(value: str) -> str:
     return "'" + value if value.startswith(("=", "+", "-", "@", "\t", "\r", "'")) else value
+
+
+def _csv_lines(stream: Any, path: Path, allow_blank: bool) -> Iterator[str]:
+    quoted = False
+    for number, line in enumerate(stream, start=1):
+        if not allow_blank and not quoted and line in ("\n", "\r", "\r\n"):
+            raise DataError(f"{path.name}, línea {number}: fila CSV vacía")
+        # csv.strict comprueba cierres y escapes, pero acepta comillas en campos sin entrecomillar.
+        for match in re.finditer('"', line):
+            position = match.start()
+            if not quoted and position and line[position - 1] not in ',\r\n"':
+                raise DataError(f"{path.name}, línea {number}: comilla CSV mal ubicada")
+            quoted = not quoted
+        yield line
+
+
+@contextmanager
+def _csv_input(path: Path, *, allow_blank: bool = True):
+    with path.open("r", encoding="utf-8-sig", newline="") as stream:
+        try:
+            yield _csv_lines(stream, path, allow_blank)
+        except csv.Error as exc:
+            raise DataError(f"{path.name}: CSV inválido: {exc}") from exc
 
 
 def _csv_read(path: Path, fields: tuple[str, ...], *, version: str = SCHEMA_VERSION,
@@ -1275,8 +1542,8 @@ def _csv_read(path: Path, fields: tuple[str, ...], *, version: str = SCHEMA_VERS
     # Las carpetas v1 a v3 usan el encabezado de productos anterior a v5.
     # Los CSV sueltos aceptan ambos encabezados, también con un nombre de archivo distinto.
     legacy = version in ("1", "2")
-    with path.open("r", encoding="utf-8-sig", newline="") as stream:
-        reader = csv.DictReader(stream)
+    with _csv_input(path, allow_blank=False) as stream:
+        reader = csv.DictReader(stream, strict=True)
         actual = set(reader.fieldnames or ())
         product_fields = fields == ENTITY_FIELDS["productos"]
         expected_fields = PRODUCT_FIELDS_V4 if product_fields and version in FOLDER_VERSIONS else fields
@@ -1288,7 +1555,8 @@ def _csv_read(path: Path, fields: tuple[str, ...], *, version: str = SCHEMA_VERS
             actual == expected | {"categoria"}
             or (version == "1" and actual in ((expected | {"categoria"}) - {"validacion"},
                                               expected - {"validacion"})))
-        if reader.fieldnames is None or not (actual == expected or v4_products or old_groups or old_products):
+        if (reader.fieldnames is None or len(reader.fieldnames) != len(actual)
+                or not (actual == expected or v4_products or old_groups or old_products)):
             raise DataError(f"Encabezados incorrectos en {path.name}; se esperan: {', '.join(expected_fields)}")
         rows = []
         for number, row in enumerate(reader, start=2):
@@ -1302,14 +1570,20 @@ def _csv_read(path: Path, fields: tuple[str, ...], *, version: str = SCHEMA_VERS
         return rows
 
 
-def _csv_write(path: Path, fields: tuple[str, ...], rows: list[dict[str, str]]) -> None:
+@contextmanager
+def _csv_output(path: Path):
     with path.open("w", encoding="utf-8", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=fields, lineterminator="\n")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({field: _storage_cell(row.get(field, "")) for field in fields})
+        yield csv.writer(stream, lineterminator="\n")
         stream.flush()
         os.fsync(stream.fileno())
+
+
+def _csv_write(path: Path, fields: tuple[str, ...], rows: list[dict[str, str]],
+               *, spreadsheet: bool = False) -> None:
+    encode = _neutralize_cell if spreadsheet else _storage_cell
+    with _csv_output(path) as writer:
+        writer.writerow(fields)
+        writer.writerows([encode(row.get(field, "")) for field in fields] for row in rows)
 
 
 def _cell_text(value: Any) -> str:
@@ -1390,24 +1664,14 @@ def _neutralize_cell(value: str) -> str:
     return value
 
 
-def _csv_write_safe(path: Path, fields: tuple[str, ...], rows: list[dict[str, str]]) -> None:
-    with path.open("w", encoding="utf-8", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=fields, lineterminator="\n")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({field: _neutralize_cell(row.get(field, "")) for field in fields})
-        stream.flush()
-        os.fsync(stream.fileno())
-
-
 def export_repository_spreadsheet(repo: Repository | CppRepository, directory: Path) -> None:
     """Exporta los datos neutralizados para abrirlos en hojas de cálculo sin fórmulas."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    _csv_write_safe(directory / "manifest.csv", MANIFEST_FIELDS,
-                    [{"version": SCHEMA_VERSION, "guardado": datetime.now().isoformat(timespec="seconds")}])
+    _csv_write(directory / "manifest.csv", MANIFEST_FIELDS,
+               [{"version": SCHEMA_VERSION, "guardado": datetime.now().isoformat(timespec="seconds")}], spreadsheet=True)
     for kind, fields in ALL_FIELDS.items():
-        _csv_write_safe(directory / f"{kind}.csv", fields, repo.rows(kind))
+        _csv_write(directory / f"{kind}.csv", fields, repo.rows(kind), spreadsheet=True)
 
 
 def is_folder_data(path: Path) -> bool:
@@ -1426,6 +1690,7 @@ def backup_of(path: Path) -> Path:
 
 def save_repository(repo: Repository, path: Path) -> None:
     """Escribe el archivo único en un temporal y lo sustituye de una vez; conserva la copia anterior."""
+    repo._outside_batch()
     path = Path(path)
     if path.is_dir():
         raise DataError("Indique un archivo .csv, no una carpeta")
@@ -1436,14 +1701,11 @@ def save_repository(repo: Repository, path: Path) -> None:
               "historial": [{"orden": str(index), "snapshot": state} for index, state in enumerate(repo.history)]}
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
-        with temporary.open("w", encoding="utf-8", newline="") as stream:
-            writer = csv.writer(stream, lineterminator="\n")
+        with _csv_output(temporary) as writer:
             for section, fields in DATA_SECTIONS.items():
                 writer.writerow([f"#{section}"])
                 writer.writerow(fields)
                 writer.writerows([_storage_cell(row.get(field, "")) for field in fields] for row in tables[section])
-            stream.flush()
-            os.fsync(stream.fileno())
         if path.exists():
             backup = backup_of(path)
             backup.parent.mkdir(exist_ok=True)
@@ -1465,8 +1727,8 @@ def read_data_sections(path: Path) -> Iterator[tuple[str, int, dict[str, str]]]:
     expected = iter(DATA_SECTIONS)
     section, header, count, previous = "", None, 0, 0
     version = ""
-    with path.open("r", encoding="utf-8-sig", newline="") as stream:
-        reader = csv.reader(stream)
+    with _csv_input(path) as stream:
+        reader = csv.reader(stream, strict=True)
         for record in reader:
             line, previous = previous + 1, reader.line_num
             where = f"{path.name}, línea {line}"
@@ -1508,7 +1770,11 @@ def read_data_sections(path: Path) -> Iterator[tuple[str, int, dict[str, str]]]:
 
 
 def _load_history(repo: Repository, entries: list[dict[str, str]]) -> None:
+    if len(entries) > 30:
+        raise DataError("Historial supera 30 acciones")
     for entry in reversed(entries):
+        if len(entry["snapshot"].encode("utf-8")) > MAX_HISTORY_BYTES:
+            raise DataError("El historial supera 64 MiB")
         # Cada snapshot se verifica antes de incorporarlo al historial.
         validator = Repository()
         try:
@@ -1542,6 +1808,8 @@ def _load_file(path: Path) -> Repository:
                 job_ids.add(row["id"])
                 repo.queue.enqueue(row)
             else:
+                if len(history) >= 30:
+                    raise DataError("El historial supera 30 acciones")
                 history.append(row)
         except DataError as exc:
             raise DataError(f"{path.name}, línea {line} (#{section}): {exc}") from exc
@@ -1603,17 +1871,14 @@ def merge_csv(repo: Repository, path: Path, kind: str) -> tuple[int, list[str]]:
     if kind not in ALL_FIELDS:
         raise DataError("Tipo de CSV desconocido")
     rows = _csv_read(Path(path), ALL_FIELDS[kind])
-    before = repo.snapshot()
     accepted, errors = 0, []
-    for number, row in enumerate(rows, start=2):
-        try:
-            repo.create(kind, row, remember=False)
-            accepted += 1
-        except DataError as exc:
-            errors.append(f"Fila {number}: {exc}")
-    if accepted:
-        repo.history.push(before)
-        repo.dirty = True
+    with repo.batch():
+        for number, row in enumerate(rows, start=2):
+            try:
+                repo.create(kind, row)
+                accepted += 1
+            except DataError as exc:
+                errors.append(f"Fila {number}: {exc}")
     return accepted, errors
 
 
@@ -1668,7 +1933,9 @@ def cpp_executable(explicit: Path | None = None) -> Path:
         return binary
     candidates = [root / "build" / "mingw" / "pea_cpp.exe",
                   root / "build" / "default" / "Release" / "pea_cpp.exe",
+                  root / "build" / "default" / "Release" / "pea_cpp",
                   root / "build" / "default" / "pea_cpp.exe",
+                  root / "build" / "default" / "pea_cpp",
                   root / "build" / "Release" / "pea_cpp.exe",
                   root / "build" / "pea_cpp.exe",
                   root / "build" / "pea_cpp"]
@@ -1706,13 +1973,15 @@ def cpp_executable(explicit: Path | None = None) -> Path:
     return binary
 
 
-CPP_PROTOCOL = "4"
+CPP_PROTOCOL = "6"
 
 
 class CppRepository:
     """Adaptador local: Tkinter envía operaciones y el proceso C++ conserva el estado."""
 
-    def __init__(self, binary: Path | None = None) -> None:
+    def __init__(self, binary: Path | None = None, *, timeout: float = 60.0) -> None:
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise DataError("El plazo del backend debe ser positivo y finito")
         executable = cpp_executable(binary)
         root = Path(__file__).resolve().parents[2]
         try:
@@ -1726,40 +1995,101 @@ class CppRepository:
         self.dirty = False
         self._history_size = 0
         self._queue_size = 0
+        self.timeout = timeout
+        self._closed = False
+        self._request_lock = threading.Lock()
+        self._requests: queue.Queue[Any] = queue.Queue()
+        self._worker = threading.Thread(target=self._io_loop, daemon=True)
+        self._worker.start()
         try:
             hello = self._request("ping")
             if hello != {"backend": "cpp", "protocol": CPP_PROTOCOL}:
-                raise DataError("El backend C++ usa un protocolo incompatible")
+                raise BackendError("El backend C++ usa un protocolo incompatible")
         except Exception:
             self.close()
             raise
 
-    def _request(self, action: str, **fields: str) -> Any:
-        if self.process.poll() is not None:
-            detail = self.process.stderr.read().strip() if self.process.stderr else ""
-            raise DataError("El backend C++ se cerró" + (f": {detail}" if detail else ""))
+    def _io_loop(self) -> None:
         assert self.process.stdin is not None and self.process.stdout is not None
-        request = {"action": action, **fields}
         try:
-            self.process.stdin.write(json.dumps(request, ensure_ascii=False, separators=(",", ":")) + "\n")
-            self.process.stdin.flush()
-            line = self.process.stdout.readline()
-        except (OSError, UnicodeError) as exc:
-            raise DataError(f"No se pudo comunicar con el backend C++: {exc}") from exc
-        if not line:
-            detail = self.process.stderr.read().strip() if self.process.stderr else ""
-            raise DataError("El backend C++ no respondió" + (f": {detail}" if detail else ""))
+            while True:
+                work = self._requests.get()
+                if work is None:
+                    return
+                payload, replies = work
+                try:
+                    self.process.stdin.write(payload)
+                    self.process.stdin.flush()
+                    replies.put(self.process.stdout.readline())
+                except (OSError, UnicodeError) as exc:
+                    replies.put(exc)
+                    return
+        finally:
+            # Solo el trabajador cierra sus streams: close() también espera si otro hilo está leyendo.
+            for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass  # El error de comunicación ya fue entregado al solicitante.
+
+    def _stop(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        deadline = time.monotonic() + 1.0
+        if self.process.poll() is None:
+            try:
+                self.process.kill()
+            except ProcessLookupError:
+                pass  # El proceso terminó entre poll() y kill().
         try:
-            response = json.loads(line)
-            state = response["state"]
-            self.dirty = bool(state["dirty"])
-            self._history_size = int(state["history_size"])
-            self._queue_size = int(state["queue_size"])
+            self.process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            pass  # El plazo de limpieza no debe bloquear el error que recibe la interfaz.
+        self._requests.put(None)
+        self._worker.join(timeout=max(0.0, deadline - time.monotonic()))
+
+    def _request(self, action: str, *, _timeout: float | None = None, **fields: str) -> Any:
+        timeout = self.timeout if _timeout is None else _timeout
+        deadline = time.monotonic() + timeout
+        if not self._request_lock.acquire(timeout=timeout):
+            raise BackendError("El backend C++ sigue ocupado con otra operación; espere a que termine")
+        try:
+            if self._closed or self.process.poll() is not None:
+                self._stop()
+                raise BackendError(f"El backend C++ se cerró (código {self.process.returncode})")
+            payload = json.dumps({"action": action, **fields}, ensure_ascii=False, separators=(",", ":")) + "\n"
+            replies: queue.Queue[Any] = queue.Queue(maxsize=1)
+            self._requests.put((payload, replies))
+            try:
+                line = replies.get(timeout=max(0.0, deadline - time.monotonic()))
+            except queue.Empty as exc:
+                self._stop()
+                raise BackendError("Se agotó el plazo de respuesta del backend C++; vuelva a abrir el programa. "
+                                "La operación no se reintentó; abra el último archivo guardado.") from exc
+            if isinstance(line, Exception) or not line:
+                self._stop()
+                raise BackendError(f"No se pudo comunicar con el backend C++: {line or 'sin respuesta'}")
+            try:
+                response = json.loads(line)
+                state = response["state"]
+                if not isinstance(response["ok"], bool) or not isinstance(state["dirty"], bool):
+                    raise TypeError("Estado de protocolo inválido")
+                if any(type(state[name]) is not int or state[name] < 0 for name in ("history_size", "queue_size")):
+                    raise TypeError("Contadores de protocolo inválidos")
+                self.dirty = state["dirty"]
+                self._history_size = state["history_size"]
+                self._queue_size = state["queue_size"]
+                result = response["result"] if response["ok"] else response["error"]
+            except (KeyError, TypeError, ValueError) as exc:
+                self._stop()
+                raise BackendError("Respuesta inválida del backend C++") from exc
             if not response["ok"]:
-                raise DataError(response["error"])
-            return response["result"]
-        except (KeyError, TypeError, json.JSONDecodeError) as exc:
-            raise DataError("Respuesta inválida del backend C++") from exc
+                raise DataError(result)
+            return result
+        finally:
+            self._request_lock.release()
 
     @staticmethod
     def _keys(key: str | tuple[str, str]) -> dict[str, str]:
@@ -1772,8 +2102,10 @@ class CppRepository:
         return self._request("rows", kind=kind)
 
     def page(self, kind: str, offset: int = 0, limit: int = PAGE_SIZE,
-             query: str = "") -> dict[str, Any]:
-        return self._request("page", kind=kind, offset=str(offset), limit=str(limit), query=query)
+             query: str = "", *, active: str = "", group_id: str = "",
+             include_references: bool = False) -> dict[str, Any]:
+        return self._request("page", kind=kind, offset=str(offset), limit=str(limit), query=query,
+                             active=active, group_id=group_id, references="1" if include_references else "0")
 
     def summary(self) -> dict[str, Any]:
         return self._request("summary")
@@ -1787,13 +2119,27 @@ class CppRepository:
     def get(self, kind: str, key: str | tuple[str, str]) -> dict[str, str] | None:
         return self._request("get", kind=kind, **self._keys(key))
 
+    def find_external(self, kind: str, value: str) -> dict[str, str] | None:
+        return self._request("find_external", kind=kind, value=value)
+
+    @contextmanager
+    def batch(self):
+        self._request("begin_batch")
+        try:
+            yield
+        finally:
+            if not self._closed:
+                self._request("end_batch")
+
     def related(self, kind: str, key: str, side: str) -> list[dict[str, str]]:
         return self._request("related", kind=kind, key=key, side=side)
 
     def related_page(self, kind: str, key: str, side: str, offset: int = 0,
-                     limit: int = PAGE_SIZE, active_only: bool = False) -> dict[str, Any]:
+                     limit: int = PAGE_SIZE, active_only: bool = False,
+                     query: str = "", *, include_references: bool = False) -> dict[str, Any]:
         return self._request("related_page", kind=kind, key=key, side=side,
-                             offset=str(offset), limit=str(limit), active="1" if active_only else "0")
+                             offset=str(offset), limit=str(limit), active="1" if active_only else "0", query=query,
+                             references="1" if include_references else "0")
 
     def create(self, kind: str, values: dict[str, str]) -> dict[str, str]:
         return self._request("create", kind=kind, values=json.dumps(values, ensure_ascii=False))
@@ -1869,16 +2215,14 @@ class CppRepository:
         return self._request("discard_review")
 
     def close(self) -> None:
-        if self.process.poll() is None:
+        if not self._closed and self.process.poll() is None:
             try:
-                self._request("shutdown")
-                self.process.wait(timeout=2)
+                self._request("shutdown", _timeout=min(self.timeout, 1.0))
+                self.process.wait(timeout=1)
             except (DataError, OSError, subprocess.TimeoutExpired):
-                self.process.kill()
-                self.process.wait()
-        for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
-            if stream is not None:
-                stream.close()
+                self._stop()
+                return
+        self._stop()
 
 
 class VisibleText(HTMLParser):
@@ -1957,6 +2301,7 @@ class WebPreview(NamedTuple):
     related_members: tuple[tuple[dict[str, str], dict[str, str]], ...] = ()
     related_plan: dict[str, str] | None = None
     related_authorships: tuple[dict[str, str], ...] = ()
+    diagnostics: tuple[str, ...] = ()
 
 
 class GrupLACProduct(NamedTuple):
@@ -2101,6 +2446,7 @@ def parse_web_page(text: str, url: str, format: str = "HTML") -> WebPreview:
     related_members: tuple[tuple[dict[str, str], dict[str, str]], ...] = ()
     related_plan: dict[str, str] | None = None
     related_authorships: tuple[dict[str, str], ...] = ()
+    diagnostics: list[str] = []
     if format == "HTML":
         parser = PageText()
         parser.feed(text)
@@ -2112,25 +2458,43 @@ def parse_web_page(text: str, url: str, format: str = "HTML") -> WebPreview:
         title = re.sub(r"\s+", " ", "".join(parser.title_parts)).strip()
         heading = re.sub(r"\s+", " ", "".join(parser.heading_parts)).strip()
         title = title or metadata.get("og:title", "") or metadata.get("twitter:title", "") or heading or metadata.get("citation_title", "")
-        if urlparse(url).hostname == "scienti.minciencias.gov.co":
+        scienti = urlparse(url).hostname == "scienti.minciencias.gov.co"
+        if scienti:
             try:
-                suggestion = parse_scienti_html(text, url)
-                if suggestion[0] == "grupos":
-                    members = parse_gruplac_members(text, url)
-                    products = parse_gruplac_products(text, url)
+                suggestion = parse_scienti_html(text, url, diagnostics=diagnostics)
+            except DataError as exc:
+                diagnostics.append(f"Perfil Scienti: {exc}")
+            if suggestion and suggestion[0] == "grupos":
+                members: list[tuple[dict[str, str], dict[str, str]]] = []
+                products: list[GrupLACProduct] = []
+                try:
+                    members = parse_gruplac_members(text, url, diagnostics=diagnostics)
                     related_members = tuple(members)
+                except DataError as exc:
+                    diagnostics.append(f"Integrantes GrupLAC: {exc}")
+                try:
+                    products = parse_gruplac_products(text, url, diagnostics=diagnostics)
                     related_products = tuple(item.row for item in products)
+                except DataError as exc:
+                    diagnostics.append(f"Productos GrupLAC: {exc}")
+                try:
                     related_plan = parse_gruplac_plan(text, url, suggestion[1]["objetivos"])
+                except DataError as exc:
+                    diagnostics.append(f"Plan GrupLAC: {exc}")
+                try:
                     related_authorships = tuple(match_gruplac_authors(products, members))
-                elif suggestion[0] == "investigadores":
-                    products = parse_cvlac_products(text, url)
+                except DataError as exc:
+                    diagnostics.append(f"Autorías GrupLAC: {exc}")
+            elif suggestion and suggestion[0] == "investigadores":
+                try:
+                    products = parse_cvlac_products(text, url, diagnostics=diagnostics)
                     related_products = tuple(item.row for item in products)
                     related_authorships = tuple(clean_row("autorias", {
                         "producto_id": item.row["id"], "investigador_id": suggestion[1]["id"],
                         "rol": "Producto listado en CvLAC"}) for item in products)
-            except DataError:
-                pass
-        if suggestion is None:
+                except DataError as exc:
+                    diagnostics.append(f"Productos CvLAC: {exc}")
+        if suggestion is None and not scienti:
             article = next((item for item in parser.schemas if _is_scholarly_article(item)), None)
             article_title = metadata.get("citation_title", "")
             if article and not article_title and isinstance(article.get("headline") or article.get("name"), str):
@@ -2173,7 +2537,7 @@ def parse_web_page(text: str, url: str, format: str = "HTML") -> WebPreview:
     else:
         kind, row = None, None
     return WebPreview(url, format, title[:250], tuple(lines[:300]), metadata, kind, row, None, tables,
-                      related_products, related_members, related_plan, related_authorships)
+                      related_products, related_members, related_plan, related_authorships, tuple(diagnostics))
 
 
 def _resolve_public_addrs(host: str, port: int) -> list[str]:
@@ -2273,13 +2637,16 @@ def fetch_web_page(url: str) -> WebPreview:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "pagina.pdf"
             path.write_bytes(content)
-            preview = parse_web_page(extract_pdf_text(path), final_url, "PDF de texto")
+            text = extract_pdf_text(path)
+            preview = parse_web_page(text, final_url, "PDF de texto")
             if urlparse(final_url).hostname == "scienti.minciencias.gov.co":
                 try:
-                    kind, row = parse_scienti_pdf(path, final_url)
-                    preview = preview._replace(suggested_kind=kind, suggested_row=row)
-                except DataError:
-                    pass
+                    diagnostics: list[str] = []
+                    kind, row = parse_scienti_pdf(path, final_url, text=text, diagnostics=diagnostics)
+                    preview = preview._replace(suggested_kind=kind, suggested_row=row,
+                                               diagnostics=tuple(diagnostics))
+                except DataError as exc:
+                    preview = preview._replace(diagnostics=tuple(diagnostics) + (f"Perfil Scienti PDF: {exc}",))
             return preview
     csv_file = content_type in ("text/csv", "application/csv", "application/vnd.ms-excel") or urlparse(final_url).path.lower().endswith(".csv")
     html_file = content_type in ("text/html", "application/xhtml+xml") or content[:500].lstrip().lower().startswith((b"<!doctype html", b"<html"))
@@ -2310,7 +2677,7 @@ def _gruplac_category(value: str) -> str:
     return token if token in _GRUPLAC_LEVELS else ""
 
 
-def parse_scienti_html(html: str, url: str) -> tuple[str, dict[str, str]]:
+def parse_scienti_html(html: str, url: str, *, diagnostics: list[str] | None = None) -> tuple[str, dict[str, str]]:
     """Extrae campos identificables; evita atribuir productos a un perfil ambiguo."""
     parsed = urlparse(url)
     if parsed.scheme != "https" or parsed.hostname != "scienti.minciencias.gov.co":
@@ -2322,6 +2689,8 @@ def parse_scienti_html(html: str, url: str) -> tuple[str, dict[str, str]]:
         raise DataError("La página no contiene texto legible")
     code = parse_qs(parsed.query)
     if "/gruplac/" in parsed.path and code.get("nro"):
+        if not any(_name_key(line) == "datos basicos" for line in lines):
+            raise DataError("No se identificó la sección Datos básicos de la ficha GrupLAC")
         candidates = [line for line in lines if line.lower() not in ("gruplac - plataforma scienti - colombia", "datos básicos")]
         name = next((line for line in candidates if line in lines[:15] and len(line) > 2 and not line.lower().startswith(("inicio", "menú", "buscar"))), "")
         if not name:
@@ -2342,7 +2711,8 @@ def parse_scienti_html(html: str, url: str) -> tuple[str, dict[str, str]]:
             except StopIteration:
                 return ""
             collected = [lines[first].split(":", 1)[1].strip()] if ":" in lines[first] else []
-            for line in lines[first + 1:]:
+            for index in range(first + 1, len(lines)):
+                line = lines[index]
                 if line.casefold().startswith(stop.casefold()):
                     break
                 collected.append(line)
@@ -2354,7 +2724,10 @@ def parse_scienti_html(html: str, url: str) -> tuple[str, dict[str, str]]:
             try:
                 formation_date = date(int(formation_match[1]), int(formation_match[2]), 1).isoformat()
             except ValueError:
-                pass
+                if diagnostics is not None:
+                    diagnostics.append(f"Perfil Scienti: fecha de formación inválida: {formed[:100]}")
+        elif formed and diagnostics is not None:
+            diagnostics.append(f"Perfil Scienti: no se pudo interpretar la fecha de formación: {formed[:100]}")
         group = {
             "id": f"G-{code['nro'][0]}", "nombre": name,
             "fecha_creacion": formation_date,
@@ -2376,7 +2749,10 @@ def parse_scienti_html(html: str, url: str) -> tuple[str, dict[str, str]]:
         category = ""
         for index, line in enumerate(lines):
             if line.casefold() == "categoría" and index + 1 < len(lines):
-                category = lines[index + 1].split(" con vigencia")[0].strip()
+                candidate = lines[index + 1].split(" con vigencia")[0].strip()
+                if _name_key(candidate) not in ("nombre", "nombre en citaciones", "nacionalidad", "sexo") \
+                        and not candidate.casefold().startswith(("producción ", "formación ", "experiencia ", "trabajos dirigidos/")):
+                    category = candidate
                 break
         if not category:
             found = re.search(r"Categoría Investigador\s+([^\n]+)", text, re.IGNORECASE)
@@ -2406,7 +2782,7 @@ def _name_key(value: str) -> str:
     return re.sub(r"\s+", " ", plain).casefold().strip()
 
 
-def parse_gruplac_members(html: str, url: str) -> list[tuple[dict[str, str], dict[str, str]]]:
+def parse_gruplac_members(html: str, url: str, *, diagnostics: list[str] | None = None) -> list[tuple[dict[str, str], dict[str, str]]]:
     """Importa el censo explícito; conserva meses textuales sin inventar un día ISO."""
     code = _require_gruplac_url(url)
     parser = LinkedTableRows()
@@ -2419,8 +2795,13 @@ def parse_gruplac_members(html: str, url: str) -> list[tuple[dict[str, str], dic
         return []
     members: list[tuple[dict[str, str], dict[str, str]]] = []
     seen: set[str] = set()
-    for row in parser.rows[first:]:
+    for index in range(first, len(parser.rows)):
+        row = parser.rows[index]
         if len(row) < 4:
+            if row and re.match(r"^\d+\.-", row[0][0]):
+                if diagnostics is not None:
+                    diagnostics.append(f"Integrantes GrupLAC, {row[0][0][:80]}: extracción incompleta, faltan celdas del censo")
+                continue
             if members:
                 break
             continue
@@ -2439,20 +2820,26 @@ def parse_gruplac_members(html: str, url: str) -> list[tuple[dict[str, str], dic
             "I-GR-" + hashlib.sha1((code + "|" + _name_key(name)).encode("utf-8")).hexdigest()[:12].upper())
         if person_id in seen:
             continue
-        seen.add(person_id)
         period = row[3][0].strip()
         role = row[1][0].strip() or "Integrante"
         ended = bool(re.search(r"\s-\s(?:19|20)\d{2}/\d{1,2}\s*$", period))
-        person = clean_row("investigadores", {
-            "id": person_id, "nombre": name, "codigo_cvlac": profile_code,
-            "url": _redact_url(href) if profile_code else _redact_url(url),
-            "fuente": f"GrupLAC, censo de integrantes, consultado {date.today().isoformat()}; vinculación: {period}",
-        })
-        membership = clean_row("membresias", {
-            "grupo_id": "G-" + code, "investigador_id": person_id,
-            "rol": f"{role} · {period}" if period else role,
-            "activo": "0" if ended else "1",
-        })
+        try:
+            person = clean_row("investigadores", {
+                "id": person_id, "nombre": name, "codigo_cvlac": profile_code,
+                "url": _redact_url(href) if profile_code else _redact_url(url),
+                "fuente": f"GrupLAC, censo de integrantes, consultado {date.today().isoformat()}; vinculación: {period}",
+            })
+            membership = clean_row("membresias", {
+                "grupo_id": "G-" + code, "investigador_id": person_id,
+                "rol": f"{role} · {period}" if period else role,
+                "activo": "0" if ended else "1",
+            })
+        except DataError as exc:
+            if diagnostics is None:
+                raise
+            diagnostics.append(f"Integrantes GrupLAC, {person_id[:100]} ({name[:80]}): {exc}")
+            continue
+        seen.add(person_id)
         members.append((person, membership))
     return members
 
@@ -2616,7 +3003,7 @@ def _combine_product(previous: GrupLACProduct, current: GrupLACProduct) -> GrupL
     return previous._replace(row=row, authors=tuple(authors))
 
 
-def parse_gruplac_products(html: str, url: str) -> list[GrupLACProduct]:
+def parse_gruplac_products(html: str, url: str, *, diagnostics: list[str] | None = None) -> list[GrupLACProduct]:
     """Extrae secciones con tipo, título y año explícitos; une fichas repetidas por DOI o título."""
     _require_gruplac_url(url)
     parser = VisibleText()
@@ -2633,16 +3020,21 @@ def parse_gruplac_products(html: str, url: str) -> list[GrupLACProduct]:
         for index in range(first, last):
             match = re.match(r"^\d+\.(?:-\s*|\s+)([^:]+?)\s*:\s*(.+)$", lines[index])
             if not match:
+                if diagnostics is not None and re.match(r"^\d+\.(?:-\s*|\s+)", lines[index]):
+                    diagnostics.append(f"Productos GrupLAC, {section}, {lines[index][:80]}: tipo o título no identificable")
                 continue
             kind, title = match.group(1).strip(), match.group(2).strip()
             category = estimate_category(section, kind)
             if only_categorized and not category:
+                if diagnostics is not None:
+                    diagnostics.append(f"Productos GrupLAC, {section}, {title[:80]}: tipología sin categoría admitida ({kind[:80]})")
                 continue
             if not title:
                 continue
             details: list[str] = []
             authors: list[str] = []
-            for line in lines[index + 1:last]:
+            for cursor in range(index + 1, last):
+                line = lines[cursor]
                 if re.match(r"^\d+\.(?:-\s*|\s+)", line):
                     break
                 prefix = next((prefix for prefix in PEOPLE_PREFIXES if line.startswith(prefix)), None)
@@ -2658,17 +3050,25 @@ def parse_gruplac_products(html: str, url: str) -> list[GrupLACProduct]:
                 year_match = re.search(r"(?<![\d-])((?:19|20)\d{2})(?=\s*(?:[,.;]|vol:|$))", detail)
                 year = year_match.group(1) if year_match else ""
             if not _publication_year(year):
+                if diagnostics is not None:
+                    diagnostics.append(f"Productos GrupLAC, {section}, {title[:80]}: extracción incompleta, falta un año válido")
                 continue
             published, doi = _source_doi(detail)
             identity = product_identity(title, year, published, kind, section == "Artículos publicados")
             note = f"; DOI incompleto en la fuente: {published}" if published and not doi else ""
-            row = clean_row("productos", {
-                "id": product_id(identity), "titulo": title, "anio": year,
-                "familia": family, "tipologia": kind,
-                "categoria": category, "categoria_origen": "estimada" if category else "",
-                "doi": doi, "url": _redact_url(url),
-                "fuente": f"GrupLAC, sección {section}, consultado {date.today().isoformat()}{note}",
-            })
+            try:
+                row = clean_row("productos", {
+                    "id": product_id(identity), "titulo": title, "anio": year,
+                    "familia": family, "tipologia": kind,
+                    "categoria": category, "categoria_origen": "estimada" if category else "",
+                    "doi": doi, "url": _redact_url(url),
+                    "fuente": f"GrupLAC, sección {section}, consultado {date.today().isoformat()}{note}",
+                })
+            except DataError as exc:
+                if diagnostics is None:
+                    raise
+                diagnostics.append(f"Productos GrupLAC, {section}, {title[:80]}: {exc}")
+                continue
             entry = GrupLACProduct(row, tuple(authors), section)
             previous = by_identity.get(identity)
             by_identity[identity] = _combine_product(previous, entry) if previous else entry
@@ -2709,24 +3109,39 @@ REFRESH_FIELDS = {
 }
 
 
+def _import_counts() -> dict[str, Any]:
+    counts: dict[str, Any] = dict.fromkeys(("grupos", "investigadores", "membresias", "planes", "productos",
+                                         "grupos_productos", "autorias", "existentes", "actualizados"), 0)
+    counts["errors"] = []
+    return counts
+
+
 def _merge_record(repository: Repository | CppRepository, kind: str, row: dict[str, str],
-                  key: str | tuple[str, str], counts: dict[str, Any], extra: dict[str, Any]) -> bool:
+                  key: str | tuple[str, str], counts: dict[str, Any],
+                  extra: dict[str, Any]) -> str | tuple[str, str] | None:
     existing = repository.get(kind, key)
+    external = {"grupos": "codigo_gruplac", "investigadores": "codigo_cvlac", "productos": "doi"}.get(kind)
+    if existing is None and external and row.get(external):
+        existing = repository.find_external(kind, row[external])
+        if existing is not None:
+            key = existing["id"]
+            row = {**row, "id": key}
     if existing is not None:
-        if kind == "grupos" and existing["codigo_gruplac"] != row["codigo_gruplac"]:
+        if kind == "grupos" and existing["codigo_gruplac"].strip().lower() != row["codigo_gruplac"].strip().lower():
             counts["errors"].append(f"{kind} {key}: ID ocupado por otro grupo")
-            return False
-        if kind == "investigadores" and existing["codigo_cvlac"] != row["codigo_cvlac"]:
+            return None
+        if kind == "investigadores" and existing["codigo_cvlac"].strip().lower() != row["codigo_cvlac"].strip().lower():
             counts["errors"].append(f"{kind} {key}: ID ocupado por otro perfil")
-            return False
+            return None
         if kind == "productos":
-            same_doi = bool(existing["doi"] and row.get("doi") and _doi_text(existing["doi"]) == _doi_text(row["doi"]))
+            same_doi = bool(_doi_text(existing["doi"]) and row.get("doi")
+                            and _doi_text(existing["doi"]) == _doi_text(row["doi"]))
             # Las fichas repiten un título con o sin punto final; el ID no cambia por eso.
             same_title_year = (_name_key(existing["titulo"]).rstrip(" .,;:") == _name_key(row["titulo"]).rstrip(" .,;:")
                                and existing["anio"] == row["anio"])
             if not same_doi and not same_title_year:
                 counts["errors"].append(f"{kind} {key}: ID ocupado por otro producto")
-                return False
+                return None
         changes = {name: row[name] for name in REFRESH_FIELDS.get(kind, ())
                    if row.get(name) and row[name] != existing.get(name, "")}
         if kind == "productos" and existing["categoria_origen"] == "manual":
@@ -2741,24 +3156,28 @@ def _merge_record(repository: Repository | CppRepository, kind: str, row: dict[s
             changes["categoria_origen"] = row.get("categoria_origen", "")
         if not changes:
             counts["existentes"] += 1
-            return True
+            return key
         # La fecha de consulta cambia en cada descarga: la fuente solo se renueva con el contenido.
         if row.get("fuente"):
             changes["fuente"] = row["fuente"]
         try:
             repository.update(kind, key, changes, **extra)
+        except BackendError:
+            raise
         except (DataError, OSError, ValueError) as exc:
             counts["errors"].append(f"{kind} {key}: {exc}")
-            return True
+            return key
         counts["actualizados"] += 1
-        return True
+        return key
     try:
         repository.create(kind, row, **extra)
+    except BackendError:
+        raise
     except (DataError, OSError, ValueError) as exc:
         counts["errors"].append(f"{kind} {key}: {exc}")
-        return False
+        return None
     counts[kind] += 1
-    return True
+    return key
 
 
 def import_gruplac_preview(repository: Repository | CppRepository, preview: WebPreview,
@@ -2775,41 +3194,44 @@ def import_gruplac_preview(repository: Repository | CppRepository, preview: WebP
     if group["codigo_gruplac"] != source_group["codigo_gruplac"]:
         raise DataError("El código GrupLAC revisado no coincide con la fuente")
     group_id = group["id"]
-    counts: dict[str, Any] = {kind: 0 for kind in (
-        "grupos", "investigadores", "membresias", "planes", "productos", "grupos_productos", "autorias")}
-    counts["existentes"] = counts["actualizados"] = 0
-    counts["errors"] = []
+    counts = _import_counts()
     extra: dict[str, Any] = {} if remember else {"remember": False}
 
-    def add(kind: str, row: dict[str, str], key: str | tuple[str, str]) -> bool:
+    def add(kind: str, row: dict[str, str], key: str | tuple[str, str]) -> str | tuple[str, str] | None:
         return _merge_record(repository, kind, row, key, counts, extra)
 
-    if not add("grupos", group, group_id):
-        return counts
-    available_people: set[str] = set()
-    for person, _ in preview.related_members:
-        if add("investigadores", person, person["id"]):
-            available_people.add(person["id"])
-    if preview.related_plan:
-        plan = {**preview.related_plan, "grupo_id": group_id}
-        add("planes", plan, plan["id"])
-    for person, membership in preview.related_members:
-        if person["id"] in available_people:
-            row = {**membership, "grupo_id": group_id}
-            add("membresias", row, (group_id, person["id"]))
-    available_products: set[str] = set()
-    for product in preview.related_products:
-        if add("productos", product, product["id"]):
-            available_products.add(product["id"])
-    for product in preview.related_products:
-        if product["id"] in available_products:
-            row = {"grupo_id": group_id, "producto_id": product["id"],
+    with repository.batch() if remember else nullcontext():
+        group_id = add("grupos", group, group_id)
+        if group_id is None:
+            return counts
+        available_people: dict[str, str] = {}
+        for person, _ in preview.related_members:
+            canonical = add("investigadores", person, person["id"])
+            if canonical is not None:
+                available_people[person["id"]] = canonical
+        if preview.related_plan:
+            plan = {**preview.related_plan, "grupo_id": group_id}
+            add("planes", plan, plan["id"])
+        for person, membership in preview.related_members:
+            canonical = available_people.get(person["id"])
+            if canonical is not None:
+                row = {**membership, "grupo_id": group_id, "investigador_id": canonical}
+                add("membresias", row, (group_id, canonical))
+        available_products: dict[str, str] = {}
+        for product in preview.related_products:
+            canonical = add("productos", product, product["id"])
+            if canonical is not None:
+                available_products[product["id"]] = canonical
+        for canonical in dict.fromkeys(available_products.values()):
+            row = {"grupo_id": group_id, "producto_id": canonical,
                    "origen": "GrupLAC: producto listado en la ficha"}
-            add("grupos_productos", row, (group_id, product["id"]))
-    for authorship in preview.related_authorships:
-        product_id, researcher_id = authorship["producto_id"], authorship["investigador_id"]
-        if product_id in available_products and researcher_id in available_people:
-            add("autorias", authorship, (product_id, researcher_id))
+            add("grupos_productos", row, (group_id, canonical))
+        for authorship in preview.related_authorships:
+            product_id = available_products.get(authorship["producto_id"])
+            researcher_id = available_people.get(authorship["investigador_id"])
+            if product_id is not None and researcher_id is not None:
+                row = {**authorship, "producto_id": product_id, "investigador_id": researcher_id}
+                add("autorias", row, (product_id, researcher_id))
     return counts
 
 
@@ -2826,7 +3248,7 @@ CVLAC_SECTIONS = {
 }
 
 
-def parse_cvlac_products(html: str, url: str) -> list[GrupLACProduct]:
+def parse_cvlac_products(html: str, url: str, *, diagnostics: list[str] | None = None) -> list[GrupLACProduct]:
     """Lee productos declarados en CvLAC; no incorpora eventos ni proyectos."""
     parsed = urlparse(url)
     if parsed.scheme != "https" or parsed.hostname != "scienti.minciencias.gov.co" or \
@@ -2869,10 +3291,14 @@ def parse_cvlac_products(html: str, url: str) -> list[GrupLACProduct]:
         else:
             title = details[cursor].rstrip(",").strip() if cursor < len(details) else ""
         if not title:
+            if diagnostics is not None:
+                diagnostics.append(f"Productos CvLAC, {parts[0]}, entrada {position + 1}: extracción incompleta, falta el título")
             continue
         detail = " ".join(details)
         year_match = re.search(r"(?<!\d)((?:19|20)\d{2})(?=[,.])", detail)
         if not year_match or not _publication_year(year_match[1]):
+            if diagnostics is not None:
+                diagnostics.append(f"Productos CvLAC, {parts[0]}, {title[:80]}: extracción incompleta, falta un año válido")
             continue
         year = year_match[1]
         published, doi = _source_doi(detail)
@@ -2881,13 +3307,19 @@ def parse_cvlac_products(html: str, url: str) -> list[GrupLACProduct]:
         identity = product_identity(title, year, published, kind, section == "Artículos publicados")
         family = {"Trabajos dirigidos/Tutorías": "Formación de recurso humano",
                   "Producción técnica": "Producción técnica y tecnológica"}.get(match[1], match[1])
-        row = clean_row("productos", {
-            "id": product_id(identity), "titulo": title, "anio": year, "tipologia": kind,
-            "familia": family,
-            "categoria": category, "categoria_origen": "estimada" if category else "",
-            "doi": doi, "url": _redact_url(url),
-            "fuente": f"CvLAC, sección {parts[0]}, consultado {date.today().isoformat()}{note}",
-        })
+        try:
+            row = clean_row("productos", {
+                "id": product_id(identity), "titulo": title, "anio": year, "tipologia": kind,
+                "familia": family,
+                "categoria": category, "categoria_origen": "estimada" if category else "",
+                "doi": doi, "url": _redact_url(url),
+                "fuente": f"CvLAC, sección {parts[0]}, consultado {date.today().isoformat()}{note}",
+            })
+        except DataError as exc:
+            if diagnostics is None:
+                raise
+            diagnostics.append(f"Productos CvLAC, {parts[0]}, {title[:80]}: {exc}")
+            continue
         authors = tuple(name.strip() for line in author_lines for name in line.split(",") if name.strip())
         entry = GrupLACProduct(row, authors, section)
         previous = by_identity.get(identity)
@@ -2904,21 +3336,21 @@ def import_cvlac_preview(repository: Repository | CppRepository, preview: WebPre
     person = clean_row("investigadores", reviewed_person or preview.suggested_row)
     if person["codigo_cvlac"] != preview.suggested_row["codigo_cvlac"]:
         raise DataError("El código CvLAC revisado no coincide con la fuente")
-    counts: dict[str, Any] = {kind: 0 for kind in (
-        "grupos", "investigadores", "membresias", "planes", "productos", "grupos_productos", "autorias")}
-    counts["existentes"] = counts["actualizados"] = 0
-    counts["errors"] = []
+    counts = _import_counts()
     extra: dict[str, Any] = {} if remember else {"remember": False}
-    if not _merge_record(repository, "investigadores", person, person["id"], counts, extra):
-        return counts
-    for product in preview.related_products:
-        if not _merge_record(repository, "productos", product, product["id"], counts, extra):
-            continue
-        key = (product["id"], person["id"])
-        # «existentes» cuenta perfil y productos; una autoría presente no se vuelve a importar.
-        if repository.get("autorias", key) is None:
-            authorship = {"producto_id": key[0], "investigador_id": key[1], "rol": "Producto listado en CvLAC"}
-            _merge_record(repository, "autorias", authorship, key, counts, extra)
+    with repository.batch() if remember else nullcontext():
+        person_id = _merge_record(repository, "investigadores", person, person["id"], counts, extra)
+        if person_id is None:
+            return counts
+        for product in preview.related_products:
+            product_id = _merge_record(repository, "productos", product, product["id"], counts, extra)
+            if product_id is None:
+                continue
+            key = (product_id, person_id)
+            # «existentes» cuenta perfil y productos; una autoría presente no se vuelve a importar.
+            if repository.get("autorias", key) is None:
+                authorship = {"producto_id": key[0], "investigador_id": key[1], "rol": "Producto listado en CvLAC"}
+                _merge_record(repository, "autorias", authorship, key, counts, extra)
     return counts
 
 
@@ -3007,14 +3439,16 @@ def extract_pdf_text(path: Path) -> str:
     return text
 
 
-def parse_scienti_pdf(path: Path, source_url: str) -> tuple[str, dict[str, str]]:
+def parse_scienti_pdf(path: Path, source_url: str, *, text: str | None = None,
+                      diagnostics: list[str] | None = None) -> tuple[str, dict[str, str]]:
     """Procesa PDFs impresos de GrupLAC/CvLAC con URL original conocida."""
-    text = extract_pdf_text(path)
+    if text is None:
+        text = extract_pdf_text(path)
     # El exportador PDF presenta texto en bloques; reutilizamos la misma extracción
     # de campos, con saltos de línea preservados para no inventar asociaciones.
     from html import escape
     html = "<p>" + "</p><p>".join(escape(line) for line in text.splitlines()) + "</p>"
-    return parse_scienti_html(html, source_url)
+    return parse_scienti_html(html, source_url, diagnostics=diagnostics)
 
 
 def new_id(prefix: str) -> str:
@@ -3168,16 +3602,6 @@ def build_gui(root: Any, repository: Repository | CppRepository,
         return next((name for name in names if name in available_fonts), None)
 
     BODY_FONT = first_font("Segoe UI Variable Text", "Segoe UI", "Inter", "Noto Sans", "DejaVu Sans") or "TkDefaultFont"
-    STRONG_FONT = first_font("Segoe UI Semibold", "Segoe UI Variable Text Semibold")
-    FIGURE_FONT = first_font("Bahnschrift SemiBold", "Bahnschrift", "Inter Display")
-
-    def font(size: int, weight: str = "normal") -> tuple[Any, ...]:
-        """weight: normal, strong (títulos) o figure (cifras)."""
-        if weight == "figure" and FIGURE_FONT:
-            return (FIGURE_FONT, size) if "Bahnschrift" in FIGURE_FONT else (FIGURE_FONT, size, "bold")
-        if weight != "normal":
-            return (STRONG_FONT, size) if STRONG_FONT else (BODY_FONT, size, "bold")
-        return (BODY_FONT, size)
 
     # Campos, menús y diálogos estándar usan las fuentes con nombre de Tk.
     for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont", "TkCaptionFont"):
@@ -3185,9 +3609,6 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             tkfont.nametofont(name, root=root).configure(family=BODY_FONT, size=10)
         except tk.TclError:
             pass
-
-    SIDEBAR_WIDTH = 196
-    PAGE_PADDING = (24, 18, 24, 14)
 
     TITLES = {"grupos": "Grupos", "investigadores": "Investigadores", "productos": "Productos",
               "planes": "Planes", "membresias": "Integrantes", "autorias": "Autorías",
@@ -3431,7 +3852,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             return ctk.ScalingTracker.widget_scaling
 
     def chart_font(widget: Any, points: int, weight: str = "normal") -> tuple[Any, ...]:
-        """Fuente en píxeles escalados (un lienzo no se escala solo); points sigue la escala de las pantallas ttk."""
+        """Fuente en píxeles escalados (un lienzo no se escala solo); points se expresa en puntos tipográficos."""
         size = -round(points * 4 / 3 * scale_of(widget))
         return (FAMILY, size, "bold") if weight != "normal" else (FAMILY, size)
 
@@ -4464,52 +4885,13 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                 except TclError:
                     pass
 
-    def show_columns(table: ttk.Treeview, columns: tuple[str, ...], usage: dict[str, int],
+    def show_columns(table: DataTable, columns: tuple[str, ...], usage: dict[str, int],
                      keep: tuple[str, ...] = ()) -> None:
         """Oculta las columnas que ningún registro ha llenado; reaparecen al tener datos."""
         shown = [name for name in columns
                  if name in keep or name.startswith("_") or usage.get(name, 1) > 0]
         if tuple(table.cget("displaycolumns")) != tuple(shown):
             table.configure(displaycolumns=shown)
-
-    def place_dialog(dialog: tk.Toplevel, parent: tk.Misc, width: int, height: int) -> None:
-        host = parent.winfo_toplevel()
-        dialog.transient(host)
-        width = min(width, host.winfo_screenwidth() - 60)
-        height = min(height, host.winfo_screenheight() - 100)
-        x = max(0, min(host.winfo_rootx() + (host.winfo_width() - width) // 2,
-                       host.winfo_screenwidth() - width))
-        y = max(0, min(host.winfo_rooty() + (host.winfo_height() - height) // 2,
-                       host.winfo_screenheight() - height))
-        dialog.geometry(f"{width}x{height}+{x}+{y}")
-
-    def text_field(parent: tk.Misc, **options: Any) -> tk.Text:
-        """tk.Text con el aspecto de los campos ttk del tema activo."""
-        style = ttk.Style()
-        return tk.Text(parent, wrap="word", font=font(10), relief="flat", borderwidth=0, padx=7, pady=5,
-                       background=style.lookup("TEntry", "fieldbackground"),
-                       foreground=style.lookup("TEntry", "foreground"),
-                       insertbackground=style.lookup("TEntry", "foreground"),
-                       selectbackground=style.lookup(".", "selectbackground"),
-                       highlightthickness=1, highlightbackground=style.lookup("TEntry", "bordercolor"),
-                       highlightcolor=style.lookup(".", "focuscolor"), **options)
-
-    class AutoScrollbar(ttk.Scrollbar):
-        """Solo ocupa espacio cuando el contenido no cabe (requiere grid)."""
-        def grid(self, **options: Any) -> None:
-            self._grid_options = options
-            self._shown = True
-            super().grid(**options)
-
-        def set(self, first: Any, last: Any) -> None:
-            needed = not (float(first) <= 0.0 and float(last) >= 1.0)
-            if needed != getattr(self, "_shown", True) and hasattr(self, "_grid_options"):
-                if needed:
-                    super().grid(**self._grid_options)
-                else:
-                    self.grid_remove()
-                self._shown = needed
-            super().set(first, last)
 
     class ChoiceDialog(Dialog):
         def __init__(self, parent: tk.Misc, title: str, prompt: str,
@@ -4545,6 +4927,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
         """Consulta de una URL pública: la descarga corre en segundo plano con el diálogo abierto.
 
         result es la URL consultada y preview su vista previa; ambos quedan en None si se cancela.
+        app se conserva para los consumidores de kit; la consulta no depende de la aplicación.
         """
         def __init__(self, parent: Any, app: "App | None" = None, initial: str = "", start: bool = False):
             super().__init__(parent, "Consultar URL pública", 600)
@@ -4775,6 +5158,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             self.count.configure(text=f"{number(len(rows))} de {number(len(catalog))} categorías")
 
     class CategoryPicker(Dialog):
+        """Selector autónomo; app se conserva por compatibilidad con los consumidores de kit."""
         def __init__(self, parent: Any, app: "App | None" = None, current: str = ""):
             super().__init__(parent, "Seleccionar categoría · Modelo 2024", 880, 620)
             self.minsize(640, 440)
@@ -5049,7 +5433,6 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             self.search = tk.StringVar()
             self.state_filter = tk.StringVar(value="Todos")
             self.offset = 0
-            self._search_timer: str | None = None
             self._rows: dict[str, dict[str, str]] = {}
             body = ctk.CTkFrame(self, fg_color="transparent")
             body.pack(fill="both", expand=True, padx=24, pady=20)
@@ -5137,24 +5520,11 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             row = self.app.record(self.kind, key) if key else None
             self.toggle_button.configure(text="Activar" if row and row["activo"] == "0" else "Desactivar")
 
-        def _search_changed(self) -> None:
-            self.offset = 0
-            if self._search_timer is not None:
-                self.after_cancel(self._search_timer)
-            self._search_timer = self.after(250, self._perform_search)
-
-        def _perform_search(self) -> None:
-            self._search_timer = None
-            self.refresh()
-
         def _move(self, direction: int) -> None:
             self.offset = max(0, self.offset + direction * PAGE_SIZE)
             self.refresh()
 
         def refresh(self) -> None:
-            if self._search_timer is not None:
-                self.after_cancel(self._search_timer)
-                self._search_timer = None
             self.search_entry.cancel_pending()
             current = self.selected()
             self.table.delete(*self.table.get_children())
@@ -5203,16 +5573,13 @@ def build_gui(root: Any, repository: Repository | CppRepository,
         def toggle(self) -> None:
             key = self.selected()
             if key:
-                self.app.mutate(lambda: self.app.repo.toggle(self.kind, key))
+                self.app.mutate(lambda: self.app.repo.toggle(self.kind, key), changed={self.kind})
 
         def delete(self) -> None:
             key = self.selected()
             row = self.app.record(self.kind, key) if key else None
             if row and self.app.confirm("Eliminar", f"¿Eliminar {record_name(row)} definitivamente?\nPuede deshacer este cambio antes de vaciar el historial.", parent=self):
-                self.app.mutate(lambda: self.app.repo.delete(self.kind, key))
-
-        def restyle(self) -> None:
-            self.table.redraw()
+                self.app.mutate(lambda: self.app.repo.delete(self.kind, key), changed={self.kind})
 
     class RelationTab(ctk.CTkFrame):
         def __init__(self, parent: tk.Misc, app: "App", kind: str):
@@ -5220,7 +5587,6 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             self.app, self.kind = app, kind
             self.offset = 0
             self.search = tk.StringVar()
-            self._search_timer: str | None = None
             body = ctk.CTkFrame(self, fg_color="transparent")
             body.pack(fill="both", expand=True, padx=8, pady=12)
             search_bar = ctk.CTkFrame(body, fg_color="transparent")
@@ -5267,12 +5633,6 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             self.toggle_button.configure(text="Activar" if row.get("activo") == "0" else "Desactivar")
 
 
-        def _search_changed(self, *_: Any) -> None:
-            self.offset = 0
-            if self._search_timer:
-                self.after_cancel(self._search_timer)
-            self._search_timer = self.after(250, self.refresh)
-
         def _move(self, direction: int) -> None:
             self.offset = max(0, self.offset + direction * PAGE_SIZE)
             self.refresh()
@@ -5284,9 +5644,6 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             return tuple(json.loads(selection[0]))  # type: ignore[return-value]
 
         def refresh(self) -> None:
-            if self._search_timer:
-                self.after_cancel(self._search_timer)
-                self._search_timer = None
             self.search_entry.cancel_pending()
             current = self.table.selection()
             self.table.delete(*self.table.get_children())
@@ -5323,15 +5680,12 @@ def build_gui(root: Any, repository: Repository | CppRepository,
         def toggle(self) -> None:
             key = self.selected()
             if key:
-                self.app.mutate(lambda: self.app.repo.toggle(self.kind, key))
+                self.app.mutate(lambda: self.app.repo.toggle(self.kind, key), changed={self.kind})
 
         def delete(self) -> None:
             key = self.selected()
             if key and self.app.confirm("Desvincular", "¿Eliminar esta relación?", parent=self):
-                self.app.mutate(lambda: self.app.repo.delete(self.kind, key))
-
-        def restyle(self) -> None:
-            self.table.redraw()
+                self.app.mutate(lambda: self.app.repo.delete(self.kind, key), changed={self.kind})
 
     class ContextTab(ctk.CTkFrame):
         def __init__(self, parent: Any, detail: "DetailDialog", source: str, side: str,
@@ -5462,7 +5816,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             if item:
                 row, link = item
                 key = row["id"] if self.source == "planes" else tuple(link[field] for field in RELATION_ENDS[self.source][:2])
-                self.app.mutate(lambda: self.app.repo.toggle(self.source, key))
+                self.app.mutate(lambda: self.app.repo.toggle(self.source, key), changed={self.source})
 
         def delete(self) -> None:
             item = self.selected()
@@ -5470,7 +5824,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                                             f"¿Eliminar {record_name(item[0])} de esta ficha?", parent=self.detail):
                 row, link = item
                 key = row["id"] if self.source == "planes" else tuple(link[field] for field in RELATION_ENDS[self.source][:2])
-                self.app.mutate(lambda: self.app.repo.delete(self.source, key))
+                self.app.mutate(lambda: self.app.repo.delete(self.source, key), changed={self.source})
 
     class DetailDialog(Dialog):
         """Ficha de un registro: resumen, vínculos con sus acciones, indicador y estadísticas."""
@@ -5578,37 +5932,17 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             self.present(wait=False)
 
         def page_for(self, tab: ContextTab, offset: int, query: str) -> dict[str, Any]:
-            needle = query.strip().casefold()
             active_only = tab.state_filter.get() == "Activos"
-            if tab.source != "planes" and not needle and not active_only:
-                page = self.app.repo.related_page(tab.source, self.key, tab.side, offset, PAGE_SIZE)
-                field = RELATION_ENDS[tab.source][1 if tab.side == "left" else 0]
-                return {"total": page["total"], "rows": [(self.app.record(tab.target_kind, link[field]), link) for link in page["rows"]]}
-            total = 0
-            rows = []
-            position = 0
-            while True:
-                page = (self.app.repo.page("planes", position, PAGE_SIZE) if tab.source == "planes" else
-                        self.app.repo.related_page(tab.source, self.key, tab.side, position, PAGE_SIZE))
-                for link in page["rows"]:
-                    if tab.source == "planes":
-                        if link["grupo_id"] != self.key:
-                            continue
-                        row = link
-                    else:
-                        field = RELATION_ENDS[tab.source][1 if tab.side == "left" else 0]
-                        row = self.app.record(tab.target_kind, link[field])
-                    if active_only and link["activo"] != "1":
-                        continue
-                    if needle and needle not in " ".join((*row.values(), *link.values())).casefold():
-                        continue
-                    if offset <= total < offset + PAGE_SIZE:
-                        rows.append((row, link))
-                    total += 1
-                position += len(page["rows"])
-                if not page["rows"] or position >= page["total"]:
-                    break
-            return {"total": total, "rows": rows}
+            if tab.source == "planes":
+                page = self.app.repo.page("planes", offset, PAGE_SIZE, query,
+                                          active="1" if active_only else "", group_id=self.key)
+                return {"total": page["total"], "rows": [(row, row) for row in page["rows"]]}
+            page = self.app.repo.related_page(tab.source, self.key, tab.side, offset, PAGE_SIZE,
+                                             active_only, query, include_references=True)
+            self.app.cache_references(page)
+            field = RELATION_ENDS[tab.source][1 if tab.side == "left" else 0]
+            return {"total": page["total"],
+                    "rows": [(self.app.record(tab.target_kind, link[field]), link) for link in page["rows"]]}
 
         def _summary_width(self, event: Any) -> None:
             self._wrap = max(240, round(event.width / scale_of(self)) - 230)
@@ -5686,29 +6020,33 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                              text_color=T["pending"], anchor="w").pack(fill="x")
             return card
 
-        def refresh(self) -> None:
+        def refresh(self, changed: set[str] | None = None) -> None:
             row = self.app.repo.get(self.kind, self.key)
             if row is None:
                 self.destroy()
                 return
-            self.eyebrow.configure(text=f"{SINGULAR[self.kind].upper()} · {self.key}")
-            self.title_label.configure(text=record_name(row))
-            chips = [(display_value("activo", row["activo"]), "primary" if row["activo"] == "1" else "muted")]
-            if self.kind == "productos":
-                chips.append((display_value("validacion", row["validacion"]),
-                              STATUS_COLORS.get(row["validacion"], "unknown")))
-            elif self.kind == "grupos" and row["categoria"]:
-                chips.append((f"Categoría {row['categoria']}", "primary"))
-            for child in self.state_chips.winfo_children():
-                child.destroy()
-            for text, tone in chips:
-                Chip(self.state_chips, text, tone).pack(side="left", padx=(0, 6))
-            self._fill_summary(row)
-            self.source_button.configure(state="normal" if row.get("url") else "disabled")
+            if changed is None or self.kind in changed:
+                self.eyebrow.configure(text=f"{SINGULAR[self.kind].upper()} · {self.key}")
+                self.title_label.configure(text=record_name(row))
+                chips = [(display_value("activo", row["activo"]), "primary" if row["activo"] == "1" else "muted")]
+                if self.kind == "productos":
+                    chips.append((display_value("validacion", row["validacion"]),
+                                  STATUS_COLORS.get(row["validacion"], "unknown")))
+                elif self.kind == "grupos" and row["categoria"]:
+                    chips.append((f"Categoría {row['categoria']}", "primary"))
+                for child in self.state_chips.winfo_children():
+                    child.destroy()
+                for text, tone in chips:
+                    Chip(self.state_chips, text, tone).pack(side="left", padx=(0, 6))
+                self._fill_summary(row)
+                self.source_button.configure(state="normal" if row.get("url") else "disabled")
             for tab in self.link_tabs.values():
-                tab.refresh()
-            self.refresh_indicator()
-            if self.stats_canvas is not None:
+                if changed is None or tab.source in changed or tab.target_kind in changed:
+                    tab.refresh()
+            analysis_changed = changed is None or bool(changed & (set(ALL_FIELDS) - {"planes"}))
+            if analysis_changed:
+                self.refresh_indicator()
+            if analysis_changed and self.stats_canvas is not None:
                 self.statistics = self.app.repo.statistics({"grupos": "Grupo", "investigadores": "Investigador", "productos": "Producto"}[self.kind], self.key, limit=0)
                 self.stats_note.set(f"{self.statistics['total']} productos activos únicos de esta ficha · Todos los años. Los vínculos inactivos se excluyen.")
                 self.stats_canvas.redraw()
@@ -5726,7 +6064,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                 message = "El indicador se calcula solo para registros activos. Active la ficha para verlo."
             else:
                 try:
-                    result = self.app.repo.indicator(self.kind, self.key, end - years + 1 if years else None, end)
+                    result = self.app.indicator(self.kind, self.key, end - years + 1 if years else None, end)
                 except DataError as exc:
                     message = str(exc)
             self.indicator_panel.show(result, record_name(row) if result else "")
@@ -5784,6 +6122,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             self.details: set[DetailDialog] = set()
             self._record_cache: dict[tuple[str, str], dict[str, str]] = {}
             self._usage_cache: dict[str, dict[str, int]] = {}
+            self._indicator_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
             self._year_timer: str | None = None
             self.status = ctk.StringVar(master=root, value="Iniciando PEA-i…")
             self.workspace = ctk.StringVar(master=root)
@@ -5940,9 +6279,6 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                 for timer in (self._year_timer, self._startup_timer):
                     if timer:
                         self.root.after_cancel(timer)
-                for tab in (*self.entity_tabs.values(), *self.relation_tabs.values()):
-                    if tab._search_timer:
-                        self.root.after_cancel(tab._search_timer)
 
         kit = SimpleNamespace(T=T, color=color, FONTS=FONTS, button=button, Card=Card, Kpi=Kpi, Chip=Chip,
                               MenuButton=MenuButton, SearchField=SearchField, Pager=Pager,
@@ -6062,6 +6398,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             return self.show_about("Estado de datos")
 
         def _apply_theme(self, theme: str) -> None:
+            # Los selectores de archivo Tk crean controles ttk aunque la aplicación use CustomTkinter.
             style = ttk.Style()
             if "clam" in style.theme_names():
                 style.theme_use("clam")
@@ -6082,78 +6419,19 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                                    ("*TCombobox*Listbox.foreground", c["ink"]),
                                    ("*TCombobox*Listbox.selectBackground", c["primary_soft"]),
                                    ("*TCombobox*Listbox.selectForeground", c["ink"]),
-                                   ("*TCombobox*Listbox.font", font(10))):
+                                   ("*TCombobox*Listbox.font", (BODY_FONT, 10))):
                 self.root.option_add(pattern, value)
-            style.configure(".", font=font(10), background=c["page"], foreground=c["ink"],
+            style.configure(".", font=(BODY_FONT, 10), background=c["page"], foreground=c["ink"],
                             troughcolor=c["page"], focuscolor=c["primary"], selectbackground=c["primary_soft"],
                             selectforeground=c["ink"], insertcolor=c["ink"])
             style.configure("TFrame", background=c["page"])
             style.configure("TLabel", background=c["page"], foreground=c["ink"])
-            style.configure("Muted.TLabel", foreground=c["muted"])
-            style.configure("Error.TLabel", foreground=c["error"])
-            style.configure("Heading.TLabel", font=font(20, "strong"), foreground=c["ink"])
-            style.configure("Section.TLabel", font=font(12, "strong"), foreground=c["ink"])
-            style.configure("Title.TLabel", font=font(15, "strong"), foreground=c["ink"])
-            style.configure("Rule.TFrame", background=c["line"])
-            # Tarjetas: superficie blanca con borde fino; sus hijos usan *.Card.* para no mostrar el fondo de página.
-            flat("Card.TFrame", c["surface"], c["line"], borderwidth=1, relief="solid")
-            style.configure("CardBody.TFrame", background=c["surface"])
-            style.configure("Card.TLabel", background=c["surface"], foreground=c["ink"])
-            style.configure("Muted.Card.TLabel", background=c["surface"], foreground=c["muted"], font=font(9))
-            style.configure("Error.Card.TLabel", background=c["surface"], foreground=c["error"])
-            style.configure("Rejected.Card.TLabel", background=c["surface"], foreground=c["rejected"])
-            style.configure("CardValue.TLabel", background=c["surface"], foreground=c["ink"], font=font(24, "figure"))
-            style.configure("CardCaption.TLabel", background=c["surface"], foreground=c["muted"], font=font(9))
-            for tone in ("sidebar", "primary", "pending", "rejected", "unknown"):
-                style.configure(f"{tone}.Stripe.TFrame", background=c[tone] if tone != "sidebar" else c["ink"])
-            style.configure("Header.TFrame", background=c["surface"])
-            style.configure("Header.TLabel", background=c["surface"], foreground=c["muted"], font=font(9))
-            style.configure("Dirty.Header.TLabel", background=c["surface"], foreground=c["pending"], font=font(9, "strong"))
-            style.configure("Status.TLabel", background=c["page"], foreground=c["muted"], font=font(9))
-            # Lateral
-            style.configure("Sidebar.TFrame", background=c["sidebar"])
-            style.configure("Brand.TLabel", background=c["sidebar"], foreground=c["sidebar_fg"], font=font(16, "figure"))
-            style.configure("SidebarCaption.TLabel", background=c["sidebar"], foreground=c["sidebar_muted"], font=font(9))
-            style.configure("NavGroup.TLabel", background=c["sidebar"], foreground=c["sidebar_muted"], font=font(9))
-            flat("Nav.TButton", c["sidebar"], foreground=c["sidebar_fg"], anchor="w", padding=(12, 7),
-                 font=font(10), relief="flat", focuscolor=c["sidebar"])
-            style.map("Nav.TButton", background=[("pressed", c["sidebar_hover"]), ("active", c["sidebar_hover"])],
-                      lightcolor=[("active", c["sidebar_hover"])], darkcolor=[("active", c["sidebar_hover"])],
-                      bordercolor=[("active", c["sidebar_hover"])], foreground=[("active", c["sidebar_fg"])])
-            # Activo: toma el color de la página y se une al contenido.
-            flat("Selected.Nav.TButton", c["page"], foreground=c["primary"], font=font(10, "strong"),
-                 focuscolor=c["page"])
-            style.map("Selected.Nav.TButton", background=[("active", c["page"]), ("pressed", c["page"])],
-                      lightcolor=[("active", c["page"])], darkcolor=[("active", c["page"])],
-                      bordercolor=[("active", c["page"])], foreground=[("active", c["primary"])])
-            flat("Burger.TButton", c["sidebar"], foreground=c["sidebar_fg"], padding=(8, 2), font=font(15),
-                 relief="flat", focuscolor=c["sidebar"])
-            style.map("Burger.TButton", background=[("active", c["sidebar_hover"])],
-                      lightcolor=[("active", c["sidebar_hover"])], darkcolor=[("active", c["sidebar_hover"])],
-                      bordercolor=[("active", c["sidebar_hover"])], foreground=[("active", c["sidebar_fg"])])
-            flat("SidebarGhost.TButton", c["sidebar"], c["sidebar_hover"], foreground=c["sidebar_muted"],
-                 padding=(10, 6), font=font(9), focuscolor=c["sidebar"])
-            style.map("SidebarGhost.TButton", background=[("active", c["sidebar_hover"])],
-                      lightcolor=[("active", c["sidebar_hover"])], darkcolor=[("active", c["sidebar_hover"])],
-                      foreground=[("active", c["sidebar_fg"])])
             # Botones: secundarios con borde visible en ambos temas.
             flat("TButton", c["surface"], c["line_strong"], foreground=c["ink"], padding=(12, 6), relief="solid", width=-6)
             style.map("TButton", background=[("disabled", c["page"]), ("pressed", c["line"]), ("active", c["hover"])],
                       lightcolor=[("disabled", c["page"]), ("pressed", c["line"]), ("active", c["hover"])],
                       darkcolor=[("disabled", c["page"]), ("pressed", c["line"]), ("active", c["hover"])],
                       bordercolor=[("disabled", c["line"]), ("active", c["primary"])],
-                      foreground=[("disabled", c["unknown"])])
-            flat("Accent.TButton", c["button"], foreground=c["on_primary"], padding=(14, 7), font=font(10, "strong"))
-            style.map("Accent.TButton", background=[("disabled", c["line"]), ("pressed", c["primary_pressed"]), ("active", c["primary_hover"])],
-                      lightcolor=[("pressed", c["primary_pressed"]), ("active", c["primary_hover"])],
-                      darkcolor=[("pressed", c["primary_pressed"]), ("active", c["primary_hover"])],
-                      bordercolor=[("pressed", c["primary_pressed"]), ("active", c["primary_hover"])],
-                      foreground=[("disabled", c["muted"]), ("active", c["on_primary"])])
-            flat("Danger.TButton", c["surface"], c["line_strong"], foreground=c["rejected"], padding=(12, 6))
-            style.map("Danger.TButton", background=[("disabled", c["page"]), ("active", c["hover"])],
-                      lightcolor=[("disabled", c["page"]), ("active", c["hover"])],
-                      darkcolor=[("disabled", c["page"]), ("active", c["hover"])],
-                      bordercolor=[("disabled", c["line"]), ("active", c["rejected"])],
                       foreground=[("disabled", c["unknown"])])
             # Campos con anillo de foco.
             for name in ("TEntry", "TCombobox"):
@@ -6173,40 +6451,12 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             for orient, sticky in (("Vertical", "ns"), ("Horizontal", "ew")):
                 style.layout(f"{orient}.TScrollbar", [(f"{orient}.Scrollbar.trough", {"sticky": sticky, "children": [
                     (f"{orient}.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})]})])
-                # Casi todas viven en tablas y tarjetas; la de la página usa el fondo de página.
+                # El selector Tk de archivos también usa estas barras.
                 flat(f"{orient}.TScrollbar", c["thumb"], troughcolor=c["surface"], gripcount=0,
                      arrowsize=9, width=9, relief="flat", borderwidth=0)
                 style.configure(f"{orient}.TScrollbar", troughcolor=c["surface"], bordercolor=c["surface"])
                 style.map(f"{orient}.TScrollbar", background=[("active", c["thumb_active"]), ("pressed", c["thumb_active"])],
                           lightcolor=[("active", c["thumb_active"])], darkcolor=[("active", c["thumb_active"])])
-            style.configure("Page.Vertical.TScrollbar", troughcolor=c["page"], bordercolor=c["page"])
-            # Pestañas planas.
-            style.configure("TNotebook", background=c["page"], bordercolor=c["line"], lightcolor=c["page"],
-                            darkcolor=c["page"], borderwidth=0, tabmargins=(0, 0, 0, 0))
-            flat("TNotebook.Tab", c["page"], c["line"], foreground=c["muted"], padding=(16, 8))
-            style.map("TNotebook.Tab", background=[("selected", c["surface"]), ("active", c["hover"])],
-                      lightcolor=[("selected", c["surface"]), ("active", c["hover"])],
-                      darkcolor=[("selected", c["surface"]), ("active", c["hover"])],
-                      foreground=[("selected", c["primary"]), ("active", c["ink"])],
-                      font=[("selected", font(10, "strong"))], padding=[("selected", (16, 8))],
-                      expand=[("selected", (0, 0, 0, 0))])
-            style.configure("TLabelframe", background=c["page"], bordercolor=c["line"], relief="solid")
-            style.configure("TLabelframe.Label", background=c["page"], foreground=c["ink"], font=font(10, "strong"))
-            style.configure("TSeparator", background=c["line"])
-            # Tablas: encabezados alineados a la izquierda, selección tenue.
-            flat("Treeview", c["surface"], c["line"], fieldbackground=c["surface"], foreground=c["ink"],
-                 rowheight=30, borderwidth=1)
-            style.map("Treeview", background=[("selected", c["primary_soft"])],
-                      foreground=[("selected", c["ink"])])
-            flat("Treeview.Heading", c["surface"], c["line"], foreground=c["muted"], relief="flat",
-                 padding=(8, 7), font=font(9, "strong"))
-            style.map("Treeview.Heading", background=[("active", c["hover"])],
-                      lightcolor=[("active", c["hover"])], darkcolor=[("active", c["hover"])])
-            for menu in getattr(self, "_menus", ()):
-                menu.configure(background=c["surface"], foreground=c["ink"],
-                               activebackground=c["primary_soft"], activeforeground=c["ink"],
-                               borderwidth=0, font=font(10))
-            self._restyle_widgets()
 
         @property
         def canvases(self) -> list[Any]:
@@ -6214,30 +6464,16 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             return list(canvas_registry)
 
         def set_appearance(self, mode: str) -> None:
-            """Claro u oscuro: estilos de las pantallas aún en ttk, widgets CustomTkinter y lienzos."""
+            """Claro u oscuro en CustomTkinter y en los lienzos."""
             self._apply_theme(mode)
+            for detail in tuple(self.details):
+                detail.refresh()
             for canvas in self.canvases:
                 canvas.redraw()
             self.appearance.set(mode)
 
         def _toggle_theme(self) -> None:
             self.set_appearance("dark" if self.theme == "light" else "light")
-
-        def _restyle_widgets(self) -> None:
-            colors = self.colors
-            for name in ("stats_table",):
-                table = getattr(self, name, None)
-                if table is not None:
-                    table.tag_configure("stripe", background=colors["stripe"])
-            for tab in getattr(self, "entity_tabs", {}).values():
-                tab.restyle()
-            for tab in getattr(self, "relation_tabs", {}).values():
-                tab.restyle()
-            if hasattr(self, "queue_table"):
-                self.queue_table.tag_configure("stripe", background=colors["stripe"])
-            # Los lienzos (gráficos y tablas) se redibujan en set_appearance.
-            for detail in tuple(getattr(self, "details", ())):
-                detail.refresh()
 
         def _menu(self) -> None:
             self.menus = {}
@@ -6734,10 +6970,10 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             reason = self.ask_text("Motivo", "Motivo de la revisión:", parent=parent)
             if reason is None:
                 return
-            self.mutate(lambda: self.repo.enqueue_review(product_id.strip(), reason))
+            self.mutate(lambda: self.repo.enqueue_review(product_id.strip(), reason), changed={"cola"})
 
         def enqueue_rejected(self) -> None:
-            count = self.mutate(self.repo.enqueue_rejected)
+            count = self.mutate(self.repo.enqueue_rejected, changed={"cola"})
             if count == 0:
                 self.status.set("No hay productos rechazados fuera de la cola")
             elif count:
@@ -6749,14 +6985,14 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                 self.inform("Cola", "No hay revisiones pendientes", parent=self.root)
                 return
             dialog = ReviewDialog(self.root, self, job)
-            self.refresh()
+            self.refresh({"productos", "cola"})
             if dialog.result:
                 self.status.set(f"Revisión cerrada; el producto quedó {dialog.result['validacion']}. Guarde para conservarlo.")
 
         def discard_queue(self) -> None:
             job = self.repo.queue_front()
             if job and self.confirm("Descartar siguiente", f"¿Descartar revisión de {self.reference_label('productos', job['producto_id'])}?", parent=self.root):
-                self.mutate(self.repo.discard_review)
+                self.mutate(self.repo.discard_review, changed={"cola"})
 
         def _stats_move(self, direction: int) -> None:
             self.stats_offset = max(0, self.stats_offset + direction * PAGE_SIZE)
@@ -6962,7 +7198,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                 if kind and self.scope_id.get():
                     entity = self.repo.get(kind, self.scope_id.get())
                     if entity is not None and entity["activo"] == "1":
-                        indicator = self.repo.indicator(kind, self.scope_id.get(), start, end, status)
+                        indicator = self.indicator(kind, self.scope_id.get(), start, end, status)
             except (ValueError, DataError) as exc:
                 self.filter_error.set(f"Filtro inválido: {exc}. Se conservan los últimos resultados válidos.")
                 self.filter_error_label.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
@@ -7017,32 +7253,47 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                 self._usage_cache[kind] = self.repo.field_usage(kind)
             return self._usage_cache[kind]
 
-        def refresh(self) -> None:
-            self._record_cache.clear()
-            self._usage_cache.clear()
-            for tab in self.entity_tabs.values():
-                tab.refresh()
-            for tab in self.relation_tabs.values():
-                tab.refresh()
-            self.refresh_queue()
-            self.overview = self.repo.summary()
-            self._scope_changed()
+        def refresh(self, changed: set[str] | None = None) -> None:
+            affected = set(ALL_FIELDS) | {"cola"} if changed is None else set(changed)
+            if affected & {"grupos", "investigadores", "productos", "autorias", "grupos_productos"}:
+                affected.add("productos")  # La validación del producto depende de sus vínculos y extremos.
+            if affected & set(ALL_FIELDS):
+                self._record_cache.clear()
+                for kind in affected:
+                    self._usage_cache.pop(kind, None)
+            analysis_changed = bool(affected & (set(ALL_FIELDS) - {"planes"}))
+            if analysis_changed:
+                self._indicator_cache.clear()
+            for kind, tab in self.entity_tabs.items():
+                if kind in affected or (kind == "planes" and "grupos" in affected):
+                    tab.refresh()
+            for kind, tab in self.relation_tabs.items():
+                if kind in affected or affected.intersection(RELATION_ENDS[kind][2:]):
+                    tab.refresh()
+            if affected & {"cola", "productos"}:
+                self.refresh_queue()
+            if affected & {"grupos", "investigadores"}:
+                self.overview = self.repo.summary()
+            if analysis_changed:
+                self._scope_changed()
             self.root.title("PEA-i UPC — Investigación" + (" *" if self.repo.dirty else ""))
             self.workspace.set(self.workspace_caption)
             self.workspace_state.set("Cambios sin guardar" if self.repo.dirty else "Guardado",
                                      "pending" if self.repo.dirty else "muted")
             self.save_button.configure(text="Guardar como…" if self.data_file is None else "Guardar")
             for detail in tuple(self.details):
-                if detail.winfo_exists():
-                    detail.refresh()
+                if detail.winfo_exists() and (changed is None or detail.kind in affected or analysis_changed
+                        or any(tab.source in affected or tab.target_kind in affected
+                               for tab in detail.link_tabs.values())):
+                    detail.refresh(affected if changed is not None else None)
 
-        def mutate(self, action: Callable[[], Any]) -> Any:
+        def mutate(self, action: Callable[[], Any], *, changed: set[str] | None = None) -> Any:
             try:
                 result = action()
             except (DataError, OSError, ValueError) as exc:
                 self.alert("No se pudo completar", str(exc), parent=self.root)
                 return None
-            self.refresh()
+            self.refresh(changed)
             self.status.set("Cambio en memoria. Guarde para conservarlo al cerrar.")
             return result
 
@@ -7054,6 +7305,21 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             if cache_key not in self._record_cache:
                 self._record_cache[cache_key] = self.repo.get(kind, key) or {"id": key, "activo": "0"}
             return self._record_cache[cache_key]
+
+        def cache_references(self, page: dict[str, Any]) -> None:
+            for kind, rows in page["references"].items():
+                for row in rows:
+                    self._record_cache[(kind, row["id"])] = row
+
+        def indicator(self, kind: str, key: str, start: int | None = None,
+                      end: int | None = None, status: str = "") -> dict[str, Any]:
+            cache_key = (kind, key, start, end, status, date.today().year)
+            if cache_key not in self._indicator_cache:
+                result = self.repo.indicator(kind, key, start, end, status)
+                if len(self._indicator_cache) >= 64:
+                    self._indicator_cache.pop(next(iter(self._indicator_cache)))
+                self._indicator_cache[cache_key] = result
+            return self._indicator_cache[cache_key]
 
         def open_detail(self, kind: str, key: str, parent: tk.Misc | None = None,
                         tab: str | None = None) -> DetailDialog | None:
@@ -7068,58 +7334,13 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             return f"{record_name(row)} · {key}"
 
         def entity_page(self, kind: str, offset: int, query: str, state: str) -> dict[str, Any]:
-            if state == "Todos":
-                return self.repo.page(kind, offset, PAGE_SIZE, query)
-            active = "1" if state == "Activos" else "0"
-            total = position = 0
-            rows = []
-            while True:
-                page = self.repo.page(kind, position, PAGE_SIZE, query)
-                for row in page["rows"]:
-                    if row["activo"] != active:
-                        continue
-                    if offset <= total < offset + PAGE_SIZE:
-                        rows.append(row)
-                    total += 1
-                position += len(page["rows"])
-                if not page["rows"] or position >= page["total"]:
-                    break
-            return {"total": total, "rows": rows}
+            active = {"Todos": "", "Activos": "1", "Inactivos": "0"}[state]
+            return self.repo.page(kind, offset, PAGE_SIZE, query, active=active)
 
         def relationship_page(self, kind: str, offset: int, query: str) -> dict[str, Any]:
-            needle = query.strip().casefold()
-            if not needle:
-                return self.repo.page(kind, offset, PAGE_SIZE)
-            ends = RELATION_ENDS[kind]
-            matching_ids = []
-            for entity_kind in ends[2:]:
-                ids = set()
-                position = 0
-                while True:
-                    page = self.repo.page(entity_kind, position, PAGE_SIZE, query)
-                    for row in page["rows"]:
-                        ids.add(row["id"])
-                        self._record_cache[(entity_kind, row["id"])] = row
-                    position += len(page["rows"])
-                    if not page["rows"] or position >= page["total"]:
-                        break
-                matching_ids.append(ids)
-            total = 0
-            rows = []
-            position = 0
-            while True:
-                page = self.repo.page(kind, position, PAGE_SIZE)
-                for row in page["rows"]:
-                    if (row[ends[0]] not in matching_ids[0] and row[ends[1]] not in matching_ids[1]
-                            and needle not in " ".join(row.values()).casefold()):
-                        continue
-                    if offset <= total < offset + PAGE_SIZE:
-                        rows.append(row)
-                    total += 1
-                position += len(page["rows"])
-                if not page["rows"] or position >= page["total"]:
-                    break
-            return {"total": total, "rows": rows}
+            page = self.repo.page(kind, offset, PAGE_SIZE, query, include_references=True)
+            self.cache_references(page)
+            return {"total": page["total"], "rows": page["rows"]}
 
         def edit_record(self, kind: str, key: str | tuple[str, str] | None = None,
                         defaults: dict[str, str] | None = None, parent: tk.Misc | None = None,
@@ -7134,7 +7355,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                                   external=external, is_new=key is None, locked_fields=locked_fields)
             if dialog.result is None:
                 return False
-            self.refresh()
+            self.refresh({kind})
             self.status.set("Cambio en memoria. Guarde para conservarlo al cerrar.")
             return True
 
@@ -7180,7 +7401,11 @@ def build_gui(root: Any, repository: Repository | CppRepository,
         def new_workspace(self) -> None:
             if self._may_discard():
                 if isinstance(self.repo, CppRepository):
-                    self.repo.reset()
+                    try:
+                        self.repo.reset()
+                    except BackendError as exc:
+                        self.alert("Motor C++ no disponible", str(exc), parent=self.root)
+                        return
                 else:
                     self.repo = Repository()
                 self.data_file = None
@@ -7196,6 +7421,9 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                     self.repo.load(path)
                 else:
                     new_repo = load_repository(path)
+            except BackendError as exc:
+                self.alert("Motor C++ no disponible", str(exc), parent=self.root)
+                return
             except (DataError, OSError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
                 backup = backup_of(path)
                 if backup.exists() and self.confirm("Datos dañados", f"{exc}\n\n¿Abrir la copia anterior de .backup?", parent=self.root):
@@ -7204,6 +7432,9 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                             self.repo.load(backup)
                         else:
                             new_repo = load_repository(backup)
+                    except BackendError as backup_exc:
+                        self.alert("Motor C++ no disponible", str(backup_exc), parent=self.root)
+                        return
                     except (DataError, OSError, ValueError, UnicodeError, json.JSONDecodeError) as backup_exc:
                         self.alert("Copia inválida", str(backup_exc), parent=self.root)
                         return
@@ -7247,7 +7478,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             except (OSError, DataError) as exc:
                 self.alert("No se pudo guardar", str(exc), parent=self.root)
                 return False
-            self.refresh()
+            self.refresh(set())
             self.status.set(f"Guardado en {self.data_file}")
             return True
 
@@ -7307,7 +7538,7 @@ def build_gui(root: Any, repository: Repository | CppRepository,
 
         def clear_history(self) -> None:
             if self.repo.history_size() and self.confirm("Vaciar historial", "¿Eliminar las acciones para deshacer?", parent=self.root):
-                self.mutate(self.repo.clear_history)
+                self.mutate(self.repo.clear_history, changed=set())
 
         def import_csv(self) -> None:
             path = filedialog.askopenfilename(parent=self.root, title="Importar hoja de cálculo",
@@ -7408,6 +7639,17 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             url_box.insert(0, preview.url)
             url_box.configure(state="readonly")
             url_box.pack(fill="x", padx=(0, 8))
+            dialog.diagnostics = preview.diagnostics
+            if preview.diagnostics:
+                warning_text = (f"Advertencias de extracción: {len(preview.diagnostics)}\n"
+                                + "\n".join(preview.diagnostics[:5]))
+                if len(preview.diagnostics) > 5:
+                    warning_text += "\nConsulte todas en «Ver texto de la página»."
+                dialog.diagnostics_label = ctk.CTkLabel(
+                    page, text=warning_text, font=FONTS["small"], text_color=T["pending"],
+                    anchor="w", justify="left", wraplength=820)
+                dialog.diagnostics_label.pack(fill="x", pady=(12, 0))
+                wrapped.append(dialog.diagnostics_label)
             detected = bool(preview.related_members or preview.related_products or preview.related_plan)
             dialog.detected = {}
             dialog.category_chips = []
@@ -7451,7 +7693,8 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             wrapped[-1].pack(fill="x", pady=(14, 0))
             page.bind("<Configure>", lambda event: [label.configure(wraplength=max(300, event.width / scale_of(page) - 24))
                                                     for label in wrapped], add="+")
-            details = ["METADATOS DECLARADOS POR LA PÁGINA"]
+            details = (["ADVERTENCIAS DE EXTRACCIÓN", *preview.diagnostics, ""] if preview.diagnostics else [])
+            details.append("METADATOS DECLARADOS POR LA PÁGINA")
             details.extend(f"{key}: {value}" for key, value in preview.metadata.items())
             if not preview.metadata:
                 details.append("Ninguno")
@@ -7500,7 +7743,13 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                     return
                 title = "Ficha GrupLAC" if kind == "grupos" else "Ficha CvLAC"
                 reviewed = None
-                if self.repo.get(kind, proposed["id"]) is None:
+                code = "codigo_gruplac" if kind == "grupos" else "codigo_cvlac"
+                try:
+                    existing = self.repo.get(kind, proposed["id"]) or self.repo.find_external(kind, proposed[code])
+                except BackendError as exc:
+                    self.alert(title, str(exc), parent=self.root)
+                    return
+                if existing is None:
                     review = RecordDialog(self.root, kind, proposed, external=True, repo=self.repo)
                     if not review.result:
                         return
@@ -7515,7 +7764,8 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                     return
                 self.refresh()
                 self._keep_import(f"Ficha incorporada: {counts['actualizados']} registros actualizados.")
-                self.show_import_result(counts, kind, (reviewed or proposed)["id"])
+                key = existing["id"] if existing is not None else (reviewed or proposed)["id"]
+                self.show_import_result(counts, kind, key, diagnostics=preview.diagnostics)
 
             for kind, label in (("grupos", "Crear grupo"), ("investigadores", "Crear investigador"),
                                 ("productos", "Crear producto")):
@@ -7539,10 +7789,12 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             dialog.present(wait=False)
             return dialog
 
-        def show_import_result(self, counts: dict[str, Any], kind: str, key: str) -> Dialog:
+        def show_import_result(self, counts: dict[str, Any], kind: str, key: str,
+                               *, diagnostics: tuple[str, ...] = ()) -> Dialog:
             """Resultado de incorporar una ficha; «Ver indicador» abre la ficha del grupo o investigador en su indicador."""
             title = {"grupos": "Ficha GrupLAC", "investigadores": "Ficha CvLAC"}.get(kind, "Resultado de importación")
             dialog = Dialog(self.root, title, 560)
+            dialog.diagnostics = diagnostics
             ctk.CTkLabel(dialog.body, text=title + " incorporada", font=FONTS["h2"], text_color=T["ink"],
                          anchor="w").pack(fill="x")
             ctk.CTkLabel(dialog.body, text=self.reference_label(kind, key), font=FONTS["small"], text_color=T["muted"],
@@ -7560,6 +7812,17 @@ def build_gui(root: Any, repository: Repository | CppRepository,
                 ctk.CTkLabel(dialog.body, text=f"Errores: {len(counts['errors'])}\n" + "\n".join(counts["errors"][:5]),
                              font=FONTS["small"], text_color=T["rejected"], anchor="w", justify="left",
                              wraplength=500).pack(fill="x", pady=(10, 0))
+            if diagnostics:
+                dialog.diagnostics_label = ctk.CTkLabel(
+                    dialog.body, text=f"Advertencias de extracción: {len(diagnostics)}\n" + "\n".join(diagnostics[:5]),
+                    font=FONTS["small"], text_color=T["pending"], anchor="w", justify="left", wraplength=500)
+                dialog.diagnostics_label.pack(fill="x", pady=(10, 0))
+                if len(diagnostics) > 5:
+                    dialog.buttons["diagnostics"] = button(
+                        dialog.body, "Ver todas las advertencias",
+                        lambda: self.inform("Advertencias de extracción", "\n".join(diagnostics), parent=dialog),
+                        width=220)
+                    dialog.buttons["diagnostics"].pack(anchor="w", pady=(6, 0))
 
             def open_indicator() -> None:
                 dialog.close()
@@ -7579,12 +7842,15 @@ def build_gui(root: Any, repository: Repository | CppRepository,
             url = self.ask_text("Origen del PDF", "URL original pública de la ficha GrupLAC/CvLAC:", parent=self.root)
             if not url:
                 return
+            diagnostics: list[str] = []
             try:
-                kind, row = parse_scienti_pdf(Path(path), url.strip())
+                kind, row = parse_scienti_pdf(Path(path), url.strip(), diagnostics=diagnostics)
                 row["fuente"] = f"PDF {Path(path).name}, consultado {date.today().isoformat()}"
             except (DataError, OSError, ValueError) as exc:
                 self.alert("Importación PDF", str(exc), parent=self.root)
                 return
+            if diagnostics:
+                self.inform("Advertencias de extracción", "\n".join(diagnostics), parent=self.root)
             self._accept_external(kind, row)
 
         def import_docx(self) -> None:

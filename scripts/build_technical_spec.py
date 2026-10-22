@@ -414,16 +414,19 @@ def build() -> None:
         heading(doc, "Protocolo entre procesos", 2)
         paragraph(doc, "Cada solicitud es un objeto JSON en una línea con la acción y sus parámetros como "
                        "cadenas; la respuesta es {\"ok\":true,\"result\":…} o {\"ok\":false,\"error\":…}. Al conectarse, la interfaz "
-                       "envía ping y exige la respuesta {\"backend\":\"cpp\",\"protocol\":\"4\"}; con otra "
+                       "envía ping y exige la respuesta {\"backend\":\"cpp\",\"protocol\":\"6\"}; con otra "
                        "versión no usa el proceso. pea_cpp acepta --data ARCHIVO para abrir un archivo al iniciar.")
-        add_table(doc, ["Grupo", "Acciones del protocolo 4"], [
+        add_table(doc, ["Grupo", "Acciones del protocolo 6"], [
             ["Sesión y archivo", "ping, state, reset, load, save, shutdown"],
-            ["Consulta", "rows, page, get, related, related_page, summary, field_usage, product_issues, statistics"],
+            ["Consulta", "rows, page, get, find_external, related, related_page, summary, field_usage, product_issues, statistics"],
             ["Modelo 2024", "catalog (169 subtipos con clase, ventana y pesos), indicator (tipo, ID, años inicial y final, validación)"],
-            ["Cambios", "new_id, create, update, delete, toggle, preview_csv, import_csv"],
+            ["Cambios", "new_id, create, update, delete, toggle, preview_csv, import_csv, begin_batch, end_batch"],
             ["Cola de revisión", "queue_rows, queue_page, queue_front, enqueue_review, enqueue_rejected, process_review, discard_review"],
             ["Historial", "undo, clear_history"],
         ], [3.6, 13.2])
+        paragraph(doc, "Las consultas page filtran por estado activo y, para planes, por grupo antes de paginar. "
+                       "page y related_page admiten búsqueda sobre los extremos de los vínculos y referencias "
+                       "de las filas devueltas para mostrar sus nombres sin solicitudes adicionales.")
         paragraph(doc, "Los casos de uso cubren inicio vacío o desde el archivo de datos, mantenimiento de entidades y "
                        "vínculos, asignación de la categoría del modelo a un producto, incorporación de fichas "
                        "GrupLAC y CvLAC, consulta estadística, cálculo del indicador de un grupo o de un "

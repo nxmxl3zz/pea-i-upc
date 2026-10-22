@@ -23,6 +23,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -52,6 +53,7 @@ const std::array<std::string, 7> ALL_KINDS = {
 };
 constexpr std::size_t MAX_FIELD_LENGTH = 100000;
 constexpr std::size_t MAX_CSV_ROWS = 500000;
+constexpr std::size_t MAX_HISTORY_BYTES = 64 * 1024 * 1024;
 const std::vector<std::string> PRODUCT_FIELDS_V4 = {
     "id", "titulo", "anio", "fecha", "familia", "tipologia",
     "validacion", "observacion", "doi", "url", "fuente", "activo"
@@ -415,15 +417,22 @@ std::string externalField(const std::string& kind) {
     if (kind == "productos") return "doi";
     return "";
 }
+std::string searchKey(const std::string& value);
 bool rowMatches(const Row& row, const std::string& query) {
     if (query.empty()) return true;
-    for (const auto& item : row)
-        if (lowercase(item.second).find(query) != std::string::npos) return true;
-    return false;
+    std::string text;
+    for (const auto& item : row) {
+        if (item.second.empty()) continue;
+        if (!text.empty()) text.push_back(' ');
+        text += item.second;
+    }
+    return searchKey(text).find(query) != std::string::npos;
 }
 struct Page {
     Rows rows;
     std::size_t total = 0;
+    bool includeReferences = false;
+    std::map<std::string, Rows> references;
 };
 Row cleanRow(const std::string& kind, const Row& input) {
     auto spec = FIELDS.find(kind);
@@ -448,7 +457,7 @@ Row cleanRow(const std::string& kind, const Row& input) {
     if (kind == "productos") {
         if (!row["fecha"].empty() && row["anio"].empty()) row["anio"] = row["fecha"].substr(0, 4);
         if (!row["anio"].empty()) {
-            if (!digits(row["anio"])) throw DataError("Anio invalido");
+            if (row["anio"].size() != 4 || !digits(row["anio"])) throw DataError("Anio invalido");
             int year;
             try { year = std::stoi(row["anio"]); }
             catch (const std::exception&) { throw DataError("Anio invalido"); }
@@ -814,6 +823,7 @@ public:
     }
     std::size_t size() const { return length_; }
     void push(std::string value) {
+        if (value.size() > MAX_HISTORY_BYTES) throw DataError("El historial supera 64 MiB");
         top_ = new Node(std::move(value), top_);
         ++length_;
         if (length_ > LIMIT) {
@@ -844,11 +854,6 @@ public:
             top_ = next;
         }
         length_ = 0;
-    }
-    std::vector<std::string> values() const {
-        std::vector<std::string> result;
-        for (Node* node = top_; node; node = node->next) result.push_back(node->value);
-        return result;
     }
     void forEach(const std::function<void(const std::string&)>& visit) const {
         for (Node* node = top_; node; node = node->next) visit(node->value);
@@ -958,7 +963,8 @@ std::string storageCell(const std::string& value) {
 // Lee registros uno a uno; admite BOM, comillas, CRLF y saltos de linea dentro de celdas.
 // Entrega cada registro con la linea del archivo donde empieza.
 void readCsvRecords(const fs::path& path,
-                    const std::function<void(std::vector<std::string>&, std::size_t)>& visit) {
+                    const std::function<void(std::vector<std::string>&, std::size_t)>& visit,
+                    std::size_t maxRecords = SIZE_MAX) {
     std::ifstream input(path, std::ios::binary);
     if (!input) throw DataError("No se pudo abrir " + path.string());
     char bom[3]{};
@@ -970,7 +976,7 @@ void readCsvRecords(const fs::path& path,
     std::vector<std::string> record;
     std::string cell;
     bool quoted = false, closedQuote = false, touched = false;
-    std::size_t line = 1, start = 1;
+    std::size_t line = 1, start = 1, records = 0;
     auto finish = [&] {
         record.push_back(std::move(cell));
         cell.clear();
@@ -979,6 +985,7 @@ void readCsvRecords(const fs::path& path,
                 throw DataError(path.filename().string() + ", linea " + std::to_string(start) +
                                 ": texto no es UTF-8 valido");
         visit(record, start);
+        ++records;
         record.clear();
         touched = false;
         closedQuote = false;
@@ -1005,6 +1012,7 @@ void readCsvRecords(const fs::path& path,
             touched = true;
         } else if (ch == '\r' || ch == '\n') {
             finish();
+            if (records >= maxRecords) return;
             if (ch == '\r' && input.peek() == '\n') input.get();
             start = ++line;
         } else {
@@ -1012,6 +1020,8 @@ void readCsvRecords(const fs::path& path,
             cell.push_back(ch);
             touched = true;
         }
+        if (cell.size() > MAX_HISTORY_BYTES)
+            throw DataError("La celda CSV supera 64 MiB");
     }
     if (!input.eof()) throw DataError("Error al leer " + path.string());
     if (quoted) throw DataError("Comillas CSV sin cerrar");
@@ -1112,6 +1122,154 @@ void appendUtf8(std::string& output, std::uint32_t codepoint) {
         output.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f)));
         output.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
     }
+}
+// Unicode 16.0.0: casefold completo, comprimido en rangos y excepciones.
+// Mantiene la busqueda equivalente a str.casefold sin depender de la locale del sistema.
+std::string searchKey(const std::string& value) {
+    struct Range { std::uint32_t first, last, step; int delta; };
+    static constexpr Range ranges[] = {
+        {0x41,0x5a,1,32}, {0xc0,0xd6,1,32}, {0xd8,0xde,1,32},
+        {0x100,0x12e,2,1}, {0x132,0x136,2,1}, {0x139,0x147,2,1},
+        {0x14a,0x176,2,1}, {0x179,0x17d,2,1}, {0x1a0,0x1a4,2,1},
+        {0x1cb,0x1db,2,1}, {0x1de,0x1ee,2,1}, {0x1f8,0x21e,2,1},
+        {0x222,0x232,2,1}, {0x246,0x24e,2,1}, {0x388,0x38a,1,37},
+        {0x391,0x3a1,1,32}, {0x3a3,0x3ab,1,32}, {0x3d8,0x3ee,2,1},
+        {0x3fd,0x3ff,1,-130}, {0x400,0x40f,1,80}, {0x410,0x42f,1,32},
+        {0x460,0x480,2,1}, {0x48a,0x4be,2,1}, {0x4c1,0x4cd,2,1},
+        {0x4d0,0x52e,2,1}, {0x531,0x556,1,48}, {0x10a0,0x10c5,1,7264},
+        {0x13f8,0x13fd,1,-8}, {0x1c90,0x1cba,1,-3008}, {0x1cbd,0x1cbf,1,-3008},
+        {0x1e00,0x1e94,2,1}, {0x1ea0,0x1efe,2,1}, {0x1f08,0x1f0f,1,-8},
+        {0x1f18,0x1f1d,1,-8}, {0x1f28,0x1f2f,1,-8}, {0x1f38,0x1f3f,1,-8},
+        {0x1f48,0x1f4d,1,-8}, {0x1f59,0x1f5f,2,-8}, {0x1f68,0x1f6f,1,-8},
+        {0x1fc8,0x1fcb,1,-86}, {0x2160,0x216f,1,16}, {0x24b6,0x24cf,1,26},
+        {0x2c00,0x2c2f,1,48}, {0x2c67,0x2c6b,2,1}, {0x2c80,0x2ce2,2,1},
+        {0xa640,0xa66c,2,1}, {0xa680,0xa69a,2,1}, {0xa722,0xa72e,2,1},
+        {0xa732,0xa76e,2,1}, {0xa77e,0xa786,2,1}, {0xa796,0xa7a8,2,1},
+        {0xa7b4,0xa7c2,2,1}, {0xa7d6,0xa7da,2,1}, {0xab70,0xabbf,1,-38864},
+        {0xff21,0xff3a,1,32}, {0x10400,0x10427,1,40}, {0x104b0,0x104d3,1,40},
+        {0x10570,0x10594,2,39}, {0x10571,0x10579,2,39}, {0x1057d,0x10589,2,39},
+        {0x1058d,0x10591,2,39}, {0x10c80,0x10cb2,1,64}, {0x10d50,0x10d65,1,32},
+        {0x118a0,0x118bf,1,32}, {0x16e40,0x16e5f,1,32}, {0x1e900,0x1e921,1,34},
+    };
+    struct Fold { std::uint32_t codepoint; const char* replacement; };
+    static constexpr Fold folds[] = {
+        {0xb5,"\xce\xbc"}, {0xdf,"\x73\x73"}, {0x130,"\x69\xcc\x87"},
+        {0x149,"\xca\xbc\x6e"}, {0x178,"\xc3\xbf"}, {0x17f,"\x73"},
+        {0x181,"\xc9\x93"}, {0x182,"\xc6\x83"}, {0x184,"\xc6\x85"},
+        {0x186,"\xc9\x94"}, {0x187,"\xc6\x88"}, {0x189,"\xc9\x96"},
+        {0x18a,"\xc9\x97"}, {0x18b,"\xc6\x8c"}, {0x18e,"\xc7\x9d"},
+        {0x18f,"\xc9\x99"}, {0x190,"\xc9\x9b"}, {0x191,"\xc6\x92"},
+        {0x193,"\xc9\xa0"}, {0x194,"\xc9\xa3"}, {0x196,"\xc9\xa9"},
+        {0x197,"\xc9\xa8"}, {0x198,"\xc6\x99"}, {0x19c,"\xc9\xaf"},
+        {0x19d,"\xc9\xb2"}, {0x19f,"\xc9\xb5"}, {0x1a6,"\xca\x80"},
+        {0x1a7,"\xc6\xa8"}, {0x1a9,"\xca\x83"}, {0x1ac,"\xc6\xad"},
+        {0x1ae,"\xca\x88"}, {0x1af,"\xc6\xb0"}, {0x1b1,"\xca\x8a"},
+        {0x1b2,"\xca\x8b"}, {0x1b3,"\xc6\xb4"}, {0x1b5,"\xc6\xb6"},
+        {0x1b7,"\xca\x92"}, {0x1b8,"\xc6\xb9"}, {0x1bc,"\xc6\xbd"},
+        {0x1c4,"\xc7\x86"}, {0x1c5,"\xc7\x86"}, {0x1c7,"\xc7\x89"},
+        {0x1c8,"\xc7\x89"}, {0x1ca,"\xc7\x8c"}, {0x1f0,"\x6a\xcc\x8c"},
+        {0x1f1,"\xc7\xb3"}, {0x1f2,"\xc7\xb3"}, {0x1f4,"\xc7\xb5"},
+        {0x1f6,"\xc6\x95"}, {0x1f7,"\xc6\xbf"}, {0x220,"\xc6\x9e"},
+        {0x23a,"\xe2\xb1\xa5"}, {0x23b,"\xc8\xbc"}, {0x23d,"\xc6\x9a"},
+        {0x23e,"\xe2\xb1\xa6"}, {0x241,"\xc9\x82"}, {0x243,"\xc6\x80"},
+        {0x244,"\xca\x89"}, {0x245,"\xca\x8c"}, {0x345,"\xce\xb9"},
+        {0x370,"\xcd\xb1"}, {0x372,"\xcd\xb3"}, {0x376,"\xcd\xb7"},
+        {0x37f,"\xcf\xb3"}, {0x386,"\xce\xac"}, {0x38c,"\xcf\x8c"},
+        {0x38e,"\xcf\x8d"}, {0x38f,"\xcf\x8e"}, {0x390,"\xce\xb9\xcc\x88\xcc\x81"},
+        {0x3b0,"\xcf\x85\xcc\x88\xcc\x81"}, {0x3c2,"\xcf\x83"}, {0x3cf,"\xcf\x97"},
+        {0x3d0,"\xce\xb2"}, {0x3d1,"\xce\xb8"}, {0x3d5,"\xcf\x86"},
+        {0x3d6,"\xcf\x80"}, {0x3f0,"\xce\xba"}, {0x3f1,"\xcf\x81"},
+        {0x3f4,"\xce\xb8"}, {0x3f5,"\xce\xb5"}, {0x3f7,"\xcf\xb8"},
+        {0x3f9,"\xcf\xb2"}, {0x3fa,"\xcf\xbb"}, {0x4c0,"\xd3\x8f"},
+        {0x587,"\xd5\xa5\xd6\x82"}, {0x10c7,"\xe2\xb4\xa7"}, {0x10cd,"\xe2\xb4\xad"},
+        {0x1c80,"\xd0\xb2"}, {0x1c81,"\xd0\xb4"}, {0x1c82,"\xd0\xbe"},
+        {0x1c83,"\xd1\x81"}, {0x1c84,"\xd1\x82"}, {0x1c85,"\xd1\x82"},
+        {0x1c86,"\xd1\x8a"}, {0x1c87,"\xd1\xa3"}, {0x1c88,"\xea\x99\x8b"},
+        {0x1c89,"\xe1\xb2\x8a"}, {0x1e96,"\x68\xcc\xb1"}, {0x1e97,"\x74\xcc\x88"},
+        {0x1e98,"\x77\xcc\x8a"}, {0x1e99,"\x79\xcc\x8a"}, {0x1e9a,"\x61\xca\xbe"},
+        {0x1e9b,"\xe1\xb9\xa1"}, {0x1e9e,"\x73\x73"}, {0x1f50,"\xcf\x85\xcc\x93"},
+        {0x1f52,"\xcf\x85\xcc\x93\xcc\x80"}, {0x1f54,"\xcf\x85\xcc\x93\xcc\x81"}, {0x1f56,"\xcf\x85\xcc\x93\xcd\x82"},
+        {0x1f80,"\xe1\xbc\x80\xce\xb9"}, {0x1f81,"\xe1\xbc\x81\xce\xb9"}, {0x1f82,"\xe1\xbc\x82\xce\xb9"},
+        {0x1f83,"\xe1\xbc\x83\xce\xb9"}, {0x1f84,"\xe1\xbc\x84\xce\xb9"}, {0x1f85,"\xe1\xbc\x85\xce\xb9"},
+        {0x1f86,"\xe1\xbc\x86\xce\xb9"}, {0x1f87,"\xe1\xbc\x87\xce\xb9"}, {0x1f88,"\xe1\xbc\x80\xce\xb9"},
+        {0x1f89,"\xe1\xbc\x81\xce\xb9"}, {0x1f8a,"\xe1\xbc\x82\xce\xb9"}, {0x1f8b,"\xe1\xbc\x83\xce\xb9"},
+        {0x1f8c,"\xe1\xbc\x84\xce\xb9"}, {0x1f8d,"\xe1\xbc\x85\xce\xb9"}, {0x1f8e,"\xe1\xbc\x86\xce\xb9"},
+        {0x1f8f,"\xe1\xbc\x87\xce\xb9"}, {0x1f90,"\xe1\xbc\xa0\xce\xb9"}, {0x1f91,"\xe1\xbc\xa1\xce\xb9"},
+        {0x1f92,"\xe1\xbc\xa2\xce\xb9"}, {0x1f93,"\xe1\xbc\xa3\xce\xb9"}, {0x1f94,"\xe1\xbc\xa4\xce\xb9"},
+        {0x1f95,"\xe1\xbc\xa5\xce\xb9"}, {0x1f96,"\xe1\xbc\xa6\xce\xb9"}, {0x1f97,"\xe1\xbc\xa7\xce\xb9"},
+        {0x1f98,"\xe1\xbc\xa0\xce\xb9"}, {0x1f99,"\xe1\xbc\xa1\xce\xb9"}, {0x1f9a,"\xe1\xbc\xa2\xce\xb9"},
+        {0x1f9b,"\xe1\xbc\xa3\xce\xb9"}, {0x1f9c,"\xe1\xbc\xa4\xce\xb9"}, {0x1f9d,"\xe1\xbc\xa5\xce\xb9"},
+        {0x1f9e,"\xe1\xbc\xa6\xce\xb9"}, {0x1f9f,"\xe1\xbc\xa7\xce\xb9"}, {0x1fa0,"\xe1\xbd\xa0\xce\xb9"},
+        {0x1fa1,"\xe1\xbd\xa1\xce\xb9"}, {0x1fa2,"\xe1\xbd\xa2\xce\xb9"}, {0x1fa3,"\xe1\xbd\xa3\xce\xb9"},
+        {0x1fa4,"\xe1\xbd\xa4\xce\xb9"}, {0x1fa5,"\xe1\xbd\xa5\xce\xb9"}, {0x1fa6,"\xe1\xbd\xa6\xce\xb9"},
+        {0x1fa7,"\xe1\xbd\xa7\xce\xb9"}, {0x1fa8,"\xe1\xbd\xa0\xce\xb9"}, {0x1fa9,"\xe1\xbd\xa1\xce\xb9"},
+        {0x1faa,"\xe1\xbd\xa2\xce\xb9"}, {0x1fab,"\xe1\xbd\xa3\xce\xb9"}, {0x1fac,"\xe1\xbd\xa4\xce\xb9"},
+        {0x1fad,"\xe1\xbd\xa5\xce\xb9"}, {0x1fae,"\xe1\xbd\xa6\xce\xb9"}, {0x1faf,"\xe1\xbd\xa7\xce\xb9"},
+        {0x1fb2,"\xe1\xbd\xb0\xce\xb9"}, {0x1fb3,"\xce\xb1\xce\xb9"}, {0x1fb4,"\xce\xac\xce\xb9"},
+        {0x1fb6,"\xce\xb1\xcd\x82"}, {0x1fb7,"\xce\xb1\xcd\x82\xce\xb9"}, {0x1fb8,"\xe1\xbe\xb0"},
+        {0x1fb9,"\xe1\xbe\xb1"}, {0x1fba,"\xe1\xbd\xb0"}, {0x1fbb,"\xe1\xbd\xb1"},
+        {0x1fbc,"\xce\xb1\xce\xb9"}, {0x1fbe,"\xce\xb9"}, {0x1fc2,"\xe1\xbd\xb4\xce\xb9"},
+        {0x1fc3,"\xce\xb7\xce\xb9"}, {0x1fc4,"\xce\xae\xce\xb9"}, {0x1fc6,"\xce\xb7\xcd\x82"},
+        {0x1fc7,"\xce\xb7\xcd\x82\xce\xb9"}, {0x1fcc,"\xce\xb7\xce\xb9"}, {0x1fd2,"\xce\xb9\xcc\x88\xcc\x80"},
+        {0x1fd3,"\xce\xb9\xcc\x88\xcc\x81"}, {0x1fd6,"\xce\xb9\xcd\x82"}, {0x1fd7,"\xce\xb9\xcc\x88\xcd\x82"},
+        {0x1fd8,"\xe1\xbf\x90"}, {0x1fd9,"\xe1\xbf\x91"}, {0x1fda,"\xe1\xbd\xb6"},
+        {0x1fdb,"\xe1\xbd\xb7"}, {0x1fe2,"\xcf\x85\xcc\x88\xcc\x80"}, {0x1fe3,"\xcf\x85\xcc\x88\xcc\x81"},
+        {0x1fe4,"\xcf\x81\xcc\x93"}, {0x1fe6,"\xcf\x85\xcd\x82"}, {0x1fe7,"\xcf\x85\xcc\x88\xcd\x82"},
+        {0x1fe8,"\xe1\xbf\xa0"}, {0x1fe9,"\xe1\xbf\xa1"}, {0x1fea,"\xe1\xbd\xba"},
+        {0x1feb,"\xe1\xbd\xbb"}, {0x1fec,"\xe1\xbf\xa5"}, {0x1ff2,"\xe1\xbd\xbc\xce\xb9"},
+        {0x1ff3,"\xcf\x89\xce\xb9"}, {0x1ff4,"\xcf\x8e\xce\xb9"}, {0x1ff6,"\xcf\x89\xcd\x82"},
+        {0x1ff7,"\xcf\x89\xcd\x82\xce\xb9"}, {0x1ff8,"\xe1\xbd\xb8"}, {0x1ff9,"\xe1\xbd\xb9"},
+        {0x1ffa,"\xe1\xbd\xbc"}, {0x1ffb,"\xe1\xbd\xbd"}, {0x1ffc,"\xcf\x89\xce\xb9"},
+        {0x2126,"\xcf\x89"}, {0x212a,"\x6b"}, {0x212b,"\xc3\xa5"},
+        {0x2132,"\xe2\x85\x8e"}, {0x2183,"\xe2\x86\x84"}, {0x2c60,"\xe2\xb1\xa1"},
+        {0x2c62,"\xc9\xab"}, {0x2c63,"\xe1\xb5\xbd"}, {0x2c64,"\xc9\xbd"},
+        {0x2c6d,"\xc9\x91"}, {0x2c6e,"\xc9\xb1"}, {0x2c6f,"\xc9\x90"},
+        {0x2c70,"\xc9\x92"}, {0x2c72,"\xe2\xb1\xb3"}, {0x2c75,"\xe2\xb1\xb6"},
+        {0x2c7e,"\xc8\xbf"}, {0x2c7f,"\xc9\x80"}, {0x2ceb,"\xe2\xb3\xac"},
+        {0x2ced,"\xe2\xb3\xae"}, {0x2cf2,"\xe2\xb3\xb3"}, {0xa779,"\xea\x9d\xba"},
+        {0xa77b,"\xea\x9d\xbc"}, {0xa77d,"\xe1\xb5\xb9"}, {0xa78b,"\xea\x9e\x8c"},
+        {0xa78d,"\xc9\xa5"}, {0xa790,"\xea\x9e\x91"}, {0xa792,"\xea\x9e\x93"},
+        {0xa7aa,"\xc9\xa6"}, {0xa7ab,"\xc9\x9c"}, {0xa7ac,"\xc9\xa1"},
+        {0xa7ad,"\xc9\xac"}, {0xa7ae,"\xc9\xaa"}, {0xa7b0,"\xca\x9e"},
+        {0xa7b1,"\xca\x87"}, {0xa7b2,"\xca\x9d"}, {0xa7b3,"\xea\xad\x93"},
+        {0xa7c4,"\xea\x9e\x94"}, {0xa7c5,"\xca\x82"}, {0xa7c6,"\xe1\xb6\x8e"},
+        {0xa7c7,"\xea\x9f\x88"}, {0xa7c9,"\xea\x9f\x8a"}, {0xa7cb,"\xc9\xa4"},
+        {0xa7cc,"\xea\x9f\x8d"}, {0xa7d0,"\xea\x9f\x91"}, {0xa7dc,"\xc6\x9b"},
+        {0xa7f5,"\xea\x9f\xb6"}, {0xfb00,"\x66\x66"}, {0xfb01,"\x66\x69"},
+        {0xfb02,"\x66\x6c"}, {0xfb03,"\x66\x66\x69"}, {0xfb04,"\x66\x66\x6c"},
+        {0xfb05,"\x73\x74"}, {0xfb06,"\x73\x74"}, {0xfb13,"\xd5\xb4\xd5\xb6"},
+        {0xfb14,"\xd5\xb4\xd5\xa5"}, {0xfb15,"\xd5\xb4\xd5\xab"}, {0xfb16,"\xd5\xbe\xd5\xb6"},
+        {0xfb17,"\xd5\xb4\xd5\xad"}, {0x10595,"\xf0\x90\x96\xbc"},
+    };
+    std::string result;
+    result.reserve(value.size());
+    for (std::size_t i = 0; i < value.size();) {
+        auto codepoint = static_cast<std::uint32_t>(static_cast<unsigned char>(value[i++]));
+        if (codepoint < 0x80) {
+            result.push_back(static_cast<char>(codepoint >= 'A' && codepoint <= 'Z' ? codepoint + 32 : codepoint));
+            continue;
+        }
+        const unsigned extra = codepoint < 0xe0 ? 1 : codepoint < 0xf0 ? 2 : 3;
+        codepoint &= extra == 1 ? 0x1f : extra == 2 ? 0x0f : 0x07;
+        if (i + extra > value.size()) throw DataError("Texto UTF-8 incompleto");
+        for (unsigned part = 0; part < extra; ++part)
+            codepoint = (codepoint << 6) | (static_cast<unsigned char>(value[i++]) & 0x3f);
+        bool matched = false;
+        for (const auto& range : ranges) {
+            if (codepoint >= range.first && codepoint <= range.last &&
+                (codepoint - range.first) % range.step == 0) {
+                appendUtf8(result, static_cast<std::uint32_t>(static_cast<int>(codepoint) + range.delta));
+                matched = true;
+                break;
+            }
+        }
+        if (matched) continue;
+        const auto found = std::lower_bound(std::begin(folds), std::end(folds), codepoint,
+            [](const Fold& fold, std::uint32_t point) { return fold.codepoint < point; });
+        if (found != std::end(folds) && found->codepoint == codepoint) result += found->replacement;
+        else appendUtf8(result, codepoint);
+    }
+    return result;
 }
 class SnapshotParser {
     const std::string& text_;
@@ -1277,6 +1435,15 @@ class Repository {
     // Reglas incumplidas por producto; se mantiene junto con el campo "validacion".
     std::unordered_map<std::string, std::vector<std::string>> issues_;
     bool dirty_ = false;
+    bool batchActive_ = false;
+    std::vector<Rows> batchChanges_;
+    std::size_t batchBytes_ = 0;
+    using IndicatorCacheKey = std::tuple<std::string, std::optional<int>, std::optional<int>, std::string, int>;
+    struct IndicatorPopulation {
+        std::map<std::string, double> maxima;
+        std::size_t size = 0;
+    };
+    mutable std::map<IndicatorCacheKey, IndicatorPopulation> indicatorPopulation_;
 
     std::vector<std::string> ruleFailures(const Row& product) const {
         std::vector<std::string> failed;
@@ -1300,6 +1467,7 @@ class Repository {
         return failed;
     }
     void revalidate(const std::vector<std::string>& productIds) {
+        indicatorPopulation_.clear();
         for (const std::string& id : productIds) {
             Row* product = entities_[2].get(id);
             if (!product) { issues_.erase(id); continue; }
@@ -1327,7 +1495,14 @@ class Repository {
         return row;
     }
     void remember(Rows changes) {
-        history_.push("{\"__undo\":" + jsonRows(changes) + "}");
+        if (changes.empty()) return;
+        std::string state = "{\"__undo\":" + jsonRows(changes) + "}";
+        if (state.size() + batchBytes_ > MAX_HISTORY_BYTES)
+            throw DataError("El historial supera 64 MiB");
+        if (batchActive_) {
+            batchBytes_ += state.size();
+            batchChanges_.push_back(std::move(changes));
+        } else history_.push(std::move(state));
         dirty_ = true;
     }
     void indexJob(const Row& job) {
@@ -1369,7 +1544,111 @@ class Repository {
         }
         return changes;
     }
+    void validateUndo(const Rows& changes) const {
+        // Overlay de claves, referencias e identidades; no copia ni modifica las listas del repositorio.
+        using Key = std::pair<std::string, std::string>;
+        std::map<std::string, std::map<Key, std::optional<Row>>> pending;
+        std::map<Key, std::string> owners;
+        std::array<std::map<Key, std::ptrdiff_t>, 2> references;
+        std::map<std::string, std::ptrdiff_t> plans;
+        std::map<std::string, Row> jobs;
+        auto queued = queueProductCounts_;
+        forEachRow("planes", [&](const Row& row) { ++plans[field(row, "grupo_id")]; });
+        queue_.forEach([&](const Row& job) { jobs.emplace(field(job, "id"), job); });
+        auto lookup = [&](const std::string& kind, const std::string& key, const std::string& second = "") -> const Row* {
+            const auto& table = pending[kind];
+            auto found = table.find({key, second});
+            if (found != table.end()) return found->second ? &*found->second : nullptr;
+            return get(kind, key, second);
+        };
+        auto owner = [&](const std::string& kind, const std::string& value) {
+            auto changed = owners.find({kind, value});
+            if (changed != owners.end()) return changed->second;
+            const auto& index = externalIndex_[static_cast<std::size_t>(entityIndex(kind))];
+            auto found = index.find(value);
+            return found == index.end() ? std::string() : found->second;
+        };
+        for (const Row& change : changes) {
+            const std::string op = field(change, "__op"), kind = field(change, "__kind");
+            if (op == "queue_remove") {
+                auto found = jobs.find(field(change, "id"));
+                if (found == jobs.end()) throw DataError("Trabajo de historial no encontrado");
+                --queued[field(found->second, "producto_id")];
+                jobs.erase(found);
+                continue;
+            }
+            if (op == "queue_prepend") {
+                Row job;
+                for (const auto& name : QUEUE_FIELDS) job[name] = field(change, name);
+                if (field(job, "id").empty() || field(job, "creado").empty() || jobs.count(field(job, "id")) ||
+                    !lookup("productos", field(job, "producto_id"))) throw DataError("Trabajo de historial invalido");
+                ++queued[field(job, "producto_id")];
+                jobs.emplace(field(job, "id"), std::move(job));
+                continue;
+            }
+            Row row = change;
+            row.erase("__op");
+            row.erase("__kind");
+            row = legacyRow(kind, std::move(row));
+            if (op != "delete") row = cleanRow(kind, row);
+            const bool entity = entityIndex(kind) >= 0;
+            const std::string key = field(row, entity ? "id" : RELATION_ENDS.at(kind)[0]);
+            const std::string second = entity ? "" : field(row, RELATION_ENDS.at(kind)[1]);
+            const Row* current = lookup(kind, key, second);
+            if ((op == "create" && current) || (op != "create" && !current))
+                throw DataError("Historial incompatible con los registros actuales");
+            if (op == "delete") {
+                if (kind == "grupos" && plans[key] != 0) throw DataError("El grupo del historial aun tiene planes");
+                if (entity) {
+                    for (const auto& relation : RELATION_ENDS) {
+                        const auto& ends = relation.second;
+                        if (kind != ends[2] && kind != ends[3]) continue;
+                        const bool left = kind == ends[2];
+                        const auto count = static_cast<std::ptrdiff_t>(relatedPage(relation.first, key, left, 0, 0).total);
+                        if (count + references[left ? 0 : 1][{relation.first, key}] != 0)
+                            throw DataError("El registro del historial aun tiene relaciones");
+                    }
+                    if (kind == "productos" && queued[key] != 0)
+                        throw DataError("El producto del historial aun tiene revisiones");
+                }
+            } else {
+                if (kind == "planes" && !lookup("grupos", field(row, "grupo_id")))
+                    throw DataError("El grupo del plan de historial no existe");
+                if (!entity) {
+                    const auto& ends = RELATION_ENDS.at(kind);
+                    if (!lookup(ends[2], key) || !lookup(ends[3], second))
+                        throw DataError("La relacion del historial apunta a una entidad inexistente");
+                }
+                const std::string name = externalField(kind);
+                if (!name.empty() && !field(row, name).empty()) {
+                    const auto normalized = normalizedExternal(kind, field(row, name));
+                    const auto id = normalized.empty() ? std::string() : owner(kind, normalized);
+                    if (!id.empty() && id != key) throw DataError("Identidad externa duplicada en el historial");
+                }
+            }
+            const bool removing = op == "delete";
+            const std::ptrdiff_t delta = removing ? -1 : op == "create" ? 1 : 0;
+            if (!entity) {
+                references[0][{kind, key}] += delta;
+                references[1][{kind, second}] += delta;
+            }
+            if (kind == "planes") {
+                if (current) --plans[field(*current, "grupo_id")];
+                if (!removing) ++plans[field(row, "grupo_id")];
+            }
+            const std::string name = externalField(kind);
+            if (!name.empty()) {
+                const auto previous = current ? normalizedExternal(kind, field(*current, name)) : "";
+                const auto next = removing ? "" : normalizedExternal(kind, field(row, name));
+                if (!previous.empty()) owners[{kind, previous}] = "";
+                if (!next.empty()) owners[{kind, next}] = key;
+            }
+            pending[kind][{key, second}] = removing ? std::nullopt : std::optional<Row>(std::move(row));
+        }
+    }
     void applyUndo(const Rows& changes) {
+        validateUndo(changes);
+        dirty_ = true;
         for (const Row& change : changes) {
             const std::string op = field(change, "__op");
             const std::string kind = field(change, "__kind");
@@ -1403,6 +1682,7 @@ class Repository {
                 else {
                     Row* current = get(kind, key, second);
                     if (!current) throw DataError("Registro de historial no encontrado");
+                    checkLinks(kind, row);
                     checkExternal(kind, row, key);
                     if (entityIndex(kind) >= 0) reindexExternal(kind, current, &row);
                     *current = std::move(row);
@@ -1462,6 +1742,25 @@ public:
     Repository(Repository&&) noexcept = default;
     Repository& operator=(Repository&&) noexcept = default;
     bool dirty() const { return dirty_; }
+    void outsideBatch() const {
+        if (batchActive_) throw DataError("Hay una importacion en curso");
+    }
+    void beginBatch() {
+        outsideBatch();
+        batchActive_ = true;
+        batchChanges_.clear();
+        batchBytes_ = 0;
+    }
+    void endBatch() {
+        if (!batchActive_) throw DataError("No hay una importacion en curso");
+        Rows changes;
+        for (auto group = batchChanges_.rbegin(); group != batchChanges_.rend(); ++group)
+            for (Row& change : *group) changes.push_back(std::move(change));
+        batchChanges_.clear();
+        batchBytes_ = 0;
+        batchActive_ = false;
+        remember(std::move(changes));
+    }
     void markSaved() { dirty_ = false; }
     std::size_t historySize() const { return history_.size(); }
     std::size_t queueSize() const { return queue_.size(); }
@@ -1472,18 +1771,11 @@ public:
     Rows queueRows() const { return queue_.rows(); }
     Page queuePage(std::size_t offset, std::size_t limit) const { return queue_.page(offset, limit); }
     void forEachQueue(const std::function<void(const Row&)>& visit) const { queue_.forEach(visit); }
-    std::vector<std::string> historyValues() const { return history_.values(); }
     void forEachHistory(const std::function<void(const std::string&)>& visit) const {
         history_.forEach(visit);
     }
-    void pushHistory(std::string state) { history_.push(std::move(state)); dirty_ = true; }
-    void pushUndo(const Rows& changes) {
-        if (!changes.empty()) {
-            history_.push("{\"__undo\":" + jsonRows(changes) + "}");
-            dirty_ = true;
-        }
-    }
-    void clearHistory() { history_.clear(); dirty_ = true; }
+    void pushUndo(const Rows& changes) { remember(changes); }
+    void clearHistory() { outsideBatch(); history_.clear(); dirty_ = true; }
 
     Row* get(const std::string& kind, const std::string& key,
              const std::string& second = "") const {
@@ -1492,6 +1784,12 @@ public:
         int relation = relationIndex(kind);
         if (relation >= 0) return relations_[static_cast<std::size_t>(relation)].get(key, second);
         return nullptr;
+    }
+    const Row* findExternal(const std::string& kind, const std::string& value) const {
+        if (externalField(kind).empty()) throw DataError("Tipo sin identidad externa");
+        const auto& index = externalIndex_[static_cast<std::size_t>(entityIndex(kind))];
+        const auto found = index.find(normalizedExternal(kind, value));
+        return found == index.end() ? nullptr : get(kind, found->second);
     }
     Rows rows(const std::string& kind) const {
         int entity = entityIndex(kind);
@@ -1508,13 +1806,38 @@ public:
         throw DataError("Tipo desconocido: " + kind);
     }
     Page page(const std::string& kind, std::size_t offset, std::size_t limit,
-              const std::string& query) const {
-        const std::string normalized = lowercase(trim(query));
-        int entity = entityIndex(kind);
-        if (entity >= 0) return entities_[static_cast<std::size_t>(entity)].page(offset, limit, normalized);
-        int relation = relationIndex(kind);
-        if (relation >= 0) return relations_[static_cast<std::size_t>(relation)].page(offset, limit, normalized);
-        throw DataError("Tipo desconocido: " + kind);
+              const std::string& query, const std::string& active = "",
+              const std::string& groupId = "", bool includeReferences = false) const {
+        if (!active.empty() && active != "0" && active != "1") throw DataError("Activo debe ser 0 o 1");
+        if (!groupId.empty() && kind != "planes")
+            throw DataError("El filtro de grupo solo se admite para planes");
+        const int relation = relationIndex(kind);
+        if (includeReferences && relation < 0)
+            throw DataError("La busqueda de extremos solo se admite para relaciones");
+        const std::string normalized = searchKey(trim(query));
+        Page result;
+        if (active.empty() && groupId.empty() && (!includeReferences || normalized.empty())) {
+            const int entity = entityIndex(kind);
+            if (entity >= 0) return entities_[static_cast<std::size_t>(entity)].page(offset, limit, normalized);
+            if (relation < 0) throw DataError("Tipo desconocido: " + kind);
+            result = relations_[static_cast<std::size_t>(relation)].page(offset, limit, normalized);
+        } else {
+            forEachRow(kind, [&](const Row& row) {
+                if ((!active.empty() && field(row, "activo") != active) ||
+                    (!groupId.empty() && field(row, "grupo_id") != groupId)) return;
+                bool matches = rowMatches(row, normalized);
+                if (!matches && includeReferences) {
+                    const auto& ends = RELATION_ENDS.at(kind);
+                    matches = rowMatches(*get(ends[2], field(row, ends[0])), normalized) ||
+                              rowMatches(*get(ends[3], field(row, ends[1])), normalized);
+                }
+                if (!matches) return;
+                if (result.total >= offset && result.rows.size() < limit) result.rows.push_back(row);
+                ++result.total;
+            });
+        }
+        if (includeReferences) addPageReferences(result, kind);
+        return result;
     }
     std::pair<std::size_t, std::size_t> activeCounts() const {
         return {entities_[0].activeCount(), entities_[1].activeCount()};
@@ -1526,10 +1849,39 @@ public:
         return fromLeft ? list.byLeft(id) : list.byRight(id);
     }
     Page relatedPage(const std::string& kind, const std::string& id, bool fromLeft,
-                     std::size_t offset, std::size_t limit, bool activeOnly = false) const {
+                     std::size_t offset, std::size_t limit, bool activeOnly = false,
+                     const std::string& query = "", bool includeReferences = false) const {
         int relation = relationIndex(kind);
         if (relation < 0) throw DataError("Relacion desconocida: " + kind);
-        return relations_[static_cast<std::size_t>(relation)].relatedPage(id, fromLeft, offset, limit, activeOnly);
+        Page result;
+        const std::string normalized = searchKey(trim(query));
+        if (normalized.empty()) {
+            result = relations_[static_cast<std::size_t>(relation)].relatedPage(id, fromLeft, offset, limit, activeOnly);
+        } else {
+            const auto& ends = RELATION_ENDS.at(kind);
+            relations_[static_cast<std::size_t>(relation)].forEachRelated(id, fromLeft, [&](const Row& row) {
+                if (activeOnly && field(row, "activo") != "1") return;
+                const Row* other = get(ends[fromLeft ? 3 : 2], field(row, ends[fromLeft ? 1 : 0]));
+                if (!rowMatches(row, normalized) && !rowMatches(*other, normalized)) return;
+                if (result.total >= offset && result.rows.size() < limit) result.rows.push_back(row);
+                ++result.total;
+            });
+        }
+        if (includeReferences) addPageReferences(result, kind, fromLeft);
+        return result;
+    }
+    void addPageReferences(Page& page, const std::string& kind, std::optional<bool> fromLeft = {}) const {
+        page.includeReferences = true;
+        const auto& ends = RELATION_ENDS.at(kind);
+        for (std::size_t side = 0; side < 2; ++side) {
+            if (fromLeft && side == (*fromLeft ? 0U : 1U)) continue;
+            auto& references = page.references[ends[side + 2]];
+            std::set<std::string> seen;
+            for (const Row& row : page.rows) {
+                const auto& id = field(row, ends[side]);
+                if (seen.insert(id).second) references.push_back(*get(ends[side + 2], id));
+            }
+        }
     }
     void forEachRelated(const std::string& kind, const std::string& id, bool fromLeft,
                         const std::function<void(const Row&)>& visit) const {
@@ -1686,9 +2038,11 @@ public:
         queueProductCounts_ = std::move(fresh.queueProductCounts_);
         queueIds_ = std::move(fresh.queueIds_);
         issues_ = std::move(fresh.issues_);
+        indicatorPopulation_.clear();
         dirty_ = true;
     }
     bool undo() {
+        outsideBatch();
         auto state = history_.peek();
         if (!state) return false;
         if (startsWith(*state, "{\"__undo\":"))
@@ -1696,9 +2050,6 @@ public:
         else restore(*state);
         history_.pop();
         return true;
-    }
-    void loadQueue(const Rows& jobs) {
-        for (const Row& job : jobs) loadJob(job);
     }
     void loadJob(const Row& job) {
         validateJob(job);
@@ -1709,6 +2060,7 @@ public:
     void loadHistory(const Rows& entries) {
         for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
             const std::string state = field(*it, "snapshot");
+            if (state.size() > MAX_HISTORY_BYTES) throw DataError("El historial supera 64 MiB");
             if (startsWith(state, "{\"__undo\":")) parseUndo(state);
             else { Repository check; check.restore(state); }
             history_.push(state);
@@ -1961,16 +2313,23 @@ public:
                 groupsOf[field(membership, "investigador_id")].insert(field(membership, "grupo_id"));
         });
         const IndicatorRaw raw = indicatorRaw(kind, key, cutoff, start, status, groupsOf);
-        auto maxima = raw.values;
+        const IndicatorCacheKey cacheKey{kind, start, end, status, cutoff};
+        auto cached = indicatorPopulation_.find(cacheKey);
+        if (cached == indicatorPopulation_.end()) {
+            IndicatorPopulation population{raw.values, 1};
+            forEachRow(kind, [&](const Row& other) {
+                if (field(other, "activo") != "1" || field(other, "id") == key) return;
+                ++population.size;
+                const auto values = indicatorRaw(kind, field(other, "id"), cutoff, start, status, groupsOf).values;
+                for (auto& item : population.maxima) item.second = std::max(item.second, values.at(item.first));
+            });
+            if (indicatorPopulation_.size() >= 16) indicatorPopulation_.erase(indicatorPopulation_.begin());
+            cached = indicatorPopulation_.emplace(cacheKey, std::move(population)).first;
+        }
+        const auto& maxima = cached->second.maxima;
         Indicator result;
         result.kind = kind; result.id = key; result.status = status;
-        result.cutoff = cutoff; result.start = start; result.population = 1;
-        forEachRow(kind, [&](const Row& other) {
-            if (field(other, "activo") != "1" || field(other, "id") == key) return;
-            ++result.population;
-            const auto values = indicatorRaw(kind, field(other, "id"), cutoff, start, status, groupsOf).values;
-            for (auto& item : maxima) item.second = std::max(item.second, values.at(item.first));
-        });
+        result.cutoff = cutoff; result.start = start; result.population = cached->second.size;
         auto term = [&](const std::string& name) {
             const double value = raw.values.at(name), maximum = maxima.at(name);
             const double index = maximum ? value / maximum : 0.0;
@@ -2015,14 +2374,12 @@ fs::path backupOf(const fs::path& path) {
 }
 // Compara el conjunto de encabezados (sin importar el orden) para detectar formatos anteriores.
 bool headerMatches(const fs::path& path, const std::vector<std::string>& fields) {
-    bool first = true, matches = false;
+    bool matches = false;
     readCsvRecords(path, [&](std::vector<std::string>& record, std::size_t) {
-        if (!first) return;
-        first = false;
         matches = record.size() == fields.size() &&
                   std::set<std::string>(record.begin(), record.end()) ==
                   std::set<std::string>(fields.begin(), fields.end());
-    });
+    }, 1);
     return matches;
 }
 // Carpeta de las versiones 1 a 3 (un CSV por tabla); se guarda luego como archivo unico.
@@ -2211,6 +2568,7 @@ void replaceFile(const fs::path& from, const fs::path& to) {
 }
 // Escribe el archivo unico en un temporal y lo sustituye de una vez; conserva la copia anterior.
 void saveRepository(Repository& repo, const fs::path& path) {
+    repo.outsideBatch();
     if (fs::is_directory(path)) throw DataError("Indique un archivo .csv, no una carpeta");
     if (path.has_parent_path()) fs::create_directories(path.parent_path());
     const auto tick = std::chrono::high_resolution_clock::now().time_since_epoch().count();
@@ -2889,8 +3247,19 @@ std::string jsonRows(const Rows& rows) {
     return result + "]";
 }
 std::string jsonPage(const Page& page) {
-    return "{\"rows\":" + jsonRows(page.rows) +
-           ",\"total\":" + std::to_string(page.total) + "}";
+    std::string result = "{\"rows\":" + jsonRows(page.rows) +
+                         ",\"total\":" + std::to_string(page.total);
+    if (page.includeReferences) {
+        result += ",\"references\":{";
+        bool first = true;
+        for (const auto& item : page.references) {
+            if (!first) result.push_back(',');
+            first = false;
+            result += jsonString(item.first) + ":" + jsonRows(item.second);
+        }
+        result.push_back('}');
+    }
+    return result + "}";
 }
 std::string jsonTally(const std::map<std::string, int>& tally) {
     std::string result = "{";
@@ -2988,7 +3357,7 @@ class ApiApp {
         const std::string kind = field(request, "kind");
         const std::string key = field(request, "key");
         const std::string second = field(request, "second");
-        if (action == "ping") return "{\"backend\":\"cpp\",\"protocol\":\"4\"}";
+        if (action == "ping") return "{\"backend\":\"cpp\",\"protocol\":\"6\"}";
         if (action == "catalog") return jsonCatalog();
         if (action == "state") return state();
         if (action == "new_id") {
@@ -2996,8 +3365,11 @@ class ApiApp {
             return jsonString(newId(kind));
         }
         if (action == "shutdown") { stopping_ = true; return "null"; }
-        if (action == "reset") { repo_ = Repository(); return "null"; }
+        if (action == "reset") { repo_.outsideBatch(); repo_ = Repository(); return "null"; }
+        if (action == "begin_batch") { repo_.beginBatch(); return "null"; }
+        if (action == "end_batch") { repo_.endBatch(); return "null"; }
         if (action == "load") {
+            repo_.outsideBatch();
             const fs::path path = pathFromUtf8(field(request, "path"));
             if (path.empty()) throw DataError("Falta archivo de datos");
             Repository fresh = loadRepository(path);
@@ -3011,9 +3383,14 @@ class ApiApp {
             return "null";
         }
         if (action == "rows") return jsonRows(repo_.rows(kind));
-        if (action == "page")
+        if (action == "page") {
+            const std::string references = field(request, "references");
+            if (!references.empty() && references != "0" && references != "1")
+                throw DataError("Referencias debe ser 0 o 1");
             return jsonPage(repo_.page(kind, pageNumber(request, "offset", 0, SIZE_MAX),
-                                      pageNumber(request, "limit", 100, 200), field(request, "query")));
+                                      pageNumber(request, "limit", 100, 200), field(request, "query"),
+                                      field(request, "active"), field(request, "group_id"), references == "1"));
+        }
         if (action == "summary") {
             const auto counts = repo_.activeCounts();
             return "{\"active_groups\":" + std::to_string(counts.first) +
@@ -3031,6 +3408,10 @@ class ApiApp {
             const Row* row = repo_.get(kind, key, second);
             return row ? jsonRow(*row) : "null";
         }
+        if (action == "find_external") {
+            const Row* row = repo_.findExternal(kind, field(request, "value"));
+            return row ? jsonRow(*row) : "null";
+        }
         if (action == "related") {
             const std::string side = field(request, "side");
             if (side != "left" && side != "right") throw DataError("Extremo desconocido");
@@ -3039,9 +3420,14 @@ class ApiApp {
         if (action == "related_page") {
             const std::string side = field(request, "side");
             if (side != "left" && side != "right") throw DataError("Extremo desconocido");
+            const std::string active = field(request, "active"), references = field(request, "references");
+            if (!active.empty() && active != "0" && active != "1") throw DataError("Activo debe ser 0 o 1");
+            if (!references.empty() && references != "0" && references != "1")
+                throw DataError("Referencias debe ser 0 o 1");
             return jsonPage(repo_.relatedPage(kind, key, side == "left",
                         pageNumber(request, "offset", 0, SIZE_MAX),
-                        pageNumber(request, "limit", 100, 200), field(request, "active") == "1"));
+                        pageNumber(request, "limit", 100, 200), active == "1",
+                        field(request, "query"), references == "1"));
         }
         if (action == "create" || action == "update") {
             const Row values = SnapshotParser(field(request, "values")).parseRow();
@@ -3085,6 +3471,7 @@ class ApiApp {
         if (action == "undo") return repo_.undo() ? "true" : "false";
         if (action == "clear_history") { repo_.clearHistory(); return "null"; }
         if (action == "preview_csv" || action == "import_csv") {
+            if (action == "import_csv") repo_.outsideBatch();
             return jsonImport(importCsv(repo_, pathFromUtf8(field(request, "path")), kind,
                                         action == "import_csv"));
         }

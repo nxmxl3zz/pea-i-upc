@@ -13,6 +13,8 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import runpy
+from typing import NamedTuple
+from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 pea = runpy.run_path(str(ROOT / "src" / "python" / "Taller2_REMR.py"))
@@ -20,19 +22,35 @@ pea = runpy.run_path(str(ROOT / "src" / "python" / "Taller2_REMR.py"))
 fetch_web_page = pea["fetch_web_page"]
 load_repository = pea["load_repository"]
 save_repository = pea["save_repository"]
+DataError = pea["DataError"]
 
 
-def resolve(row: dict[str, str]) -> tuple[str, str]:
+class CategoryResult(NamedTuple):
+    identifier: str
+    status: str
+    category: str = ""
+    reason: str = ""
+
+
+def resolve(row: dict[str, str]) -> CategoryResult:
     url = row["url"].strip()
     if not url:
-        return row["id"], ""
+        return CategoryResult(row["id"], "skipped", reason="El investigador no tiene URL CvLAC")
     try:
         preview = fetch_web_page(url)
-    except Exception:
-        return row["id"], ""
-    if preview.suggested_kind == "investigadores" and preview.suggested_row:
-        return row["id"], preview.suggested_row.get("categoria", "").strip()
-    return row["id"], ""
+    except DataError as exc:
+        return CategoryResult(row["id"], "error", reason=f"Consulta CvLAC: {exc}")
+    if preview.suggested_kind != "investigadores" or not preview.suggested_row:
+        reason = "; ".join(preview.diagnostics) or "La respuesta no contiene una ficha CvLAC identificable"
+        return CategoryResult(row["id"], "error", reason=reason)
+    expected = row.get("codigo_cvlac", "").strip() or parse_qs(urlparse(url).query).get("cod_rh", [""])[0]
+    if expected and preview.suggested_row.get("codigo_cvlac", "").strip().lower() != expected.lower():
+        return CategoryResult(row["id"], "error", reason="El código CvLAC recibido no coincide con el perfil solicitado")
+    category = preview.suggested_row.get("categoria", "").strip()
+    if category:
+        return CategoryResult(row["id"], "found", category, "; ".join(preview.diagnostics))
+    reason = "; ".join(("La ficha CvLAC no declara categoría", *preview.diagnostics))
+    return CategoryResult(row["id"], "absent", reason=reason)
 
 
 def main() -> None:
@@ -57,22 +75,31 @@ def main() -> None:
 
     updated = 0
     failures = 0
+    absent = 0
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {pool.submit(resolve, row): row for row in pending}
         for index, future in enumerate(as_completed(futures), start=1):
             row = futures[future]
-            _, categoria = future.result()
-            if categoria:
-                repo.update("investigadores", row["id"], {"categoria": categoria}, remember=False)
+            result = future.result()
+            if result.status == "found":
+                repo.update("investigadores", row["id"], {"categoria": result.category}, remember=False)
                 updated += 1
+                if result.reason:
+                    print(f"[EXTRACCIÓN INCOMPLETA] {result.identifier}: {result.reason}", flush=True)
+            elif result.status == "absent":
+                absent += 1
+                print(f"[SIN CATEGORÍA] {result.identifier}: {result.reason}", flush=True)
             else:
                 failures += 1
+                print(f"[FALLO] {result.identifier}: {result.reason}", flush=True)
             if index % 100 == 0:
-                print(f"[{index}/{len(pending)}] actualizados={updated} sin-categoría/fallos={failures}", flush=True)
+                print(f"[{index}/{len(pending)}] actualizados={updated} sin-categoría={absent} fallos={failures}", flush=True)
 
     if updated:
         save_repository(repo, args.data)
-    print(f"\nActualizados: {updated} | sin categoría o fallo: {failures}", flush=True)
+    print(f"\nActualizados: {updated} | sin categoría: {absent} | fallos: {failures}", flush=True)
+    if failures:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
