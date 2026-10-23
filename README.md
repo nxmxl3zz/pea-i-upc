@@ -23,7 +23,7 @@
   <img src="https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus&logoColor=white" alt="C++17">
   <img src="https://img.shields.io/badge/GUI-CustomTkinter-2f8f7a" alt="CustomTkinter">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey" alt="Windows and Linux">
-  <img src="https://img.shields.io/badge/data-21%2C419%20products-e8a25c" alt="21,419 products">
+  <img src="https://img.shields.io/badge/data-%2B20k%20products-e8a25c" alt="+20k products">
 </p>
 
 ---
