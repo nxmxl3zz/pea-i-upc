@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" fill="none">
+  <!-- PEA-i mark: research output bars under the production-indicator gauge, in the app palette. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b3a33"/>
+      <stop offset="1" stop-color="#0d1a17"/>
+    </linearGradient>
+    <linearGradient id="bar" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#2f8f7a"/>
+      <stop offset="1" stop-color="#5fd0b4"/>
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="124" height="124" rx="28" fill="url(#bg)" stroke="#2f6b5e" stroke-width="2"/>
+  <path d="M30 62a34 34 0 0 1 68 0" stroke="#24463e" stroke-width="8" stroke-linecap="round"/>
+  <path d="M30 62a34 34 0 0 1 52.8-28.3" stroke="#5fd0b4" stroke-width="8" stroke-linecap="round"/>
+  <rect x="30" y="84" width="12" height="20" rx="3" fill="url(#bar)"/>
+  <rect x="48" y="76" width="12" height="28" rx="3" fill="url(#bar)"/>
+  <rect x="66" y="68" width="12" height="36" rx="3" fill="url(#bar)"/>
+  <rect x="84" y="58" width="12" height="46" rx="3" fill="#e8a25c"/>
+</svg>
