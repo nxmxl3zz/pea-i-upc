@@ -79,3 +79,7 @@ En Windows use `py -3`. Las pruebas de interfaz necesitan una sesión gráfica y
 
 
 ### Rafael Miranda
+
+## Licencia
+
+Publicado bajo la [licencia MIT](LICENSE).

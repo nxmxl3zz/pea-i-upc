@@ -189,3 +189,7 @@ CMakeLists.txt                    C++ build
 <p align="center">
   Built by <strong>Rafael Miranda</strong> for the Data Structures course · Systems Engineering · Universidad Popular del Cesar
 </p>
+
+## License
+
+Released under the [MIT License](LICENSE).
